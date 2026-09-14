@@ -1,4 +1,4 @@
-import { log, disableLogs, getConfiguration, instanceCount, getNsDataThroughFile, getFilePath, getActiveSourceFiles, formatNumberShort, formatDuration } from './helpers.js'
+import { log, disableLogs, getConfiguration, instanceCount, getNsDataThroughFile, runCommand, getFilePath, getActiveSourceFiles, formatNumberShort, formatDuration } from './helpers.js'
 
 const cityNames = ["Sector-12", "Aevum", "Volhaven", "Chongqing", "New Tokyo", "Ishima"];
 const antiChaosOperation = "Stealth Retirement Operation"; // Note: Faster and more effective than Diplomacy at reducing city chaos
@@ -7,15 +7,26 @@ const simulacrumAugName = "The Blade's Simulacrum"; // This augmentation lets yo
 // In general, we will buy the skill upgrade with the next highest cost, but to tweak the priority of various skills,
 // we use the following configuration to change their relative cost. Higher number means lower priority
 // Note: Ideally we could emphasize Tracer "early-game" and Digital Observer "late-game", but this is too much of a pain to solve for
+// Skill effects and cost slopes are from src/Bladeburner/data/Skills.ts (cost = baseCost + costInc * level, roughly)
 const costAdjustments = {
-    "Overclock": 0.8, // Speed up contracts/operations. More important now that sleeves remove the operation count bottleneck
-    "Reaper": 1.2, // Combat boost. Early effect is paltry (because stats are so low), will get plenty of points late game
-    "Evasive Systems": 1.2, // Dex/Agi boost. Mildly deprioritized for same reasoning as above.
+    "Overclock": 0.8, // -1% action time per level (max 90). Speed up contracts/operations. More important now that sleeves remove the operation count bottleneck
+    "Cyber's Edge": 1.5, // +2% max stamina per level. baseCost 1 but costInc 3 (steepest slope), so it's cheap early and self-limiting later. Stamina drives the success penalty, so worth some points.
+    "Evasive Systems": 1.2, // +4% effective Dex/Agi per level (Action.ts: stats enter competence as stat^0.9, and Dex/Agi also reduce action time)
+    "Reaper": 2, // +2% effective Str/Def/Dex/Agi per level. Stats enter competence as stat^0.9 (~1.8%/level) vs Blade's Intuition's flat +3%/level, so it's a weaker buy at equal cost
     "Cloak": 1.5, // Cheap, and stealth ends up with plenty of boost, so we don't need to invest in Cloak as much.
     "Hyperdrive": 2, // Improves stats gained, but not Rank gained. Less useful if training outside of BB
     "Tracer": 2, // Only boosts Contract success chance, which are relatively easy to begin with.
-    "Cyber's Edge": 5, // Boosts stamina, but contract counts are much more limiting than stamina, so isn't really needed
+    "Datamancer": 5, // +5% population-estimate accuracy per level only. It has the lowest cost slope of all skills (costInc 1), so left unadjusted it would absorb most SP.
     "Hands of Midas": 10 // Improves money gain. It is assumed that Bladeburner will *not* be a main source of income
+};
+
+// Action level tuning: difficulty(L) = baseDifficulty * difficultyFac^(L-1) (src/Bladeburner/Actions/LevelableAction.ts getDifficulty) and
+// success chance = min(1, competence / difficulty) (src/Bladeburner/Actions/Action.ts getSuccessChance), so while below 100%:
+//   chance(L) = chance(L0) * difficultyFac^(L0 - L)
+// Per-action factors from src/Bladeburner/data/Contracts.ts and Operations.ts:
+const difficultyFacByAction = {
+    "Tracking": 1.02, "Bounty Hunter": 1.04, "Retirement": 1.03,
+    "Investigation": 1.03, "Undercover Operation": 1.04, "Sting Operation": 1.04, "Raid": 1.045, "Stealth Retirement Operation": 1.05, "Assassination": 1.06,
 };
 
 // Some bladeburner info gathered at startup and cached
@@ -27,9 +38,14 @@ let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information abou
 let options;
 
 const argsSchema = [
-    ['success-threshold', 0.99], // Attempt the best action whose minimum chance of success exceeds this threshold
+    // Since v3.0.0 action difficulty is no longer randomized, and since v3.0.1 failing an action no longer costs faction rep (changelog.md),
+    // so a 90% success chance is a reasonable default (failures still cost rank and HP).
+    ['success-threshold', 0.9], // Attempt the best contract/operation whose minimum chance of success exceeds this threshold (its level is tuned to meet it)
+    ['blackop-success-threshold', 0.99], // Black ops are attempted only when their chance exceeds this (failure is very costly, and their estimate can be optimistic)
+    ['disable-action-leveling', false], // By default, contract/operation levels are set to the highest level whose estimated success chance meets --success-threshold
     ['chaos-recovery-threshold', 50], // Prefer to do "Stealth Retirement" operations to reduce chaos when it reaches this number
     ['max-chaos', 100], // If chaos exceeds this amount in every city, we will reluctantly resort to diplomacy to reduce it.
+    ['max-chaos-for-incite', 15], // Only "Incite Violence" (to generate more contracts/operations) while chaos in every city is below this
     ['toast-upgrades', false], // Set to true to toast each time a skill is upgraded
     ['toast-operations', false], // Set to true to toast each time we switch operations
     ['toast-relocations', false], // Set to true to toast each time we change cities
@@ -228,8 +244,19 @@ async function mainLoop(ns) {
     // Gather the success chance of contracts (based on our current city)
     const contractChances = await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Contracts", contractNames);
     const operationChances = await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Operations", operationNames);
+    // Black ops ignore population (src/Bladeburner/Actions/BlackOperation.ts getPopulationSuccessFactor() = 1), so their estimated and real
+    // chances are identical, but Action.ts getSuccessRange still multiplies one end of the returned range by pop/popEst. One end of the pair
+    // is therefore the true chance; we use the max (exact when the population is over-estimated, optimistic otherwise - hence the separate,
+    // stricter --blackop-success-threshold).
     const blackOpsChance = nextBlackOp === null || rank < blackOpsRanks[nextBlackOp] ? [0, 0] : // Insufficient rank for blackops means chance is zero
-        (await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Black Operations", [nextBlackOp]))[nextBlackOp];
+        (([lo, hi]) => [Math.max(lo, hi), Math.max(lo, hi)])((await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Black Operations", [nextBlackOp]))[nextBlackOp]);
+    // Gather current/max levels of levelable actions so we can tune them to meet our success threshold (4 GB each, ram-dodged)
+    let currentLevels = {}, maxLevels = {};
+    if (!options['disable-action-leveling']) {
+        currentLevels = { ...await getBBDictByActionType(ns, 'getActionCurrentLevel', "Contracts", contractNames), ...await getBBDictByActionType(ns, 'getActionCurrentLevel', "Operations", operationNames) };
+        maxLevels = { ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Contracts", contractNames), ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Operations", operationNames) };
+    }
+    const thresholdFor = actionName => actionName == nextBlackOp ? options['blackop-success-threshold'] : options['success-threshold'];
     // Define some helpers for determining min/max chance for each action
     const getChance = actionName => contractNames.includes(actionName) ? contractChances[actionName] :
         operationNames.includes(actionName) ? operationChances[actionName] :
@@ -238,9 +265,10 @@ async function mainLoop(ns) {
     const maxChance = actionName => getChance(actionName)[1];
 
     // NEXT STEP: Pick the action we should be working on.
-    let bestActionName, reason;
+    let bestActionName, reason, bestActionLevel = 0; // bestActionLevel > 0 means we want the action at that level (0 = leave the level alone)
     const actionSummaryString = (action) => `Success Chance: ${(100 * minChance(action)).toFixed(1)}%` +
-        (maxChance(action) - minChance(action) < 0.001 ? '' : ` to ${(100 * maxChance(action)).toFixed(1)}%`) + `, Remaining: ${getCount(action)}`
+        (maxChance(action) - minChance(action) < 0.001 ? '' : ` to ${(100 * maxChance(action)).toFixed(1)}%`) + `, Remaining: ${getCount(action)}` +
+        (currentLevels[action] ? `, Level: ${currentLevels[action]}/${maxLevels[action]}` : '')
 
     // Trigger stamina recovery if we drop below our --low-stamina-pct configuration, and remain trigered until we've recovered to --high-stamina-pct
     const stamina = await getBBInfo(ns, `getStamina()`); // Returns [current, max];
@@ -276,28 +304,37 @@ async function mainLoop(ns) {
         candidateActions = candidateActions.filter(a => getCount(a) > 0);
         //log(ns, `The following actions are available: ${candidateActions}`); // Debug log to see what candidate actions are
 
-        // Pick the first candidate action with a minimum chance of success that exceeds our --success-threshold
-        if (!populationUncertain)
-            bestActionName = candidateActions.filter(a => minChance(a) > options['success-threshold'] && getCount(a) >= 1)[0];
-        else // Special case for when population uncertainty is high - proceed so long as max chance is high enough
-            bestActionName = candidateActions.filter(a => maxChance(a) > options['success-threshold'] && getCount(a) >= 1)[0];
+        // Pick the first candidate action (highest rep first) that can meet our success threshold, lowering its level if necessary (or raising it
+        // if it has headroom). When population uncertainty is high, proceed so long as the max chance is high enough.
+        const chanceFn = populationUncertain ? maxChance : minChance;
+        for (const a of candidateActions.filter(a => getCount(a) >= 1)) {
+            const level = getTargetLevel(a, chanceFn(a), thresholdFor(a), currentLevels[a], maxLevels[a]);
+            if (level === null) continue;
+            [bestActionName, bestActionLevel] = [a, level];
+            break;
+        }
 
         if (!bestActionName) // If there were none, allow us to fall-back to an action with a minimum chance >50%, and maximum chance > threshold
-            bestActionName = candidateActions.filter(a => minChance(a) > 0.5 && maxChance(a) > options['success-threshold'] && getCount(a) >= 1)[0];
+            bestActionName = candidateActions.filter(a => minChance(a) > 0.5 && maxChance(a) > thresholdFor(a) && getCount(a) >= 1)[0];
         if (bestActionName) // If we found something to do, log details about its success chance range
-            reason = actionSummaryString(bestActionName);
+            reason = actionSummaryString(bestActionName) + (bestActionLevel > 0 && bestActionLevel != currentLevels[bestActionName] ?
+                ` (setting level ${currentLevels[bestActionName]} -> ${bestActionLevel} to meet --success-threshold ${options['success-threshold']})` : '');
 
         // If there were no operations/contracts, resort to a "General" action which always have 100% chance, but take longer and gives less reward
         if (!bestActionName) {
+            const [maxChaosCity, maxChaos] = getMaxKeyValue(chaosByCity, cityNames);
+            const noWorkLeft = unreservedActions.every(a => getCount(a) == 0);
             if (populationUncertain) { // Lower population uncertainty
                 bestActionName = "Field Analysis";
                 reason = `High population uncertainty in ${currentCity}`;
-            } // If all (non-reserved) operation counts are 0, and chaos isn't too high, Incite Violence to get more work (logic above should subsequently reduce chaos)
-            else if (unreservedActions.every(a => getCount(a) == 0) && cityNames.every(c => chaosByCity[c] < options['max-chaos'])) {
+            } // If all (non-reserved) operation counts are 0, and chaos is low everywhere, Incite Violence to get more work.
+            // Incite Violence (src/Bladeburner/Bladeburner.ts InciteViolence) adds only ~3 minutes' worth of contract/operation count regen,
+            // but adds 10 + chaos/log10(chaos) chaos to EVERY city. Chaos above 50 scales action difficulty by sqrt(1 + chaos - 50)
+            // (src/Bladeburner/Actions/Action.ts getChaosSuccessFactor), so only incite while chaos is low everywhere (--max-chaos-for-incite).
+            else if (noWorkLeft && maxChaos < options['max-chaos-for-incite']) {
                 bestActionName = "Incite Violence";
-                let [maxChaosCity, maxChaos] = getMaxKeyValue(chaosByCity, cityNames);
                 reason = `No work available, and max city chaos is ${maxChaos.toFixed(1)} in ${maxChaosCity}, ` +
-                    `which is less than --max-chaos threshold ${options['max-chaos']}`;
+                    `which is less than --max-chaos-for-incite threshold ${options['max-chaos-for-incite']}`;
             } // Otherwise, consider training
             else if (unreservedActions.some(a => maxChance(a) < options['success-threshold']) && // Only if we aren't at 100% chance for everything
                 staminaPct > options['high-stamina-pct'] && timesTrained < options['training-limit']) { // Only if we have plenty of stamina and have barely trained
@@ -306,19 +343,30 @@ async function mainLoop(ns) {
                 reason = `Nothing better to do, times trained (${timesTrained.toFixed(0)}) < --training-limit (${options['training-limit']}), and ` +
                     `actions are below success threshold: ` + unreservedActions.filter(a => maxChance(a) < options['success-threshold'])
                         .map(a => `${a} (${(100 * maxChance(a)).toFixed(1)}%)`).join(", ");
+            } // If there's no work and stamina isn't full, regenerate it (and HP) so we're at full strength when work becomes available
+            else if (noWorkLeft && staminaPct < options['high-stamina-pct']) {
+                bestActionName = "Hyperbolic Regeneration Chamber";
+                reason = `No work available, and stamina is ${(100 * staminaPct).toFixed(1)}% < --high-stamina-pct ${(100 * options['high-stamina-pct']).toFixed(1)}%`;
             } else { // Otherwise, Field Analysis
                 bestActionName = "Field Analysis"; // Gives a little rank, and improves population estimate. Best we can do when there's nothing else.
                 reason = `Nothing better to do`;
             }
         }
         // NOTE: We never "Recruit". Community consensus is that team mates die too readily, and have minimal impact on success.
-        // NOTE: We don't use the "Hyperbolic Regeneration Chamber". We are cautious enough that we should never need healing.
+    }
+
+    // Apply any action level change (autolevel must be disabled, or the game snaps the level back to max on every completion: src/Bladeburner/Bladeburner.ts completeAction)
+    if (bestActionLevel > 0 && bestActionLevel != currentLevels[bestActionName]) {
+        const levelType = contractNames.includes(bestActionName) ? "Contracts" : "Operations";
+        await runCommand(ns, 'ns.bladeburner.setActionAutolevel(ns.args[0], ns.args[1], false); ns.bladeburner.setActionLevel(ns.args[0], ns.args[1], ns.args[2]);',
+            '/Temp/bladeburner-setActionLevel.js', [levelType, bestActionName, bestActionLevel]);
+        log(ns, `INFO: Set Bladeburner ${levelType} "${bestActionName}" level ${currentLevels[bestActionName]} -> ${bestActionLevel} (max ${maxLevels[bestActionName]})`);
     }
 
     // Detect our current action (API returns an object like { "type":"Operations", "name":"Investigation" })
     const currentAction = await getBBInfo(ns, `getCurrentAction()`);
     // Special case: If the user has manually kicked off the last BlackOps, don't interrupt it, let it be our last task
-    if (currentAction?.name == remainingBlackOpsNames[remainingBlackOpsNames - 1]) lastAssignedTask = currentAction;
+    if (currentAction?.name == remainingBlackOpsNames[remainingBlackOpsNames.length - 1]) lastAssignedTask = currentAction;
     // Warn the user if it looks like a task was interrupted by something else (user activity or bladeburner automation). Ignore if our last assigned task has run out of actions.
     if (lastAssignedTask && lastAssignedTask != currentAction?.name && getCount(lastAssignedTask) > 0) {
         log(ns, `WARNING: The last task this script assigned was "${lastAssignedTask}", but you're now doing "${currentAction?.name || '(nothing)'}". ` +
@@ -351,6 +399,26 @@ async function mainLoop(ns) {
     // Ensure we perform this new action at least once before interrupting it
     lastAssignedTask = bestActionName;
     currentTaskEndTime = !success ? 0 : Date.now() + expectedDuration + 10; // Pad this a little to ensure we don't interrupt it.
+}
+
+/** Determine the highest level of an action whose estimated success chance should meet the threshold (see difficultyFacByAction).
+ * @param {string} actionName
+ * @param {number} chance The estimated success chance at the current level
+ * @param {number} threshold The required success chance
+ * @param {number} currentLevel The action's current level (undefined if the action isn't levelable, or leveling is disabled)
+ * @param {number} maxLevel The action's max level
+ * @returns {number|null} The target level (1..maxLevel), 0 if the action is acceptable but not levelable, or null if no level meets the threshold */
+function getTargetLevel(actionName, chance, threshold, currentLevel, maxLevel) {
+    const fac = difficultyFacByAction[actionName];
+    if (!fac || !currentLevel || !maxLevel) return chance > threshold ? 0 : null; // Not levelable (general actions, black ops) or leveling disabled
+    const lnFac = Math.log(fac);
+    if (chance > threshold) { // We can raise the level by k while chance * fac^-k >= threshold. If the estimate is capped at 100%, assume it is exactly 100%
+        const k = Math.floor(Math.log(Math.min(chance, 1) / threshold) / lnFac);
+        return Math.max(currentLevel, Math.min(maxLevel, currentLevel + k));
+    }
+    if (chance <= 0) return null;
+    const k = Math.ceil(Math.log(threshold / chance) / lnFac); // Lower the level by k so that chance * fac^k >= threshold
+    return currentLevel - k >= 1 ? currentLevel - k : null;
 }
 
 /** @param {NS} ns

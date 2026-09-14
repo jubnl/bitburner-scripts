@@ -1,6 +1,7 @@
 import { log as log_helper, getConfiguration, disableLogs, formatMoney, formatDuration, formatNumberShort, getErrorInfo } from './helpers.js'
 
 const sellForMoney = 'Sell for Money';
+const generateContract = 'Generate Coding Contract';
 
 const argsSchema = [
     ['l', false], // Spend hashes as soon as we can afford any --spend-on purchase item. Otherwise, only spends when nearing capacity.
@@ -8,6 +9,9 @@ const argsSchema = [
     ['interval', 50], // (milliseonds) Interval at which the program wakes up to spends hashes
     ['spend-on', [sellForMoney]], // One or more actions to spend hashes on.
     ['spend-on-server', null], // The server to boost, for spend options that take a server argument: 'Reduce Minimum Security' and 'Increase Maximum Money'
+    ['spend-on-company', null], // The company to target, for spend options that take a company argument: 'Company Favor' (v3.0: +5 favor per purchase, persists until you leave the BitNode)
+    ['contracts-before-money', true], // When no explicit --spend-on is given, prefer 'Generate Coding Contract' (solved automatically by contractor.js) over 'Sell for Money' while contracts are cheap enough (see --max-contract-cost-ratio). Set `--contracts-before-money false` to only sell for money.
+    ['max-contract-cost-ratio', 40], // Only generate a contract while its hash cost (25 * (contracts generated + 1)) is at most this many times the 'Sell for Money' cost (4 hashes). A contract pays >= $25m * difficulty (v3.0: 75e6 * difficulty * BN mult / 3), so at the default ratio (160 hashes = $40m) it is still a bargain.
     ['no-capacity-upgrades', false], // By default, we will attempt to upgrade the hacknet node capacity if we cannot afford any purchases. Set to true to disable this.
     ['reserve', null], // The amount of player money to leave unpent when considering buying capacity upgrades (defaults to the amount in reserve.txt on home)
     ['ignore-reserve-if-upgrade-cost-less-than-pct', 0.01], // Hack to purchase capacity upgrades regardless of the curent global reserve if they cost less than this fraction of player money
@@ -17,7 +21,9 @@ const argsSchema = [
 
 const basicSpendOptions = ['Sell for Money', 'Generate Coding Contract', 'Improve Studying', 'Improve Gym Training',
     'Sell for Corporation Funds', 'Exchange for Corporation Research', 'Exchange for Bladeburner Rank', 'Exchange for Bladeburner SP'];
-const parameterizedSpendOptions = ['Reduce Minimum Security', 'Increase Maximum Money'];
+const serverSpendOptions = ['Reduce Minimum Security', 'Increase Maximum Money']; // Upgrades which take a server name as their target (--spend-on-server)
+const companySpendOptions = ['Company Favor']; // Upgrades which take a company name as their target (--spend-on-company). v3.0 src/Hacknet/data/HashUpgradesMetadata.tsx (hasTargetCompany)
+const parameterizedSpendOptions = serverSpendOptions.concat(companySpendOptions);
 const purchaseOptions = basicSpendOptions.concat(parameterizedSpendOptions);
 const minTimeBetweenToasts = 5000; // milleconds. If we start buying a lot of things, throttle toast notifications.
 
@@ -40,6 +46,7 @@ export async function main(ns) {
     const interval = options.interval;
     const toBuy = options['spend-on'].map(s => s.replaceAll("_", " "));
     const spendOnServer = options['spend-on-server']?.replaceAll("_", " ") ?? undefined;
+    const spendOnCompany = options['spend-on-company']?.replaceAll("_", " ") ?? undefined;
     const maxPurchasesPerLoop = options['max-purchases-per-loop'];
     // Validate arguments
     if (toBuy.length == 0)
@@ -47,13 +54,31 @@ export async function main(ns) {
     const unrecognized = toBuy.filter(p => !purchaseOptions.includes(p));
     if (unrecognized.length > 0)
         return log(ns, `ERROR: One or more --spend-on arguments are not recognized: ${unrecognized.join(", ")}`, true, 'error');
+    if (!spendOnServer && toBuy.some(p => serverSpendOptions.includes(p)))
+        return log(ns, `ERROR: --spend-on-server must be specified when spending on: ${toBuy.filter(p => serverSpendOptions.includes(p)).join(", ")}`, true, 'error');
+    if (!spendOnCompany && toBuy.some(p => companySpendOptions.includes(p)))
+        return log(ns, `ERROR: --spend-on-company must be specified when spending on: ${toBuy.filter(p => companySpendOptions.includes(p)).join(", ")}`, true, 'error');
+    // Helper to get the target argument (server or company name) for the given upgrade. ns.hacknet.spendHashes(upgName, upgTarget = "", count = 1) (src/NetscriptFunctions/Hacknet.ts)
+    const getUpgradeTarget = (spendAction) => serverSpendOptions.includes(spendAction) ? spendOnServer : companySpendOptions.includes(spendAction) ? spendOnCompany : undefined;
     // Operate in "low-priority" mode if our only job is to sell for money when nearing our hash capacity
     const lowPriority = !liquidate && toBuy.length == 1 && toBuy[0] == sellForMoney;
+    // Unless the user explicitly asked for specific spend options (command line or config file), prefer generating cheap coding contracts over selling for money.
+    // Cost verified in v3.0 src/Hacknet/data/HashUpgradesMetadata.tsx: 'Sell for Money' is a flat 4 hashes ($1m), 'Generate Coding Contract' is 25 * (level + 1).
+    const explicitSpendOn = ns.args.includes('--spend-on') || JSON.stringify(options['spend-on']) != JSON.stringify([sellForMoney]);
+    const contractsBeforeMoney = options['contracts-before-money'] && !explicitSpendOn;
+    const maxContractCostRatio = options['max-contract-cost-ratio'];
+    const primaryPurchases = contractsBeforeMoney ? [generateContract, ...toBuy] : toBuy;
+    // Predicate: an action is worth buying unless it is our (implicit) contract generation and contracts have become too expensive relative to money
+    const isWorthBuying = (spendAction) => spendAction != generateContract || !contractsBeforeMoney ||
+        ns.hacknet.hashCost(generateContract) <= maxContractCostRatio * ns.hacknet.hashCost(sellForMoney);
 
     disableLogs(ns, ['sleep', 'getServerMoneyAvailable']);
     ns.print(`Starting spend-hacknet-hashes.js... Will check in every ${formatDuration(interval)}`);
     ns.print(liquidate ? `-l --liquidate mode active! Will spend all hashes as soon as possible.` :
         `Saving up hashes, only spending hashes when near capacity to avoid wasting them.`);
+    if (contractsBeforeMoney)
+        ns.print(`Will prefer '${generateContract}' over '${sellForMoney}' while a contract costs at most ${maxContractCostRatio}x the money cost ` +
+            `(--contracts-before-money / --max-contract-cost-ratio).`);
 
     // Set up a helper to log but limit how often we generate a toast notification when making many purchases in a short time
     let lastToast = 0; // Last time we generated a toast notification about a successful purchase
@@ -103,18 +128,22 @@ export async function main(ns) {
                 capacity = ns.hacknet.hashCapacity() || 0;
                 // Spend every hash we can if so instructed, otherwise, spend only hashes that would be wasted on next tick.
                 let maxHashSpend = () => ns.hacknet.numHashes() - (spendAllHashes ? 0 : Math.max(0, capacity - hashesEarnedNextTick));
+                // When we're implicitly preferring contracts over money and are about to waste hashes anyway (overflow budget > 0), allow dipping
+                // into the saved-up hashes for a single contract rather than converting the overflow to money (the overflow alone is rarely >= 25 hashes)
+                const contractBudget = () => (spendAllHashes || maxHashSpend() > 0) ? ns.hacknet.numHashes() : 0;
+                const activePurchases = () => purchases.filter(isWorthBuying);
                 let lastPurchaseSucceeded = true; // Additional mechanism to break out of the while loop if any purchase fails
                 // Make purchases in a loop until we hit our purchase-per-loop limit, or we've spent enough to avoid hashes being wasted next tick
-                while (lastPurchaseSucceeded && purchasesThisLoop < maxPurchasesPerLoop && getMinCost(purchases) <= maxHashSpend()) {
+                while (lastPurchaseSucceeded && purchasesThisLoop < maxPurchasesPerLoop && getMinCost(activePurchases()) <= maxHashSpend()) {
                     lastPurchaseSucceeded = false; // Safety mechanism to avoid looping if we don't enter the for-loop below for some reason
                     // Loop over all requested purchases and try to buy each one once (TODO: Figure out in advance how many we can buy of each and buy in bulk)
-                    for (const spendAction of purchases) {
+                    for (const spendAction of activePurchases()) {
                         const cost = ns.hacknet.hashCost(spendAction); // What's the cost of making this purchase
-                        const budget = maxHashSpend();
+                        const budget = (contractsBeforeMoney && spendAction == generateContract) ? contractBudget() : maxHashSpend();
                         if (cost > budget) continue; // Skip this purchase if if costs more than we have left
                         const quantity = spendAction == sellForMoney ? Math.floor(budget / cost) : 1; // We can easily buy money in bulk, because the cost doesn't scale.
                         const totalCost = cost * quantity;
-                        lastPurchaseSucceeded = ns.hacknet.spendHashes(spendAction, parameterizedSpendOptions.includes(spendAction) ? spendOnServer : undefined, quantity);
+                        lastPurchaseSucceeded = ns.hacknet.spendHashes(spendAction, getUpgradeTarget(spendAction), quantity);
                         if (!lastPurchaseSucceeded) { // Note: Even if we had enough hashes, we may fail if another script spends them first
                             log(ns, `WARN: Failed to spend hashes on ${quantity}x '${spendAction}'. Cost was: ${formatHashes(totalCost)} of ${formatHashes(budget)} ` +
                                 `budgeted hashes. Have: ${formatHashes(ns.hacknet.numHashes())} of ${formatHashes(capacity)} (capacity) hashes.`);
@@ -135,8 +164,8 @@ export async function main(ns) {
                     log(ns, `INFO: Summary: Spent ${formatHashes(startingHashes - ns.hacknet.numHashes())} hashes on ${purchasesThisLoop} purchases ` +
                         (spendAllHashes ? '' : `to avoid reaching capacity (${formatHashes(capacity)}) `) + `while earning ${formatHashes(globalProduction)} hashes per second.`);
             };
-            // Spend hashes normally on any/all user-specified purchases
-            await fnSpendHashes(toBuy, liquidate);
+            // Spend hashes normally on any/all user-specified purchases (plus implicit contract generation, if enabled)
+            await fnSpendHashes(primaryPurchases, liquidate);
             currentHashes = lastHashBalance = ns.hacknet.numHashes();
 
             // Determine if we should try to upgrade our hacknet capacity

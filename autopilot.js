@@ -23,6 +23,8 @@ const argsSchema = [ // The set of all command line arguments
     ['disable-rush-gangs', false], // Set to true to disable focusing work-for-faction on Karma until gangs are unlocked
     ['disable-casino', false], // Set to true to disable running the casino.js script automatically
     ['spend-hashes-on-server-hacking-threshold', 0.1], // Threshold for how good hacking multipliers must be to merit spending hashes for boosting hack income. Set to a large number to disable this entirely.
+    ['max-money-boost-cap', 10e12], // Stop spending hashes on "Increase Maximum Money" once the target server's max money reaches this. The game soft-caps the effect above $10t (src/Server/Server.ts changeMaximumMoney). Set to 0 to disable the cap.
+    ['assume-daedalus-sells-trp', false], // Set to true to run the Daedalus invite rush / money-reserve logic even in BN15 (where Daedalus does NOT sell The Red Pill - it is a Darknet labyrinth reward instead)
     ['on-completion-script', null], // Spawn this script when we defeat the bitnode
     ['on-completion-script-args', []], // Optional args to pass to the script when we defeat the bitnode
     ['xp-mode-interval-minutes', 55], // Every time this many minutes has elapsed, toggle daemon.js to runing in --xp-only mode, which prioritizes earning hack-exp rather than money
@@ -77,6 +79,14 @@ export async function main(ns) {
         // Low Priority:
         8.3,  // Hard.   Just gives stock "Limit orders" which we don't use in our scripts,
         3.3,  // Hard.   Corporations. I have no corp scripts, maybe one day I will. The history here is: in 2021, corps were too exploity and broke the game (inf. money). Also the APIs were buggy and new, so I skipped it. Autopilot will win normally while ignoring corps.
+        // BN15 (v3.0 "The Secrets of the Dark Net"): a brand-new Darknet mechanic (src/DarkNet/*) with its own API that these scripts do not automate yet.
+        // Multipliers are moderate (hack level/speed 0.6, combat 0.7, cha 1.1, aug cost 3x, DaedalusAugsRequirement 20, WD difficulty 2) but the catch is that
+        // Daedalus does NOT sell The Red Pill here - TRP is only a reward from the Darknet labyrinth (src/DarkNet/effects/labyrinth.ts), so autopilot cannot
+        // currently finish this BN on its own. Placed after everything else so the rest of the SFs are collected first. Rewards: 15.1 permanent TOR + darkscape
+        // + full dark web in every BN; 15.2 CHA boosts salary/company rep (+20% authentication speed); 15.3 CHA boosts faction rep (+50% .cache xp/money).
+        15.1, // Hard.   Manual/unsupported: requires playing the Darknet labyrinth to obtain TRP.
+        15.2, // Hard.   As above.
+        15.3, // Hard.   As above.
         12.9999 // Easy. Keep playing forever. Only stanek scales very well here, there is much work to be done to be able to climb these faster.
     ];
     const augTRP = "The Red Pill";
@@ -274,12 +284,26 @@ export async function main(ns) {
         }
     }
 
+    /** Daedalus accepts either hacking >= 2500 OR strength/defense/dexterity/agility all >= 1500 (src/Faction/FactionInfo.tsx haveCombatSkills(1500))
+     * @param {Player} player @param {number} fraction Optionally check against a fraction of the 1500 requirement (e.g. 0.9 for "nearly there") */
+    function daedalusCombatPathMet(player, fraction = 1) {
+        return ["strength", "defense", "dexterity", "agility"].every(stat => player.skills[stat] >= 1500 * fraction);
+    }
+
     /** Logic run periodically to if there is anything we can do to speed along earning a Daedalus invite
      * @param {NS} ns
      * @param {Player} player **/
     async function checkOnDaedalusStatus(ns, player, stocksValue) {
         // Early exit conditions, if we Daedalus is not (or is no longer) a concern for this reset
         if (alreadyJoinedDaedalus || autoJoinDaedalusUnavailable) return;
+        // In BN15, Daedalus does not sell The Red Pill (src/Faction/FactionHelpers.tsx getFactionAugmentationsFiltered strips TRP from Daedalus when
+        // bitNodeN === 15). TRP is instead the 4th Darknet labyrinth reward (src/DarkNet/effects/labyrinth.ts), which these scripts do not automate.
+        // So there is no reason to rush an invite / reserve $100b for Daedalus (faction-manager will still join it if invited, for its other augs).
+        if (resetInfo.currentNode == 15 && !options['assume-daedalus-sells-trp']) {
+            log_once(ns, `INFO: In BN15, Daedalus does not sell "${augTRP}" - it must be earned from the Darknet labyrinth (not automated by these scripts). ` +
+                `Skipping the Daedalus invite rush / money reserve logic. (Override with --assume-daedalus-sells-trp)`, true, 'info');
+            return autoJoinDaedalusUnavailable = true;
+        }
         // If we've already installed the red pill we no longer need to try to join this faction.
         // Even without SF4, we can "deduce" whether we've installed TRP by checking whether w0r1d_d43m0n has a non-zero hack level
         if (installedAugmentations.includes(augTRP) || (wdHack != null && Number.isFinite(wdHack) && wdHack > 0))
@@ -321,8 +345,9 @@ export async function main(ns) {
 
         // Remaining logic below is for rushing a Daedalus invite in the current reset
         const totalWorth = player.money + stocksValue;
-        // Check for sufficient hacking level before attempting to reserve money
-        if (player.skills.hacking < 2500) {
+        // Check for sufficient hacking level (or combat stats) before attempting to reserve money
+        // src/Faction/FactionInfo.tsx Daedalus inviteReqs: augs >= DaedalusAugsRequirement AND money >= 100e9 AND (hacking >= 2500 OR all combat stats >= 1500)
+        if (player.skills.hacking < 2500 && !daedalusCombatPathMet(player)) {
             // If we happen to already have enough money for daedalus and are only waiting on hack-level,
             // set a flag to switch daemon.js into --xp-only mode, to prioritize earning hack exp over money
             // HEURISTIC (i.e. Hack): Only do this if we naturally get within 75% of the hack stat requirement,
@@ -339,7 +364,7 @@ export async function main(ns) {
             //       never reserve money in case this requirement is not met, or we're potentially just wasting money
             if (!(4 in unlockedSFs)) {
                 log(ns, `SUCCESS: ${player.money < moneyReq ? "If you sell your stocks, y" : "Y"}ou should have enough money ` +
-                    `(>=${formatMoney(moneyReq)}) and a sufficiently high hack level (>=${2500}) to get an invite from the faction Daedalus. ` +
+                    `(>=${formatMoney(moneyReq)}) and sufficiently high stats (hack >= 2500, or all combat stats >= 1500) to get an invite from the faction Daedalus. ` +
                     `Before you attempt this though, ensure you have ${bitNodeMults.DaedalusAugsRequirement} ` +
                     `augmentations installed (scripts cannot check this without SF4).`, true, 'success');
                 return autoJoinDaedalusUnavailable = true; // We won't show this again.
@@ -553,20 +578,33 @@ export async function main(ns) {
                     // Check whether we should be spending hashes to reduce minimum security
                     const serverMinSecurity = await getNsDataThroughFile(ns, 'ns.getServerMinSecurityLevel(ns.args[0])', null, [bestServer]);
                     const shouldReduceMinSecurity = serverMinSecurity > 2; // Each purchase reduces by 2%. Can't go below 1, but not worth the cost to keep going below 2.
+                    // Check whether we should (still) be spending hashes to increase max money. The game soft-caps this above $10t:
+                    // src/Server/Server.ts changeMaximumMoney: if moneyMax > 10e12, n = 1 + (n - 1) / ln(moneyMax - 10e12) / ln(8), so the +2% per purchase
+                    // shrinks to a tiny fraction of a percent, making further purchases a waste of hashes (controlled by --max-money-boost-cap).
+                    const moneyBoostCap = options['max-money-boost-cap'];
+                    const serverMaxMoney = moneyBoostCap > 0 ? await getNsDataThroughFile(ns, 'ns.getServerMaxMoney(ns.args[0])', null, [bestServer]) : 0;
+                    const shouldIncreaseMaxMoney = !(moneyBoostCap > 0) || serverMaxMoney < moneyBoostCap;
+                    if (!shouldIncreaseMaxMoney)
+                        log_once(ns, `INFO: ${bestServer} max money (${formatMoney(serverMaxMoney)}) has reached the "Increase Maximum Money" soft-cap ` +
+                            `(${formatMoney(moneyBoostCap)}, --max-money-boost-cap), so hashes will no longer be spent boosting it.`);
                     // If we were already spending hashes to boost a server, check to see if things have changed
                     if (existingSpendHashesProc) {
                         const currentBoostTarget = existingSpendHashesProc.args[1 + existingSpendHashesProc.args.indexOf("--spend-on-server")];
                         const isReducingSecurity = existingSpendHashesProc.args.includes("Reduce_Minimum_Security");
-                        if (currentBoostTarget != bestServer || isReducingSecurity != shouldReduceMinSecurity) {
+                        const isIncreasingMoney = existingSpendHashesProc.args.includes("Increase_Maximum_Money");
+                        if (currentBoostTarget != bestServer || isReducingSecurity != shouldReduceMinSecurity || isIncreasingMoney != shouldIncreaseMaxMoney) {
                             log(ns, `Killing a prior spend-hacknet-hashes.js process targetting ${currentBoostTarget} because ` +
-                                (currentBoostTarget != bestServer ? `The new best income server is ${bestServer}.` : 'We no longer need to reduce minimum security.'), true);
+                                (currentBoostTarget != bestServer ? `The new best income server is ${bestServer}.` :
+                                    isReducingSecurity != shouldReduceMinSecurity ? 'We no longer need to reduce minimum security.' :
+                                        'Its max money has reached the soft-cap, so we no longer need to increase maximum money.'), true);
                             await killScript(ns, 'spend-hacknet-hashes.js', null, existingSpendHashesProc);
                             existingSpendHashesProc = false;
                         }
                     }
-                    if (!existingSpendHashesProc) { // 
+                    if (!existingSpendHashesProc && (shouldIncreaseMaxMoney || shouldReduceMinSecurity)) {
                         log(ns, `Identified that the best hack income server is ${bestServer} worth ${formatMoney(gain)}/sec.`);
-                        const spendHashesArgs = ["--liquidate", "--spend-on-server", bestServer, "--spend-on", "Increase_Maximum_Money"];
+                        const spendHashesArgs = ["--liquidate", "--spend-on-server", bestServer];
+                        if (shouldIncreaseMaxMoney) spendHashesArgs.push("--spend-on", "Increase_Maximum_Money");
                         if (shouldReduceMinSecurity) spendHashesArgs.push("--spend-on", "Reduce_Minimum_Security");
                         launchScriptHelper(ns, 'spend-hacknet-hashes.js', spendHashesArgs);
                     }
@@ -1005,10 +1043,10 @@ export async function main(ns) {
                     setStatus(ns, `We're in Daedalus, so we won't install until we can afford to purchase "${augTRP}".`);
                     return true;
                 }
-            } else if (playerInstalledAugCount >= bitNodeMults.DaedalusAugsRequirement && player.skills.hacking >= (2500 * 0.9)) {
-                // If we meet the Daedalus aug count requirement and at least 90% of the required hack level, wait to earn the invite
-                setStatus(ns, `Not installing because we're in BN8 and we have enough augs and ` + (player.skills.hacking < 2500 ? 'nearly ' : '')
-                    + 'enough hack level to get invited to Daedalus once we hit $100b.');
+            } else if (playerInstalledAugCount >= bitNodeMults.DaedalusAugsRequirement && (player.skills.hacking >= (2500 * 0.9) || daedalusCombatPathMet(player, 0.9))) {
+                // If we meet the Daedalus aug count requirement and at least 90% of the required hack level (or combat stats), wait to earn the invite
+                setStatus(ns, `Not installing because we're in BN8 and we have enough augs and ` + ((player.skills.hacking < 2500 && !daedalusCombatPathMet(player)) ? 'nearly ' : '')
+                    + 'enough hack level (or combat stats) to get invited to Daedalus once we hit $100b.');
                 return true;
             } else if (getTimeInAug() > 4 * 60 * 60 * 1000) { // 4 hours = 4hrs/min * 60mins/sec * 60secs/ms * 1000ms
                 // If we've been in BN8 for more than 4 hours, we shouldn't reset unless we're making significant progress towards unlocking Daedalus.

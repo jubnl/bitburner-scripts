@@ -10,7 +10,7 @@ const argsSchema = [
     ['max-spend', Number.MAX_VALUE], // The maximum amount of money to spend on upgrades
     ['toast', false], // Set to true to toast purchases
     ['reserve', null], // Reserve this much cash (defaults to contents of reserve.txt if not specified)
-
+    ['legacy-production-estimates', false], // Set to true to restore the old marginal-production estimates (hacknet *server* formulas applied to hacknet nodes too, and no Formulas API). By default we use the exact game formulas for nodes vs servers, and ns.formulas.hacknet* when Formulas.exe is available.
 ];
 
 export function autocomplete(data, _) {
@@ -66,18 +66,46 @@ function setStatus(ns, logMessage) {
 /** @param {NS} ns **/
 export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600 sec == 1 hour */, options) {
     const currentHacknetMult = ns.getPlayer().mults.hacknet_node_money;
+    // Detect up-front whether we have hacknet nodes or hacknet servers (hashCapacity is 0 for plain nodes), so the right formulas are used from the first purchase
+    if (haveHacknetServers && ns.hacknet.numNodes() > 0 && ns.hacknet.hashCapacity() == 0)
+        haveHacknetServers = false;
     // Get the lowest cache level, we do not consider upgrading the cache level of servers above this until all have the same cache level
     const minCacheLevel = [...Array(ns.hacknet.numNodes()).keys()].reduce((min, i) => Math.min(min, ns.hacknet.getNodeStats(i).cache), Number.MAX_VALUE);
-    // Note: Formulas API has a hashGainRate which should agree with these calcs, but this way they're available even without the formulas API
+    const legacyEstimates = options?.['legacy-production-estimates'] ?? false;
+    // Production of a node/server with the given stats via the Formulas API (exact; 0 RAM per RamCostGenerator formulas.hacknetNodes/hacknetServers, but throws without Formulas.exe)
+    const fnProduction = (level, ram, cores) => haveHacknetServers ?
+        ns.formulas.hacknetServers.hashGainRate(level, 0, ram, cores, currentHacknetMult) : // (level, ramUsed, maxRam, cores, mult)
+        ns.formulas.hacknetNodes.moneyGainRate(level, ram, cores, currentHacknetMult); // (level, ram, cores, mult)
+    let formulasAvailable = true;
+    try { fnProduction(1, 1, 1); } catch { formulasAvailable = false; }
+    const haveFormulas = formulasAvailable && !legacyEstimates; // Whether to use the formulas API for exact marginal production
+    // Relative production gain from a single upgrade, used when the formulas API is unavailable. Derived from the game's production formulas:
+    //   Hacknet Nodes   (src/Hacknet/formulas/HacknetNodes.ts calculateMoneyGainRate):  level * gainPerLevel * 1.035^(ram - 1) * (cores + 5) / 6 * mult * BN
+    //   Hacknet Servers (src/Hacknet/formulas/HacknetServers.ts calculateHashGainRate): hashesPerLevel * level * 1.07^log2(ram) * (1 + (cores - 1) / 5) * mult * BN
+    // (The legacy estimates applied the server formulas to plain nodes as well, which over-values cores and under-values RAM on nodes.)
+    const useServerFormulas = haveHacknetServers || legacyEstimates;
+    const relativeGain = {
+        level: s => (s.level + 1) / s.level - 1, // Linear in level for both nodes and servers
+        ram: s => useServerFormulas ? 0.07 : Math.pow(1.035, s.ram) - 1, // Servers: 1.07^log2(2r) / 1.07^log2(r) = 1.07. Nodes: 1.035^(2r-1) / 1.035^(r-1) = 1.035^r
+        cores: s => useServerFormulas ? (s.cores + 5) / (s.cores + 4) - 1 : (s.cores + 6) / (s.cores + 5) - 1, // Servers: ((c+1)+4)/(c+4). Nodes: ((c+1)+5)/(c+5)
+    };
+    const addedProduction = (s, stat) => {
+        if (haveFormulas) { // Exact marginal production from the formulas API
+            const next = { level: s.level, ram: s.ram, cores: s.cores };
+            next[stat] = stat == "ram" ? s.ram * 2 : next[stat] + 1;
+            return fnProduction(next.level, next.ram, next.cores) - fnProduction(s.level, s.ram, s.cores);
+        }
+        return s.production * relativeGain[stat](s);
+    };
     const upgrades = [{ name: "none", cost: 0 }, {
         name: "level", upgrade: ns.hacknet.upgradeLevel, cost: i => ns.hacknet.getLevelUpgradeCost(i, 1), nextValue: nodeStats => nodeStats.level + 1,
-        addedProduction: nodeStats => nodeStats.production * ((nodeStats.level + 1) / nodeStats.level - 1)
+        addedProduction: nodeStats => addedProduction(nodeStats, "level")
     }, {
         name: "ram", upgrade: ns.hacknet.upgradeRam, cost: i => ns.hacknet.getRamUpgradeCost(i, 1), nextValue: nodeStats => nodeStats.ram * 2,
-        addedProduction: nodeStats => nodeStats.production * 0.07
+        addedProduction: nodeStats => addedProduction(nodeStats, "ram")
     }, {
         name: "cores", upgrade: ns.hacknet.upgradeCore, cost: i => ns.hacknet.getCoreUpgradeCost(i, 1), nextValue: nodeStats => nodeStats.cores + 1,
-        addedProduction: nodeStats => nodeStats.production * ((nodeStats.cores + 5) / (nodeStats.cores + 4) - 1)
+        addedProduction: nodeStats => addedProduction(nodeStats, "cores")
     }, {
         name: "cache", upgrade: ns.hacknet.upgradeCache, cost: i => ns.hacknet.getCacheUpgradeCost(i, 1), nextValue: nodeStats => nodeStats.cache + 1,
         addedProduction: nodeStats => nodeStats.cache > minCacheLevel || !haveHacknetServers ? 0 : nodeStats.production * 0.01 / nodeStats.cache // Note: Does not actually give production, but it has "worth" to us so we can buy more things
@@ -91,10 +119,9 @@ export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600
     let worstNodeProduction = Number.MAX_VALUE; // Used to how productive a newly purchased node might be
     for (var i = 0; i < ns.hacknet.numNodes(); i++) {
         let nodeStats = ns.hacknet.getNodeStats(i);
-        if (haveHacknetServers) { // When a hacknet server runs scripts, nodeStats.production lags behind what it should be for current ram usage. Get the "raw" rate
-            try { nodeStats.production = ns.formulas.hacknetServers.hashGainRate(nodeStats.level, 0, nodeStats.ram, nodeStats.cores, currentHacknetMult); }
-            catch { /* If we do not have the formulas API yet, we cannot account for this and must simply fall-back to using the production reported by the node */ }
-        }
+        if (haveHacknetServers && formulasAvailable) // When a hacknet server runs scripts, nodeStats.production lags behind what it should be for current ram usage. Get the "raw" rate
+            nodeStats.production = fnProduction(nodeStats.level, nodeStats.ram, nodeStats.cores);
+        // (If we do not have the formulas API yet, we cannot account for this and must simply fall-back to using the production reported by the node)
         worstNodeProduction = Math.min(worstNodeProduction, nodeStats.production);
         for (let up = 1; up < upgrades.length; up++) {
             let currentUpgradeCost = upgrades[up].cost(i);

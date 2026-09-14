@@ -19,6 +19,7 @@ const argsSchema = [
     ['no-crime', false], // Disable doing crimes at all. (Also disabled with --no-focus)
     ['crime-focus', false], // Useful in crime-focused BNs when you want to focus on crime related factions
     ['fast-crimes-only', false], // Assasination and Heist are so slow, I can see people wanting to disable them just so they can interrupt at will.
+    ['crime-warmup-with-mug', false], // Restore the pre-3.0 behaviour of starting with 'Mug' when Homicide's success chance is < 75%. By default we always use Homicide when karma/kills are needed, since (v3.0) failed crimes still give karma/4, so Homicide beats Mug for karma at any success chance.
     ['invites-only', false], // Just work to get invites, don't work for augmentations / faction rep
     ['prioritize-invites', false], // Prioritize working for as many invites as is practical before starting to grind for faction reputation
     ['get-invited-to-every-faction', false], // You want to be in every faction? You got it!
@@ -34,10 +35,11 @@ const default_desired_augs = ["The Red Pill", "CashRoot Starter Kit", "The Blade
 //       companies get a stat modifier of "+224", except a few which have "+249". Rather than replicate those gross numbers,
 //       I would just store those job stat requirements as [225, 250, 275, 375] below. I then keep track of the few companies
 //       which require +25 on all stat requirements. Don't worry, I make up for it by being convoluted in other ways...
+// Verified against v3.0.1 src/Company/data/CompaniesMetadata.ts jobStatReqOffset: ECorp/MegaCorp/NWO = 249, all other megacorps = 224
 const companySpecificConfigs = [
     { name: "NWO", statModifier: 25 },
     { name: "MegaCorp", statModifier: 25 },
-    { name: "Blade Industries", statModifier: 25 },
+    { name: "ECorp", statModifier: 25 },
     { name: "Fulcrum Secret Technologies", companyName: "Fulcrum Technologies" }, // Special snowflake
     { name: "Silhouette", companyName: "TBD", repRequiredForFaction: 1.0e7 } // Hack: 3.2e6 should be enough rep to get the CTO position, but once
     // we hit this rep we might break out of the work loop before getting the final promotion, so we keep working until we get the faction invite.
@@ -497,8 +499,12 @@ async function earnFactionInvite(ns, factionName) {
         }
     }
     requirement = Math.max(serverReqHackingLevel, requiredHackByFaction[factionName] || 0)
-    if (requirement && player.skills.hacking < requirement &&
-        // Special case (Daedalus): Don't grind for hack requirement if we previously did a grind for the physical requirements
+    // Special case (Daedalus): the invite requires hacking >= 2500 OR all four combat stats >= 1500
+    // (src/Faction/FactionInfo.tsx: someCondition([haveSkill("hacking", 2500), haveCombatSkills(1500)])),
+    // so the hack requirement is moot if the combat path is already satisfied (or we just did a combat grind for it)
+    const combatPathSatisfied = reqHackingOrCombat.includes(factionName) && (requiredCombatByFaction[factionName] || 0) > 0 && deficientStats.length == 0;
+    if (requirement && player.skills.hacking < requirement && !combatPathSatisfied &&
+        // Don't grind for hack requirement if we previously did a grind for the physical requirements
         !(reqHackingOrCombat.includes(factionName) && workedForInvite)) {
         ns.print(`${reasonPrefix} you have insufficient hack level. Need: ${requirement}, Have: ${player.skills.hacking}`);
         const em = requirement / options['training-stat-per-multi-threshold'];
@@ -633,9 +639,15 @@ export async function crimeForKillsKarmaStats(ns, reqKills, reqKarma, reqStats, 
         if (!forever && breakToMainLoop()) return ns.print('INFO: Interrupting crime to check on high-level priorities.');
         let crimeChances = await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(c => [c, ns.singularity.getCrimeChance(c)]))`, '/Temp/crime-chances.txt', bestCrimesByDifficulty);
         let karma = -ns.heart.break();
-        crime = crimeCount < 2 ? (crimeChances["Homicide"] > 0.75 ? "Homicide" : "Mug") : // Start with a few fast & easy crimes to boost stats if we're just starting
-            (!needStats && (player.numPeopleKilled < reqKills || karma < reqKarma)) ? "Homicide" : // If *all* we need now is kills or Karma, homicide is the fastest way to do that, even at low proababilities
+        const needKarmaOrKills = player.numPeopleKilled < reqKills || karma < reqKarma;
+        // v3.0 src/Work/CrimeWork.ts: a failed crime still grants karma/4 (and kills only on success), and src/Crime/Crimes.ts gives
+        // Homicide 3 karma / 3s vs Mug 0.25 karma / 4s. So Homicide's *worst* case (0% success) is 0.25 karma/s, which already beats
+        // Mug's *best* case (0.0625 karma/s). Hence, whenever karma or kills are needed, Homicide is always the right crime.
+        const homicideForKarma = needKarmaOrKills && !(options ? options['crime-warmup-with-mug'] : false);
+        crime = (crimeCount < 2 && !homicideForKarma) ? (crimeChances["Homicide"] > 0.75 ? "Homicide" : "Mug") : // Start with a few fast & easy crimes to boost stats if we're just starting
+            (!needStats && needKarmaOrKills) ? "Homicide" : // If *all* we need now is kills or Karma, homicide is the fastest way to do that, even at low proababilities
                 bestCrimesByDifficulty.find((c, index) => doFastCrimesOnly && index <= 1 ? 0 : crimeChances[c] >= chanceThresholds[index]); // Otherwise, crime based on success chance vs relative reward (precomputed)
+        if (crime == "Mug" && homicideForKarma) crime = "Homicide"; // Never fall back to Mug while karma/kills are still needed (Heist/Assassination tiers are kept for money/stat grinding)
         // Warn if current crime is disrupted
         let currentWork = await getCurrentWorkInfo(ns);
         let crimeType = currentWork.crimeType;

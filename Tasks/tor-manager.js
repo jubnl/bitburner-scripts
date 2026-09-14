@@ -9,7 +9,9 @@ export async function main(ns) {
     if (!keepRunning)
         ns.print(`tor-manager will run once. Run with argument "-c" to run continuously.`)
 
-    let hasTor = () => ns.scan("home").includes("darkweb");
+    // Note: Since 3.0, ns.scan never returns the "darkweb" server (src/NetscriptFunctions.ts scan: DarknetServer instances are skipped),
+    //       so TOR can no longer be detected by scanning for it. ns.hasTorRouter() costs 0.05 GB (src/Netscript/RamCostGenerator.ts).
+    let hasTor = () => ns.hasTorRouter();
     if (hasTor())
         return ns.print('Player already has Tor');
     do {

@@ -43,6 +43,10 @@ const argsSchema = [
     ['no-share', false],  // Disable sharing free ram to increase faction rep gain
     ['share-cooldown', 5000], // Wait before attempting to schedule more share threads (e.g. to free RAM to be freed for hack batch scheduling first)
     ['share-max-utilization', 0.8], // Set to 1 if you don't care to leave any RAM free after sharing. Will use up to this much of the available RAM
+    // Cap on the number of share threads scheduled at once. The game's share bonus is 1 + ln(effectiveThreads) / 25 (src/NetworkShare/Share.ts calculateShareBonus),
+    // so the returns are logarithmic: 16384 threads (64 TB) is already a ~1.39x rep multiplier, and doubling the threads only adds ~0.028x. RAM beyond this cap is better spent on hacking.
+    ['share-max-threads', 16384],
+    ['ignore-cores', false], // Set to true to disable cores-aware scheduling (grow/weaken/share threads are scaled by the host's core bonus: 1 + (cores - 1) / 16, src/Server/ServerHelpers.ts getCoreBonus)
 
     ['disable-script', []], // The names of scripts that you do not want run by our scheduler
     ['run-script', []], // The names of additional scripts that you want daemon to run on home
@@ -51,10 +55,17 @@ const argsSchema = [
 
     // Batch script fine-tuning flags
     ['initial-max-targets', undefined], // Initial number of servers to target / prep (default is 2 + 1 for every 500 TB of RAM on the network)
-    ['cycle-timing-delay', 4000], // (ms) Length of a hack cycle. The smaller this is, the more batches (HWGW) we can schedule before the first cycle fires, but the greater the chance of a misfire
+    // (ms) Length of a hack cycle: consecutive batches (HWGW) against the same target are spaced this far apart, and the 4 tasks of a batch resolve 1/4 of this apart.
+    // The smaller this is, the more batches we can schedule before the first one fires (more income per target), but the tighter the tolerance for timer jitter.
+    // Since the game fixes each task's duration when the remote script starts (hack/grow/weaken time + additionalMsec, src/Netscript/NetscriptHelpers.tsx hack()),
+    // the only ordering risk is game-loop timer jitter, so 2000 (500ms between task resolutions) is comfortable. 1000 (with --max-batches 200) is an aggressive but workable setting.
+    ['cycle-timing-delay', 2000],
     ['queue-delay', 1000], // (ms) Delay before the first script begins, to give time for all scripts to be scheduled
     ['recovery-thread-padding', 1], // Multiply the number of grow/weaken threads needed by this amount to automatically recover more quickly from misfires.
-    ['max-batches', 40], // Maximum overlapping cycles to schedule in advance. Note that once scheduled, we must wait for all batches to complete before we can schedule mor
+    // Maximum overlapping cycles to schedule in advance for one target. Note that once scheduled, we must wait for all batches to complete before we can schedule more.
+    // The number of batches that fit is ~ weaken-time / cycle-timing-delay, so halving the delay (above) needs roughly double the batches to fully use the window.
+    // Each batch is 4 running scripts, so very high values (e.g. 200 for --cycle-timing-delay 1000) cost IRL RAM/CPU for the game to track.
+    ['max-batches', 100],
     ['max-steal-percentage', 0.75], // Don't steal more than this in case something goes wrong with timing or scheduling, it's hard to recover frome
 
     ['looping-mode', false], // Set to true to attempt to schedule perpetually-looping tasks.
@@ -146,6 +157,7 @@ export async function main(ns) {
 
     let daemonHost = null; // the name of the host of this daemon, so we don't have to call the function more than once.
     let hasFormulas = true;
+    let ownTorRouter = false; // Whether we own the TOR router (refreshed once per loop, see updatePortCrackers)
     let currentTerminalServer = ""; // Periodically updated when intelligence farming, the current connected terminal server.
     let dictSourceFiles = (/**@returns{{[bitNode: number]: number;}}*/() => undefined)(); // Available source files
     let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)();
@@ -275,7 +287,7 @@ export async function main(ns) {
         lowUtilizationIterations = highUtilizationIterations = 0;
         allHostNames = [], _allServers = [], homeServer = null;
         resetServerSortCache();
-        ownedCracks = [];
+        ownedCracks = [], ownedPrograms = [], ownTorRouter = false;
         psCache = {};
         // XpMode Related Caches
         singleServerLimit = 0, lastCycleTotalRam = 0; // Cache of total ram on the server to check whether we should attempt to lift the above restriction.
@@ -388,9 +400,11 @@ export async function main(ns) {
         // These scripts are spawned periodically (at some interval) to do their checks, with an optional condition that limits when they should be spawned
         // Note: Periodic script are generally run every 30 seconds, but intervals are spaced out to ensure they aren't all bursting into temporary RAM at the same time.
         periodicScripts = [
-            // Buy tor as soon as we can if we haven't already, and all the port crackers
-            { interval: 25000, name: "/Tasks/tor-manager.js", shouldRun: () => 4 in dictSourceFiles && !allHostNames.includes("darkweb") },
-            { interval: 26000, name: "/Tasks/program-manager.js", shouldRun: () => 4 in dictSourceFiles && ownedCracks.length != 5 },
+            // Buy tor as soon as we can if we haven't already, and all the darkweb programs (port crackers first)
+            // Note: Since 3.0, ns.scan never returns the "darkweb" server (src/NetscriptFunctions.ts scan skips DarknetServer instances),
+            //       so we track ownership via ns.hasTorRouter() (0.05 GB, ram-dodged once per loop in updatePortCrackers) rather than the scan result.
+            { interval: 25000, name: "/Tasks/tor-manager.js", shouldRun: () => 4 in dictSourceFiles && !ownTorRouter },
+            { interval: 26000, name: "/Tasks/program-manager.js", shouldRun: () => 4 in dictSourceFiles && ownTorRouter && ownedPrograms.length != darkwebPrograms.length },
             { interval: 27000, name: "/Tasks/contractor.js", minRamReq: 14.2 }, // Periodically look for coding contracts that need solving
             // Buy every hacknet upgrade with up to 4h payoff if it is less than 10% of our current money or 8h if it is less than 1% of our current money.
             { interval: 28000, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "4h", "--max-spend", getPlayerMoney(ns) * 0.1] },
@@ -951,6 +965,10 @@ export async function main(ns) {
                     network = getNetworkStats(); // Update network stats since they may have changed after scheduling xp cycles above
                     utilizationPercent = network.totalUsedRam / network.totalMaxRam;
                     let shareThreads = Math.floor(maxThreads * (maxShareUtilization - utilizationPercent) / (1 - utilizationPercent)); // Ensure we don't take utilization above (1-maxShareUtilization)%
+                    // Cap the thread count: the share bonus is 1 + ln(effectiveThreads) / 25 (src/NetworkShare/Share.ts calculateShareBonus), so returns are
+                    // logarithmic and RAM beyond this cap is better left free for hack batches. (Hosts with more cores are preferred by arbitraryExecution, since
+                    // effectiveThreads = threads * intelligence bonus * coreBonus of the host running share.)
+                    shareThreads = Math.min(shareThreads, options['share-max-threads']);
                     if (shareThreads > 0) {
                         if (verbose) log(ns, `Creating ${shareThreads.toLocaleString('en')} share threads to improve faction rep gain rates. Using ${formatRam(shareThreads * 4)} of ${formatRam(network.totalMaxRam)} ` +
                                          `(${(400 * shareThreads / network.totalMaxRam).toFixed(1)}%) of all RAM). Final utilization will be ${(100 * (4 * shareThreads + network.totalUsedRam) / network.totalMaxRam).toFixed(1)}%`);
@@ -995,8 +1013,64 @@ export async function main(ns) {
         } while (!runOnce);
     }
 
-    // How much a weaken thread is expected to reduce security by
+    // How much a weaken thread is expected to reduce security by (on a 1-core host)
     let actualWeakenPotency = () => bitNodeMults.ServerWeakenRate * weakenThreadPotency;
+
+    /** The bonus the game applies to grow(), weaken() and share() based on the cpuCores of the host RUNNING the script
+     * (src/NetscriptFunctions.ts: grow/weaken use `scripthost.cpuCores`, share uses `ctx.workerScript.getServer().cpuCores`).
+     * Game: src/Server/ServerHelpers.ts getCoreBonus(cores) = 1 + (cores - 1) / 16. It multiplies the weaken amount (getWeakenEffect),
+     * the per-thread log-growth of grow (src/Server/formulas/grow.ts calculateServerGrowthLog) and the effective share threads (src/NetworkShare/Share.ts).
+     * @param {number} cores */
+    const coreBonus = cores => 1 + (Math.max(1, cores || 1) - 1) / 16;
+
+    /** Builds a function that converts a "1-core" weaken thread count into the threads required on a host with the given number of cores.
+     * Game: weaken amount = ServerWeakenAmount (0.05) * threads * coreBonus(cores) * ServerWeakenRate (src/Server/ServerHelpers.ts getWeakenEffect), linear in threads.
+     * @param {number} oneCoreThreads
+     * @returns {((cores: number) => number)|null} null if cores-aware scheduling is disabled (--ignore-cores) */
+    function weakenThreadsByCores(oneCoreThreads) {
+        if (options['ignore-cores']) return null;
+        return cores => {
+            if (cores <= 1) return oneCoreThreads;
+            let potencyRatio = coreBonus(cores); // How much more effective each thread is on this host than on a 1-core host
+            if (hasFormulas) { // The formulas API is free (0 GB, src/Netscript/RamCostGenerator.ts), so take the value straight from the game when we can
+                try { potencyRatio = ns.formulas.hacking.weakenEffect(1, cores) / ns.formulas.hacking.weakenEffect(1, 1); }
+                catch { hasFormulas = false; }
+            }
+            return Math.max(1, Math.ceil((oneCoreThreads / potencyRatio).toPrecision(14)));
+        };
+    }
+
+    /** Builds a function that converts a "1-core" grow thread count into the threads required on a host with the given number of cores.
+     * Game: money after grow = (startMoney + threads) * exp(k * threads * coreBonus(cores)) (src/Server/formulas/grow.ts calculateGrowMoney and
+     * calculateServerGrowthLog), so the exponential term scales exactly with 1 / coreBonus (the "+threads" term is negligible unless money is ~0,
+     * which is why callers that rely on it - grow-from-zero and XP farming - do not use this). When Formulas.exe is available and `oneCoreThreads`
+     * is the full amount needed to reach max money from `startMoney`, we instead ask the game directly:
+     * ns.formulas.hacking.growThreads(server, player, targetMoney, cores) -> numCycleForGrowthCorrected (src/Server/ServerHelpers.ts) with the host's cores.
+     * @param {Server} server The target server
+     * @param {number} oneCoreThreads Threads computed assuming a 1-core host (including any recovery padding)
+     * @param {number|null} startMoney The money the target is expected to have when the grow resolves, or null if `oneCoreThreads` is only a partial grow (linear scaling only)
+     * @param {number} padding The recovery thread padding that was applied to oneCoreThreads (re-applied to the formulas result)
+     * @returns {((cores: number) => number)|null} null if cores-aware scheduling is disabled (--ignore-cores) */
+    function growThreadsByCores(server, oneCoreThreads, startMoney = null, padding = 1) {
+        if (options['ignore-cores']) return null;
+        const minThreads = padding > 1 ? 2 : 1; // Same minimums as getGrowThreadsNeededAfterTheft
+        return cores => {
+            if (cores <= 1) return oneCoreThreads;
+            if (hasFormulas && startMoney !== null) {
+                try {
+                    // Mock the properties of the target as they will be when the grow resolves (prepped to min security, holding startMoney)
+                    const mock = server.server;
+                    mock.hackDifficulty = server.getMinSecurity();
+                    mock.requiredHackingSkill = server.requiredHackLevel;
+                    mock.moneyMax = server.getMaxMoney();
+                    mock.moneyAvailable = startMoney;
+                    const threads = ns.formulas.hacking.growThreads(mock, _cachedPlayerInfo, server.getMaxMoney(), cores);
+                    return Math.max(minThreads, Math.ceil((threads * padding).toPrecision(14)));
+                } catch { hasFormulas = false; }
+            }
+            return Math.max(minThreads, Math.ceil((oneCoreThreads / coreBonus(cores)).toPrecision(14)));
+        };
+    }
 
     // Get a dictionary from retrieving the same infromation for every server name
     async function getServersDict(ns, command) {
@@ -1012,6 +1086,7 @@ export async function main(ns) {
     let dictServerMaxRam = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
     let dictServerProfitInfo = (/**@returns{{[serverName: string]: {gainRate: number, expRate: number}}}*/() => undefined)();
     let dictServerGrowths = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
+    let dictServerCores = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 
     /** Gathers up arrays of server data via external request to have the data written to disk.
      * This data should only need to be gathered once per run, as it never changes
@@ -1043,6 +1118,9 @@ export async function main(ns) {
         // Min Security / Max Money can be affected by Hashnet purchases, so we should update this occasionally
         dictServerMinSecurityLevels = await getServersDict(ns, 'getServerMinSecurityLevel');
         dictServerMaxMoney = await getServersDict(ns, 'getServerMaxMoney');
+        // Core counts can increase over time (ram-manager.js buys home cores, hacknet servers can be upgraded) and affect grow/weaken/share thread sizing
+        dictServerCores = await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(server => [server, ns.getServer(server).cpuCores]))`,
+            '/Temp/getServer-cpuCores-all.txt', allHostNames);
         // Get the information about the relative profitability of each server (affects targetting order)
         const pid = await exec(ns, getFilePath('analyze-hack.js'), null, null, '--all', '--silent');
         await waitForProcessToComplete_Custom(ns, getHomeProcIsAlive(ns), pid);
@@ -1099,6 +1177,8 @@ export async function main(ns) {
         }
         getMinSecurity() { return dictServerMinSecurityLevels[this.name] ?? 0; } // Servers not in our dictionary were purchased, and so undefined is okay
         getMaxMoney() { return dictServerMaxMoney[this.name] ?? 0; }
+        /** @returns {number} The number of CPU cores on this server. Boosts grow/weaken/share scripts that RUN here (see coreBonus) */
+        cpuCores() { return dictServerCores?.[this.name] ?? this.server?.cpuCores ?? 1; }
         getMoneyPerRamSecond() { return dictServerProfitInfo ? dictServerProfitInfo[this.name]?.gainRate ?? 0 : (dictServerMaxMoney[this.name] ?? 0); }
         getExpPerSecond() { return dictServerProfitInfo ? dictServerProfitInfo[this.name]?.expRate ?? 0 : (1 / dictServerMinSecurityLevels[this.name] ?? 0); }
         getMoney() { return this.ns.getServerMoneyAvailable(this.name); }
@@ -1405,24 +1485,20 @@ export async function main(ns) {
             return log(ns, `WARNING: Attempt to schedule ${getTargetSummary(currentTarget)} returned 0 max cycles? ${JSON.stringify(snapshot)}`, false, 'warning');
         if (currentTarget.getHackThreadsNeeded() === 0)
             return log(ns, `WARNING: Attempted to schedule empty cycle ${maxCycles} x ${getTargetSummary(currentTarget)}? ${JSON.stringify(snapshot)}`, false, 'warning');
-        let firstEnding = null, lastStart = null, lastBatch = 0, cyclesScheduled = 0;
+        let lastBatch = 0, cyclesScheduled = 0;
+        // Note: A guard used to live here to stop scheduling once a batch's last task would *start* after the first batch's hack *resolves*
+        // (the server is then briefly not at min security). It was dead code (it compared against an undefined `newBatch.firstFire`, so it
+        // only ever compared the first batch against itself) and it is not needed: our remote scripts start immediately and bundle their wait
+        // into `additionalMsec`, and the game fixes a task's duration the moment the script starts (hack/grow/weaken time at the *current*
+        // security + additionalMsec, src/Netscript/NetscriptHelpers.tsx hack()), so a task's planned start time cannot change its duration.
+        // Batch spacing (cycleTimingDelay = 4 x the gap between task resolutions, see getScheduleTiming) keeps resolution windows from
+        // overlapping, and the number of batches is bounded by optimalPacedCycles (~ weaken time / cycle-timing-delay) and --max-batches.
         while (cyclesScheduled < maxCycles) {
             const newBatchStart = new Date((cyclesScheduled === 0) ? Date.now() + queueDelay : lastBatch.getTime() + cycleTimingDelay);
             lastBatch = new Date(newBatchStart.getTime());
             const batchTiming = getScheduleTiming(newBatchStart, currentTarget);
             if (verbose && runOnce) logSchedule(ns, batchTiming, currentTarget); // Special log for troubleshooting batches
-            const newBatch = getScheduleObject(ns, batchTiming, currentTarget, scheduledTasks.length);
-            if (firstEnding === null) { // Can't start anything after this first hack completes (until back at min security), or we risk throwing off timing
-                firstEnding = new Date(newBatch.hackEnd.valueOf());
-            }
-            if (lastStart === null || lastStart < newBatch.firstFire) {
-                lastStart = new Date(newBatch.lastFire.valueOf());
-            }
-            if (cyclesScheduled > 0 && lastStart >= firstEnding) {
-                if (verbose) log(ns, `Had to stop scheduling at ${cyclesScheduled} of ${maxCycles} desired cycles (lastStart: ${lastStart} >= firstEnding: ${firstEnding}) ${JSON.stringify(snapshot)}`);
-                break;
-            }
-            scheduledTasks.push(newBatch);
+            scheduledTasks.push(getScheduleObject(ns, batchTiming, currentTarget, scheduledTasks.length));
             cyclesScheduled++;
         }
 
@@ -1434,7 +1510,8 @@ export async function main(ns) {
                 args.push(...getFlagsArgs(schedItem.toolShortName, currentTarget.name));
                 if (options.i && currentTerminalServer?.name == currentTarget.name && schedItem.toolShortName == "hack")
                     schedItem.toolShortName = "manualhack";
-                const result = await arbitraryExecution(ns, getTool(schedItem.toolShortName), schedItem.threadsNeeded, args)
+                const result = await arbitraryExecution(ns, getTool(schedItem.toolShortName), schedItem.threadsNeeded, args,
+                    undefined, undefined, undefined, schedItem.threadsByCores ?? null); // grow/weaken items carry a cores-aware thread count
                 if (result == false) { // If execution fails, we have probably run out of ram.
                     log(ns, `WARNING: Scheduling failed for ${getTargetSummary(currentTarget)} ${discriminationArg} of ${cyclesScheduled} Took: ${Date.now() - start}ms`, false, 'warning');
                     currentTarget.previousCycle = `INCOMPLETE. Tried: ${cyclesScheduled} x ${getTargetSummary(currentTarget)}`;
@@ -1506,7 +1583,8 @@ export async function main(ns) {
         let schedItems = [];
 
         const schedHack = getScheduleItem("hack", "hack", batchTiming.hackStart, batchTiming.hackEnd, currentTarget.getHackThreadsNeeded());
-        const schedWeak1 = getScheduleItem("weak1", "weak", batchTiming.firstWeakenStart, batchTiming.firstWeakenEnd, currentTarget.getWeakenThreadsNeededAfterTheft());
+        const weak1Threads = currentTarget.getWeakenThreadsNeededAfterTheft();
+        const schedWeak1 = getScheduleItem("weak1", "weak", batchTiming.firstWeakenStart, batchTiming.firstWeakenEnd, weak1Threads, weakenThreadsByCores(weak1Threads));
         // Special end-game case, if we have no choice but to hack a server to zero money, schedule back-to-back grows to restore money
         // TODO: This approach isn't necessary if we simply include the `growThreadsNeeded` logic to take into account the +1$ added before grow.
         let schedGrow, schedWeak2;
@@ -1527,12 +1605,18 @@ export async function main(ns) {
                 new Date(batchTiming.growEnd.getTime() - (cycleTimingDelay / 8)), injectThreads)); // Will put $injectThreads on the server
             // This will then grow from whatever % $injectThreads is back to 100%
             schedGrow = getScheduleItem("grow", "grow", batchTiming.growStart, batchTiming.growEnd, schedGrowThreads);
-            schedWeak2 = getScheduleItem("weak2", "weak", batchTiming.secondWeakenStart, batchTiming.secondWeakenEnd,
-                Math.ceil(((injectThreads + schedGrowThreads) * growthThreadHardening / actualWeakenPotency()).toPrecision(14)));
+            // Note: Neither grow above is core-scaled, because they rely on the game's "+$1 per thread" before growth (which does not scale with cores)
+            const weak2Threads = Math.ceil(((injectThreads + schedGrowThreads) * growthThreadHardening / actualWeakenPotency()).toPrecision(14));
+            schedWeak2 = getScheduleItem("weak2", "weak", batchTiming.secondWeakenStart, batchTiming.secondWeakenEnd, weak2Threads, weakenThreadsByCores(weak2Threads));
             if (verbose) log(ns, `INFO: Special grow strategy since percentage stolen per hack thread is 100%: G1: ${injectThreads}, G1: ${schedGrowThreads}, W2: ${schedWeak2.threadsNeeded} (${currentTarget.name})`);
         } else {
-            schedGrow = getScheduleItem("grow", "grow", batchTiming.growStart, batchTiming.growEnd, currentTarget.getGrowThreadsNeededAfterTheft());
-            schedWeak2 = getScheduleItem("weak2", "weak", batchTiming.secondWeakenStart, batchTiming.secondWeakenEnd, currentTarget.getWeakenThreadsNeededAfterGrowth());
+            const growThreads = currentTarget.getGrowThreadsNeededAfterTheft();
+            // The grow resolves after the hack has stolen actualPercentageToSteal() of max money; hosts with more cores need fewer threads to grow it back
+            const moneyAfterTheft = currentTarget.getMaxMoney() * (1 - currentTarget.actualPercentageToSteal());
+            schedGrow = getScheduleItem("grow", "grow", batchTiming.growStart, batchTiming.growEnd, growThreads,
+                growThreadsByCores(currentTarget, growThreads, moneyAfterTheft, recoveryThreadPadding));
+            const weak2Threads = currentTarget.getWeakenThreadsNeededAfterGrowth();
+            schedWeak2 = getScheduleItem("weak2", "weak", batchTiming.secondWeakenStart, batchTiming.secondWeakenEnd, weak2Threads, weakenThreadsByCores(weak2Threads));
         }
 
         if (hackOnly) {
@@ -1556,13 +1640,16 @@ export async function main(ns) {
     }
 
     // initialize a new incomplete schedule item
-    function getScheduleItem(description, toolShortName, start, end, threadsNeeded) {
+    /** @param {number} threadsNeeded Threads required on a 1-core host
+     * @param {((cores: number) => number)|null} threadsByCores Optional: threads required on a host with the given cores (grow/weaken only) */
+    function getScheduleItem(description, toolShortName, start, end, threadsNeeded, threadsByCores = null) {
         const schedItem = {
             description: description,
             toolShortName: toolShortName,
             start: start,
             end: end,
-            threadsNeeded: threadsNeeded
+            threadsNeeded: threadsNeeded,
+            threadsByCores: threadsByCores
         };
         return schedItem;
     }
@@ -1570,8 +1657,12 @@ export async function main(ns) {
     // Intended as a high-powered "figure this out for me" run command.
     // If it can't run all the threads at once, it runs as many as it can across the spectrum of daemons available.
     /** @param {NS} ns
-     * @param {Tool} tool - An object representing the script being executed **/
-    async function arbitraryExecution(ns, tool, threads, args, preferredServerName = null, useSmallestServerPossible = false, allowThreadSplitting = null) {
+     * @param {Tool} tool - An object representing the script being executed
+     * @param {number} threads - The number of threads required, as computed for a 1-core host
+     * @param {((cores: number) => number)|null} threadsByCores - Optional (grow/weaken only): given the core count of a candidate host, returns the
+     *        threads needed to do the WHOLE job on that host (see weakenThreadsByCores / growThreadsByCores). If the job ends up split across hosts,
+     *        the remainder is scaled linearly by each host's core bonus. When null, threads are used as-is on every host. **/
+    async function arbitraryExecution(ns, tool, threads, args, preferredServerName = null, useSmallestServerPossible = false, allowThreadSplitting = null, threadsByCores = null) {
         // We will be using the list of servers that is sorted by most available ram
         const igRes = tool.ignoreReservedRam; // Whether this tool ignores "reserved ram"
         const rootedServersByFreeRam = getAllServersByFreeRam().filter(server => server.hasRoot() && server.totalRam(igRes) > 1.6);
@@ -1580,23 +1671,32 @@ export async function main(ns) {
         if (useSmallestServerPossible) // If so-configured, fill up small servers before utilizing larger ones (can be laggy)
             preferredServerOrder.reverse();
 
-        // IDEA: "home" is more effective at grow() and weaken() than other nodes (has multiple cores) (TODO: By how much?)
-        //       so if this is one of those tools, put it at the front of the list of preferred candidates, otherwise keep home ram free if possible
-        //       TODO: This effort is wasted unless we also scale down the number of threads "needed" when running on home. We will overshoot grow/weaken
-        const homeIndex = preferredServerOrder.findIndex(i => i.name == "home");
-        if (homeIndex > -1) { // Home server might not be in the server list at all if it has insufficient RAM
-            const home = preferredServerOrder.splice(homeIndex, 1)[0];
-            if (tool.shortName == "grow" || tool.shortName == "weak" || preferredServerName == "home")
-                preferredServerOrder.unshift(home); // Send to front
-            else
-                preferredServerOrder.push(home); // Otherwise, send it to the back (reserve home for scripts that benefit from cores) and use only if there's no room on any other server.
+        const isHacknet = /** @param {Server} server */ server => server.name.startsWith('hacknet-server-') || server.name.startsWith('hacknet-node-');
+        // grow(), weaken() and share() are all boosted by the core bonus (1 + (cores - 1) / 16, see coreBonus) of the host that RUNS them, so for these
+        // tools, prefer hosts with the most cores (home has up to 8, hacknet servers up to 128 - src/Hacknet/data/Constants.ts MaxCores) - the
+        // thread counts of grow/weaken jobs are scaled down accordingly via `threadsByCores`. For all other tools (hack), keep the RAM-based order,
+        // but send home to the back (reserve it for the tools that benefit from its cores) and hacknet servers last (using them costs hash production).
+        const benefitsFromCores = !options['ignore-cores'] && ["grow", "weak", "share"].includes(tool.shortName);
+        if (benefitsFromCores) {
+            // Stable sort: most cores first, then home, then non-hacknet hosts, then the original (RAM-based) order
+            preferredServerOrder.sort((a, b) => (b.cpuCores() - a.cpuCores()) || ((b.name == "home") - (a.name == "home")) || (isHacknet(a) - isHacknet(b)));
+        } else {
+            const homeIndex = preferredServerOrder.findIndex(i => i.name == "home");
+            if (homeIndex > -1) { // Home server might not be in the server list at all if it has insufficient RAM
+                const home = preferredServerOrder.splice(homeIndex, 1)[0];
+                if (preferredServerName == "home" || (options['ignore-cores'] && (tool.shortName == "grow" || tool.shortName == "weak")))
+                    preferredServerOrder.unshift(home); // Send to front
+                else
+                    preferredServerOrder.push(home); // Otherwise, send it to the back (reserve home for scripts that benefit from cores) and use only if there's no room on any other server.
+            }
+            // Push all "hacknet servers" to the end of the preferred list, since they will lose productivity if used
+            // (Note: this used to call indexOf with a predicate, which never matches, so hacknet servers were never actually moved)
+            const anyHacknetNodes = preferredServerOrder.filter(isHacknet);
+            if (anyHacknetNodes.length > 0) {
+                preferredServerOrder.splice(0, preferredServerOrder.length, ...preferredServerOrder.filter(s => !isHacknet(s)));
+                preferredServerOrder.push(...anyHacknetNodes.sort((a, b) => b.totalRam(igRes) != a.totalRam(igRes) ? b.totalRam(igRes) - a.totalRam(igRes) : a.name.localeCompare(b.name)));
+            }
         }
-        // Push all "hacknet servers" to the end of the preferred list, since they will lose productivity if used
-        const anyHacknetNodes = [];
-        let hnNodeIndex;
-        while (-1 !== (hnNodeIndex = preferredServerOrder.indexOf(s => s.name.startsWith('hacknet-server-') || s.name.startsWith('hacknet-node-'))))
-            anyHacknetNodes.push(...preferredServerOrder.splice(hnNodeIndex, 1));
-        preferredServerOrder.push(...anyHacknetNodes.sort((a, b) => b.totalRam(igRes) != a.totalRam(igRes) ? b.totalRam(igRes) - a.totalRam(igRes) : a.name.localeCompare(b.name)));
 
         // Allow for an overriding "preferred" server to be used in the arguments, and slot it to the front regardless of the above
         if (preferredServerName && preferredServerName != "home" /*home is handled above*/ && preferredServerOrder[0].name != preferredServerName) {
@@ -1607,7 +1707,7 @@ export async function main(ns) {
                 log(ns, `ERROR: Configured preferred server "${preferredServerName}" for ${tool.name} is not a valid server name`, true, 'error');
         }
         if (verbose) log(ns, `Preferred Server ${preferredServerName ?? "(any)"} for ${threads} threads of ${tool.name} (use small=` + `${useSmallestServerPossible})` +
-            ` resulted in preferred order:${preferredServerOrder.map(s => ` ${s.name} (${formatRam(s.ramAvailable(igRes))})`)}`);
+            ` resulted in preferred order:${preferredServerOrder.map(s => ` ${s.name} (${formatRam(s.ramAvailable(igRes))}${benefitsFromCores ? `, ${s.cpuCores()} cores` : ''})`)}`);
 
         // Helper function to compute the most threads a server can run
         let computeMaxThreads = /** @param {Server} server */ function (server) {
@@ -1619,26 +1719,35 @@ export async function main(ns) {
         };
 
         let targetServer = null;
-        let remainingThreads = threads;
+        let remainingThreads = threads; // Tracked in "1-core thread" units (a thread run on a multi-core host counts for coreBonus threads)
         let splitThreads = false;
+        // Helper to compute how many threads must actually be run on a given host to complete the remaining job (fewer on hosts with more cores)
+        const threadsWantedOn = /** @param {Server} server */ server => {
+            if (!threadsByCores) return remainingThreads;
+            if (remainingThreads == threads) return threadsByCores(server.cpuCores()); // Whole job on one host: exact count for that host's cores
+            return Math.max(1, Math.ceil((remainingThreads / coreBonus(server.cpuCores())).toPrecision(14))); // Remainder of a split job: linear scaling
+        };
         for (let i = 0; i < rootedServersByFreeRam.length && remainingThreads > 0; i++) {
             targetServer = rootedServersByFreeRam[i];
-            const maxThreadsHere = Math.min(remainingThreads, computeMaxThreads(targetServer));
+            let wantHere = threadsWantedOn(targetServer);
+            let maxThreadsHere = Math.min(wantHere, computeMaxThreads(targetServer));
             if (maxThreadsHere <= 0)
                 continue; //break; HACK: We don't break here because there are cases when sort order can change (e.g. we've reserved home RAM)
 
             // If this server can handle all required threads, see if a server that is more preferred also has room.
             // If so, we prefer to pack that server with more jobs before utilizing another server.
-            if (maxThreadsHere == remainingThreads) {
+            if (maxThreadsHere == wantHere) {
                 for (let j = 0; j < preferredServerOrder.length; j++) {
                     const nextMostPreferredServer = preferredServerOrder[j];
-                    // If the next largest server is also the current server with the most capacity, then it's the best one to pack
+                    // If the next most preferred server is also the current server with the most capacity, then it's the best one to pack
                     if (nextMostPreferredServer == targetServer)
                         break;
                     // If the job can just as easily fit on this server, prefer to put the job there
-                    if (remainingThreads <= computeMaxThreads(nextMostPreferredServer)) {
+                    const wantThere = threadsWantedOn(nextMostPreferredServer);
+                    if (wantThere <= computeMaxThreads(nextMostPreferredServer)) {
                         //log(ns, 'Opted to exec ' + tool.name + ' on preferred server ' + nextMostPreferredServer.name + ' rather than the one with most ram (' + targetServer.name + ')');
                         targetServer = nextMostPreferredServer;
+                        wantHere = maxThreadsHere = wantThere;
                         break;
                     }
                 }
@@ -1663,8 +1772,11 @@ export async function main(ns) {
                 log(ns, `ERROR: Failed to exec ${tool.name} on server ${targetServer.name} with ${maxThreadsHere} threads`, false, 'error');
                 return false;
             }
-            // Decrement the threads that have been successfully scheduled
-            remainingThreads -= maxThreadsHere;
+            // Decrement the threads that have been successfully scheduled (in 1-core units: threads run on a multi-core host count for more)
+            if (maxThreadsHere >= wantHere)
+                remainingThreads = 0;
+            else
+                remainingThreads = Math.max(0, remainingThreads - maxThreadsHere * (threadsByCores ? coreBonus(targetServer.cpuCores()) : 1));
             if (remainingThreads > 0) {
                 if (!(allowThreadSplitting || tool.isThreadSpreadingAllowed)) break;
                 if (verbose) log(ns, `INFO: Had to split ${threads} ${tool.name} threads across multiple servers. ${maxThreadsHere} on ${targetServer.name}`);
@@ -1675,7 +1787,7 @@ export async function main(ns) {
         if (remainingThreads > 0 && threads < Number.MAX_SAFE_INTEGER) {
             const keepItQuiet = options['silent-misfires'] || homeServer.ramAvailable(true) <= 16; // Don't confuse new users with transient errors when first getting going
             log(ns, `${keepItQuiet ? 'WARN' : 'ERROR'}: Ran out of RAM to run ${tool.name} on ${splitThreads ? 'all servers (split)' : `${targetServer?.name} `}- ` +
-                `${threads - remainingThreads} of ${threads} threads were spawned.`, false, keepItQuiet ? undefined : 'error');
+                `${Math.ceil(threads - remainingThreads)} of ${threads} (1-core equivalent) threads were spawned.`, false, keepItQuiet ? undefined : 'error');
         }
         // if (splitThreads && !tool.isThreadSpreadingAllowed) return false; // TODO: Don't think this is needed anymore. We allow overriding with "allowThreadSplitting" in some cases, doesn't mean this is an error
         return remainingThreads == 0;
@@ -1728,7 +1840,8 @@ export async function main(ns) {
                     `to min security (${formatNumber(currentTarget.getMinSecurity())}) (${currentTarget.name})`);
             prepSucceeding = await arbitraryExecution(ns, weakenTool, weakenThreadsScheduled,
                 // Note: Because we are scheduling prep tasks to fire ASAP, we should override the "silent misfires" (last arg) to true
-                [currentTarget.name, now.getTime(), currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)]);
+                [currentTarget.name, now.getTime(), currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
+                undefined, undefined, undefined, weakenThreadsByCores(weakenThreadsScheduled)); // Fewer threads are needed on hosts with more cores
             if (prepSucceeding == false)
                 log(ns, `WARN: Failed to schedule ${weakenThreadsScheduled} prep weaken threads despite there ostensibly being room for ${weakenThreadsAllowable} (${currentTarget.name})`);
         }
@@ -1736,7 +1849,9 @@ export async function main(ns) {
         if (prepSucceeding && growThreadsScheduled > 0) {
             prepSucceeding = await arbitraryExecution(ns, growTool, growThreadsScheduled,
                 [currentTarget.name, now.getTime(), currentTarget.timeToGrow(), "prep", ...getFlagsArgs("grow", currentTarget.name, false, true)],
-                undefined, undefined, /*allowThreadSplitting*/ true); // Special case: for prep we allow grow threads to be split
+                undefined, undefined, /*allowThreadSplitting*/ true, // Special case: for prep we allow grow threads to be split
+                // Fewer threads are needed on hosts with more cores. If we could afford the full grow, hosts with cores can compute the exact count from current money
+                growThreadsByCores(currentTarget, growThreadsScheduled, growThreadsScheduled == growThreadsNeeded ? currentTarget.getMoney() : null));
             if (prepSucceeding == false)
                 log(ns, `WARN: Failed to schedule ${growThreadsScheduled} prep grow threads despite there ostensibly being room for ${growThreadsAllowable} (${currentTarget.name})`);
         }
@@ -1958,7 +2073,8 @@ export async function main(ns) {
                     if (verbose) log(ns, `Scheduling ${weakenThreadsNeeded}x weak on ${allocatedServer?.name ?? "(any)"} targetting ${server.name}`);
                     success &&= await arbitraryExecution(ns, getTool("weak"), weakenThreadsNeeded,
                         [server.name, scheduleWeak, server.timeToWeaken(), "weakenForXp", ...getFlagsArgs("weak", server.name, allowLoop)],
-                        singleServer ? allocatedServer?.name : null, !singleServer);
+                        singleServer ? allocatedServer?.name : null, !singleServer, undefined,
+                        weakenThreadsByCores(weakenThreadsNeeded)); // Fewer threads are needed on hosts with more cores (grow is not scaled: it relies on +$1 per thread)
                     if (success && allowLoop && !allWeakLoopsScheduled)
                         loopsByServer_Weaken[server.name] = 1 + (loopsByServer_Weaken[server.name] ?? 0);
                     if (verbose) log(ns, `Looping ${weakenThreadsNeeded} x Weak starting in ${Math.round(scheduleWeak - now)}ms, ` +
@@ -2331,13 +2447,21 @@ export async function main(ns) {
     }
 
     const crackNames = ["BruteSSH.exe", "FTPCrack.exe", "relaySMTP.exe", "HTTPWorm.exe", "SQLInject.exe"];
+    // All programs purchasable on the darkweb (src/DarkWeb/DarkWebItems.ts), which /Tasks/program-manager.js buys for us (crackers first).
+    // Should match the list in program-manager.js: it is re-launched periodically until we own all of these.
+    const darkwebPrograms = [...crackNames, "ServerProfiler.exe", "DeepscanV1.exe", "DeepscanV2.exe", "AutoLink.exe", "DarkscapeNavigator.exe", "Formulas.exe"];
     let ownedCracks = [];
+    let ownedPrograms = [];
 
-    /** Determine which port crackers we own
+    /** Determine which port crackers (and other darkweb programs) we own, and whether we own the TOR router.
+     * Note: ns.hasTorRouter() costs 0.05 GB, so it is ram-dodged in the same temp script as the file checks (one exec per loop).
      * @param {NS} ns */
     async function updatePortCrackers(ns) {
-        const owned = await filesExist(ns, crackNames);
-        ownedCracks = crackNames.filter((s, i) => owned[i]);
+        const result = await getNsDataThroughFile(ns, `[ns.hasTorRouter(), ...ns.args.map(f => ns.fileExists(f, "home"))]`,
+            '/Temp/owned-programs.txt', darkwebPrograms);
+        ownTorRouter = result[0] === true;
+        ownedPrograms = darkwebPrograms.filter((s, i) => result[1 + i]);
+        ownedCracks = crackNames.filter(s => ownedPrograms.includes(s));
     }
 
     // script entry point

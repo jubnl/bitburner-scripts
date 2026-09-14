@@ -5,7 +5,11 @@ import {
 
 // Global config
 const updateInterval = 200; // We can improve our timing by updating more often than gang stats do (which is every 2 seconds for stats, every 20 seconds for territory)
-const wantedPenaltyThreshold = 0.0001; // Don't let the wanted penalty get worse than this
+let wantedPenaltyThreshold = 0.01; // Don't let the wanted penalty get worse than this (overridden by --wanted-penalty-threshold)
+// Game (src/Gang/Gang.ts process / src/Gang/data/Constants.ts): gang gains are processed once storedCycles >= minCyclesToProcess (10 cycles = 2s),
+// and at most maxCyclesToProcess (25 cycles = 5s) per 200ms engine tick. So the game runs 1 cycle/tick normally, 25 cycles/tick in bonus time.
+const gangCyclesPerNormalUpdate = 10;
+const gangCyclesPerBonusUpdate = 25;
 const offStatCostPenalty = 50; // Equipment that doesn't contribute to our main stats suffers a percieved cost penalty of this multiple
 const defaultMaxSpendPerTickTransientEquipment = 0.002; // If the --equipment-budget is not specified, spend up to this percent of non-reserved cash on temporary upgrades (equipment)
 const defaultMaxSpendPerTickPermanentEquipment = 0.2; // If the --augmentation-budget is not specified, spend up to this percent of non-reserved cash on permanent member upgrades
@@ -33,6 +37,7 @@ let allTaskNames = (/**@returns{string[]}*/() => undefined)();
 let allTaskStats = (/**@returns{{[taskName: string]: GangTaskStats;}}*/() => undefined)();
 let assignedTasks = (/**@returns{{[gangMemberName: string]: string;}}*/() => ({}))(); // Each member will independently attempt to scale up the crime they perform until they are ineffective or we start generating wanted levels
 let lastMemberReset = {}; // Tracks when each member last ascended
+let lastAscensionResults = {}; // Most recent ns.gang.getAscensionResult() per member (used to avoid buying soon-to-be-lost equipment)
 
 // Global state
 let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information about the current bitnode
@@ -60,6 +65,14 @@ const argsSchema = [
     ['equipment-budget', null], // Percentage of non-reserved cash to spend per tick on permanent member upgrades (If not specified, uses defaultMaxSpendPerTickTransientEquipment)
     ['money-focus', false], // Always optimize gang crimes for maximum monetary gain. Is otherwise balanced.
     ['reputation-focus', false], // Always optimize gang crimes for maximum reputation gain. Is otherwise balanced.
+    ['wanted-penalty-threshold', 0.01], // Don't let the wanted penalty (1 - respect/(respect+wanted)) get worse than this before we start recovering
+    ['wanted-recovery-fraction', 0.5], // When recovering from wanted, target this fraction of the max decay rate the whole gang could achieve on vigilante work
+    ['disable-ascend-recruit-guard', false], // By default, we won't ascend a member if the respect lost would delay recruiting our next member (until we have 12)
+    ['equipment-ascend-proximity', 0.1], // Don't buy (non-augmentation) equipment for members within this fraction of their ascension threshold (it's lost on ascend). 0 to disable.
+    ['full-budget-min-cash', 1e9], // Use the full equipment/augmentation budgets once we have this much cash (else they are divided by --reduced-budget-divisor)
+    ['full-budget-min-gang-income', 1e6], // ...or once gang income exceeds this much per second
+    ['reduced-budget-divisor', 100], // Budgets are divided by this until one of the above conditions (or 4S data ownership) is met
+    ['disable-next-update', false], // Set to true to poll for gang updates (legacy) rather than awaiting ns.gang.nextUpdate()
 ];
 
 export function autocomplete(data, _) {
@@ -94,6 +107,8 @@ export async function main(ns) {
 async function initialize(ns) {
     ns.disableLog('ALL');
     pctTraining = options['no-training'] ? 0 : options['training-percentage'];
+    wantedPenaltyThreshold = options['wanted-penalty-threshold'];
+    lastAscensionResults = {};
 
     let loggedWaiting = false;
     is4sBought = false;
@@ -220,7 +235,9 @@ async function mainLoop(ns) {
 /** @param {NS} ns
  * Do some things only once per territory tick **/
 async function onTerritoryTick(ns, myGangInfo) {
-    territoryNextTick = lastLoopTime + territoryTickTime / (ns.gang.getBonusTime() > 0 ? 5 : 1); // Reset the time the next tick will occur
+    // Reset the time the next tick will occur. In bonus time, the game processes 25 cycles per 200ms engine tick instead of 1
+    // (src/Gang/Gang.ts process(): Math.min(storedCycles, maxCyclesToProcess=25)), so territory ticks 25x faster.
+    territoryNextTick = lastLoopTime + territoryTickTime / (ns.gang.getBonusTime() > 0 ? gangCyclesPerBonusUpdate : 1);
     if (lastTerritoryPower != myGangInfo.power || lastTerritoryPower == null) {
         log(ns, `Territory power updated from ${formatNumberShort(lastTerritoryPower)} to ${formatNumberShort(myGangInfo.power)}.`)
         consecutiveTerritoryDetections++;
@@ -242,8 +259,8 @@ async function onTerritoryTick(ns, myGangInfo) {
     if (canRecruit)
         await doRecruitMember(ns) // Recruit new members if available
     const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
-    if (!options['no-auto-ascending']) await tryAscendMembers(ns); // Ascend members if we deem it a good time
-    await tryUpgradeMembers(ns, dictMembers); // Upgrade members if possible
+    if (!options['no-auto-ascending']) await tryAscendMembers(ns, myGangInfo); // Ascend members if we deem it a good time
+    await tryUpgradeMembers(ns, dictMembers, myGangInfo); // Upgrade members if possible
     await enableOrDisableWarfare(ns, myGangInfo); // Update whether we should be participating in gang warfare
     // There's a chance we do training instead of work for this next tick. If training, we primarily train our main stat, with a small chance to train less-important stats
     const task = Math.random() >= pctTraining ? null : "Train " + (Math.random() < 0.1 ? "Charisma" : Math.random() < (isHackGang ? 0.1 : 0.9) ? "Combat" : "Hacking")
@@ -280,11 +297,16 @@ async function updateMemberActivities(ns, dictMemberInfo = null, forceTask = nul
  * Logic to assign tasks that maximize rep gain rate without wanted gain getting out of control **/
 async function optimizeGangCrime(ns, myGangInfo) {
     const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
-    // Tolerate our wanted level increasing, as long as reputation increases several orders of magnitude faster and we do not currently have a penalty more than -0.01%
+    // Tolerate our wanted level increasing, as long as reputation increases several orders of magnitude faster and we do not currently have a penalty worse than --wanted-penalty-threshold
     let currentWantedPenalty = getWantedPenalty(myGangInfo) - 1;
+    // The game (src/Gang/Gang.ts processGains) applies wanted = (old + gain * cycles) * (1 - 0.001 * justice) per update, where "justice" is the
+    // number of members on a wanted-reducing task. So the most wanted we can shed per cycle (beyond the small additive vigilante term) is about
+    // 0.001 * members * wanted / cyclesPerUpdate. We target a fraction of that (--wanted-recovery-fraction) so that recovery is actually achievable.
+    const cyclesPerUpdate = getGangCyclesPerUpdate(ns);
+    const maxDecayRate = 0.001 * myGangMembers.length * myGangInfo.wantedLevel / cyclesPerUpdate;
     // Note, until we have ~200 respect, the best way to recover from wanted penalty is to focus on gaining respect, rather than doing vigilante work.
     let wantedGainTolerance = currentWantedPenalty < -1.1 * wantedPenaltyThreshold && myGangInfo.wantedLevel >= (1.1 + myGangInfo.respect / 1000) &&
-        myGangInfo.respect > 200 ? -0.01 * myGangInfo.wantedLevel /* Recover from wanted penalty */ :
+        myGangInfo.respect > 200 ? -options['wanted-recovery-fraction'] * maxDecayRate /* Recover from wanted penalty */ :
         currentWantedPenalty < -0.9 * wantedPenaltyThreshold && myGangInfo.wantedLevel >= (1.1 + myGangInfo.respect / 10000) ? 0 /* Sustain */ :
             Math.max(myGangInfo.respectGainRate / 1000, myGangInfo.wantedLevel / 10) /* Allow wanted to increase at a manageable rate */;
     const playerData = await getNsDataThroughFile(ns, 'ns.getPlayer()');
@@ -304,7 +326,7 @@ async function optimizeGangCrime(ns, myGangInfo) {
         name: taskName,
         respect: computeRepGains(myGangInfo, taskName, m),
         money: calculateMoneyGains(myGangInfo, taskName, m),
-        wanted: computeWantedGains(myGangInfo, taskName, m),
+        wanted: computeWantedGains(myGangInfo, taskName, m, cyclesPerUpdate),
     })).filter(task => task.wanted <= 0 || task.money > 0 || task.respect > 0)])); // Completely remove tasks that offer no gains, but would generate wanted levels
     // Sort tasks by best gain rate
     if (optStat == "both money and respect") {
@@ -403,28 +425,59 @@ async function doRecruitMember(ns) {
 
 /** @param {NS} ns
  * Check if any members are deemed worth ascending to increase a stat multiplier **/
-async function tryAscendMembers(ns) {
+async function tryAscendMembers(ns, myGangInfo) {
     const dictAscensionResults = await getGangInfoDict(ns, myGangMembers, 'getAscensionResult');
+    lastAscensionResults = dictAscensionResults;
+    // Ascending deducts the member's earned respect from the gang (src/Gang/Gang.ts ascendMember: respect -= res.respect).
+    // Recruiting the (n+1)th member requires 5^(n - 3 + 1) respect (src/Gang/Gang.ts respectForNextRecruit, Constants: numFreeMembers=3,
+    // recruitThresholdBase=5, MaximumGangMembers=12), so until we have 12 members, don't ascend if it would put us below the next recruit threshold.
+    const guardRecruits = !options['disable-ascend-recruit-guard'] && myGangMembers.length < 12;
+    const respectNeededForNextRecruit = guardRecruits ? await getNsDataThroughFile(ns, 'ns.gang.respectForNextRecruit()') : 0;
+    let projectedRespect = myGangInfo.respect;
     for (let i = 0; i < myGangMembers.length; i++) {
         const member = myGangMembers[i];
-        // First members are given the largest threshold, so that early on when they are our only members, they are more stable
-        const ascMultiThreshold = options['ascend-multi-threshold'] + (11 - i) * options['ascend-multi-threshold-spacing'];
         const ascResult = dictAscensionResults[member];
-        if (!ascResult || !importantStats.some(stat => ascResult[stat] >= ascMultiThreshold))
+        if (!ascResult || !importantStats.some(stat => ascResult[stat] >= getAscendThreshold(i)))
             continue;
+        if (guardRecruits && projectedRespect - ascResult.respect < respectNeededForNextRecruit) {
+            log(ns, `INFO: Not ascending member ${member} yet: it would cost ${formatNumberShort(ascResult.respect)} respect, leaving ` +
+                `${formatNumberShort(projectedRespect - ascResult.respect)} < ${formatNumberShort(respectNeededForNextRecruit)} needed to recruit member #${myGangMembers.length + 1}.`);
+            continue;
+        }
         if (undefined !== (await getNsDataThroughFile(ns, `ns.gang.ascendMember(ns.args[0])`, null, [member]))) {
             log(ns, `SUCCESS: Ascended member ${member} to increase multis by ${importantStats.map(s => `${s} -> ${ascResult[s].toFixed(2)}x`).join(", ")}`, false, 'success');
             lastMemberReset[member] = Date.now();
+            projectedRespect -= ascResult.respect;
+            delete lastAscensionResults[member]; // No longer near ascension
         }
         else
             log(ns, `ERROR: Attempt to ascended member ${member} failed. Go investigate!`, false, 'error');
     }
 }
 
+/** @param {number} memberIndex
+ * @returns {number} The ascension multiplier threshold for the member at this index.
+ * First members are given the largest threshold, so that early on when they are our only members, they are more stable */
+function getAscendThreshold(memberIndex) {
+    return options['ascend-multi-threshold'] + (11 - memberIndex) * options['ascend-multi-threshold-spacing'];
+}
+
+/** @param {number} memberIndex
+ * @returns {boolean} Whether this member is within --equipment-ascend-proximity of their ascension threshold on any important stat.
+ * Equipment (but not augmentations) is cleared on ascend (src/Gang/GangMember.ts ascend(): upgrades.length = 0), so buying it now would be a waste. */
+function isNearAscension(memberIndex) {
+    const proximity = options['equipment-ascend-proximity'];
+    if (options['no-auto-ascending'] || !(proximity > 0)) return false;
+    const ascResult = lastAscensionResults[myGangMembers[memberIndex]];
+    if (!ascResult) return false;
+    const gainNeeded = (getAscendThreshold(memberIndex) - 1) * (1 - proximity);
+    return importantStats.some(stat => (ascResult[stat] - 1) >= gainNeeded);
+}
+
 /** @param {NS} ns
  * @param {{[gangMember: string]: GangMemberInfo;}} dictMembers
  * Upgrade any missing equipment / augmentations of members if we have the budget for it **/
-async function tryUpgradeMembers(ns, dictMembers) {
+async function tryUpgradeMembers(ns, dictMembers, myGangInfo) {
     // Update equipment costs to take into account discounts
     const dictEquipmentCosts = await getGangInfoDict(ns, equipments.map(e => e.name), 'getEquipmentCost');
     equipments.forEach(e => e.cost = dictEquipmentCosts[e.name])
@@ -435,14 +488,19 @@ async function tryUpgradeMembers(ns, dictMembers) {
     const maxBudget = 0.99; // Note: To avoid rounding issues and micro-spend race-conditions, only allow budgeting up to 99% of money per tick
     let budget = Math.min(maxBudget, (options['equipment-budget'] || defaultMaxSpendPerTickTransientEquipment)) * homeMoney;
     let augBudget = Math.min(maxBudget, (options['augmentations-budget'] || defaultMaxSpendPerTickPermanentEquipment)) * homeMoney;
-    // Hack: Default aug budget is cut by 1/100 in a few situations (TODO: Add more, like when BitnodeMults are such that gang income is severely nerfed)
+    // Budgets are reduced early on, while cash is scarce and better spent elsewhere. We consider ourselves "established" once we have
+    // --full-budget-min-cash, or the gang itself earns --full-budget-min-gang-income per second (moneyGainRate is per 200ms cycle, 5 cycles/sec),
+    // or (legacy heuristic) we own 4S stock data. Bitnode 8 always uses the reduced budget.
     if (!is4sBought)
         is4sBought = await getNsDataThroughFile(ns, `ns.stock.has4SDataTixApi()`);
-    if (!is4sBought || resetInfo.currentNode === 8) {
-        budget /= 100;
-        augBudget /= 100;
+    const gangIncomePerSecond = (myGangInfo?.moneyGainRate ?? 0) * 5;
+    const established = playerData.money >= options['full-budget-min-cash'] || gangIncomePerSecond >= options['full-budget-min-gang-income'] || is4sBought;
+    if (!established || resetInfo.currentNode === 8) {
+        budget /= options['reduced-budget-divisor'];
+        augBudget /= options['reduced-budget-divisor'];
     }
     // Find out what outstanding equipment can be bought within our budget
+    const nearAscension = myGangMembers.map((_, i) => isNearAscension(i));
     for (const equip of equipments) {
         if (augBudget <= 0) break;
         for (const member of Object.values(dictMembers)) { // Get this equip for each member before considering the next most expensive equip
@@ -451,6 +509,8 @@ async function tryUpgradeMembers(ns, dictMembers) {
             let percievedCost = equip.cost * (Object.keys(equip.stats).some(stat => importantStats.some(i => stat.includes(i))) ? 1 : offStatCostPenalty);
             if (percievedCost > augBudget) continue;
             if (equip.type != "Augmentation" && percievedCost > budget) continue;
+            // Non-augmentation equipment is lost on ascension, so don't buy it for members about to ascend
+            if (equip.type != "Augmentation" && nearAscension[myGangMembers.indexOf(member.name)]) continue;
             if (!member.upgrades.includes(equip.name) && !member.augmentations.includes(equip.name)) {
                 purchaseOrder.push({ member: member.name, type: equip.type, equipmentName: equip.name, cost: equip.cost });
                 budget -= equip.cost;
@@ -491,8 +551,18 @@ async function waitForGameUpdate(ns, oldGangInfo) {
     const maxWaitTime = 2500;
     const waitInterval = 100;
     const start = Date.now()
-    while (Date.now() < start + maxWaitTime) {
-        var latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
+    var latestGangInfo;
+    if (!options['disable-next-update']) {
+        // ns.gang.nextUpdate() (0 GB, src/Netscript/RamCostGenerator.ts CycleTiming) resolves right after the game next processes gang gains
+        // (src/Gang/Gang.ts process()), so this is both faster and more precise than polling. It resolves within 2s (much less in bonus time).
+        await ns.gang.nextUpdate();
+        latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
+        if (JSON.stringify(latestGangInfo) != JSON.stringify(oldGangInfo)) {
+            sequentialMisfires = 0;
+            return latestGangInfo;
+        }
+    } else while (Date.now() < start + maxWaitTime) {
+        latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
         if (JSON.stringify(latestGangInfo) != JSON.stringify(oldGangInfo)) {
             sequentialMisfires = 0;
             return latestGangInfo;
@@ -569,15 +639,28 @@ function computeRepGains(myGangInfo, currentTask, memberInfo) {
 
 /** @param {GangGenInfo} myGangInfo
  * @param {string} currentTask
- * @param {GangMemberInfo} memberInfo **/
-function computeWantedGains(myGangInfo, currentTask, memberInfo) {
+ * @param {GangMemberInfo} memberInfo
+ * @param {number} cyclesPerUpdate Number of game cycles the gang processes per update (10 normally, 25 in bonus time)
+ * @returns {number} The expected change in wanted level per cycle attributable to this member doing this task **/
+function computeWantedGains(myGangInfo, currentTask, memberInfo, cyclesPerUpdate = gangCyclesPerNormalUpdate) {
     const task = allTaskStats[currentTask];
+    // Multiplicative decay term (src/Gang/Gang.ts processGains): wanted = (old + gain * cycles) * (1 - 0.001 * justice), where "justice" counts
+    // members whose task has baseWanted < 0 (Vigilante Justice / Ethical Hacking). This is applied once per update (of `cyclesPerUpdate` cycles),
+    // and is what actually lets wanted recover, so we attribute -0.001 * wanted / cyclesPerUpdate to each member on such a task (regardless of stats).
+    const decay = task.baseWanted < 0 ? -0.001 * myGangInfo.wantedLevel / cyclesPerUpdate : 0;
     const statWeight = getStatWeight(task, memberInfo) - 3.5 * task.difficulty;
-    if (task.baseWanted === 0 || statWeight <= 0) return 0;
+    if (task.baseWanted === 0 || statWeight <= 0) return decay;
     const territoryMult = Math.max(0.005, Math.pow(myGangInfo.territory * 100, task.territory.wanted) / 100);
-    if (isNaN(territoryMult) || territoryMult <= 0) return 0;
-    return (task.baseWanted < 0) ? 0.4 * task.baseWanted * statWeight * territoryMult :
+    if (isNaN(territoryMult) || territoryMult <= 0) return decay;
+    // Additive term (src/Gang/GangMember.ts calculateWantedLevelGain)
+    return (task.baseWanted < 0) ? 0.4 * task.baseWanted * statWeight * territoryMult + decay :
         Math.min(100, (7 * task.baseWanted) / Math.pow(3 * statWeight * territoryMult, 0.8));
+}
+
+/** @param {NS} ns
+ * @returns {number} How many game cycles the gang processes per update (src/Gang/data/Constants.ts minCyclesToProcess / maxCyclesToProcess) */
+function getGangCyclesPerUpdate(ns) {
+    return ns.gang.getBonusTime() > 0 ? gangCyclesPerBonusUpdate : gangCyclesPerNormalUpdate; // getBonusTime costs 0 GB
 }
 
 /** @param {GangGenInfo} myGangInfo

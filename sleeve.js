@@ -25,6 +25,11 @@ const argsSchema = [
     ['enable-bladeburner-team-building', false], // Set to true to have one sleeve support the main sleeve, and another do recruitment. Otherwise, they will just do more "Infiltrate Synthoids"
     ['disable-bladeburner', false], // Set to true to disable having sleeves workout at the gym (costs money)
     ['failed-bladeburner-contract-cooldown', 30 * 60 * 1000], // Default 30 minutes: time to wait after failing a bladeburner contract before we try again
+    ['sync-first', false], // Set to true to always synchronize sleeves to 100% before doing anything else (legacy behaviour). By default we only sync when the sleeve's next job is crime for karma.
+    ['train-max-shock', 10], // Only train (gym/university) sleeves whose shock is at or below this. Class exp is multiplied by (100 - shock)% but the cost is not.
+    ['train-with-pending-augs', false], // Set to true to train sleeves even when they still have purchasable augmentations (installing an aug resets all sleeve exp)
+    ['max-faction-sleeves', 8], // Up to this many sleeves may work for (distinct) joined factions that still have unowned augmentations we need rep for. 0 to disable.
+    ['faction-work-max-shock', 25], // Extra faction-work sleeves (above) must have shock at or below this (rep earned is scaled by (100 - shock)%), else they recover shock first
 ];
 
 const interval = 1000; // Update (tick) this often to check on sleeves and recompute their ideal task
@@ -39,11 +44,16 @@ const minBbContracts = 2; // There should be this many contracts remaining befor
 const minBbProbability = 0.99; // Player chance should be this high before sleeves attempt contracts
 const waitForContractCooldown = 60 * 1000; // 1 minute - Cooldown when contract count or probability gets too low
 
-let cachedCrimeStats, workByFaction; // Cache of crime statistics and which factions support which work
+let cachedCrimeStats, workByFaction, factionWorkUnsupported; // Cache of crime statistics and which factions support which work
 let task, lastStatusUpdateTime, lastPurchaseTime, lastPurchaseStatusUpdate, availableAugs, cacheExpiry,
     shockChance, lastRerollTime, bladeburnerCooldown, lastSleeveHp, lastSleeveShock; // State by sleeve
-let numSleeves, ownedSourceFiles, playerInGang, playerInBladeburner, bladeburnerCityChaos, bladeburnerContractChances, bladeburnerContractCounts, followPlayerSleeve;
+let numSleeves, ownedSourceFiles, playerInGang, playerGangFaction, playerInBladeburner, bladeburnerCityChaos, bladeburnerContractChances, bladeburnerContractCounts, followPlayerSleeve;
+let sleeveExpDisabled = false; // bitNodeOptions.disableSleeveExpAndAugmentation: sleeves gain no exp and cannot buy augs
+let factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = []; // Factions other sleeves can work for (item 9)
+const factionWorkRefreshInterval = 5 * 60 * 1000; // How often to recompute which factions still need rep
 let options;
+// Sleeve -> bladeburner contract assignment (each contract type can only be performed by one sleeve at a time)
+const sleeveBbContractBySleeve = { 1: "Retirement", 2: "Bounty Hunter", 3: "Tracking" };
 
 export function autocomplete(data, _) {
     data.flags(argsSchema);
@@ -59,8 +69,10 @@ export async function main(ns) {
     // Ensure the global state is reset (e.g. after entering a new bitnode)
     task = [], lastStatusUpdateTime = [], lastPurchaseTime = [], lastPurchaseStatusUpdate = [], availableAugs = [],
         cacheExpiry = [], shockChance = [], lastRerollTime = [], bladeburnerCooldown = [], lastSleeveHp = [], lastSleeveShock = [];
-    workByFaction = {}, cachedCrimeStats = {};
+    workByFaction = {}, cachedCrimeStats = {}, factionWorkUnsupported = {};
+    factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = [];
     playerInGang = playerInBladeburner = false;
+    playerGangFaction = null;
     // Ensure we have access to sleeves
     ownedSourceFiles = await getActiveSourceFiles(ns);
     if (!(10 in ownedSourceFiles))
@@ -79,13 +91,7 @@ export async function main(ns) {
 /** @param {NS} ns
  * Purchases augmentations for sleeves */
 async function manageSleeveAugs(ns, i, budget) {
-    // Retrieve and cache the set of available sleeve augs (cached temporarily, but not forever, in case rules around this change)
-    if (availableAugs[i] == null || Date.now() > cacheExpiry[i]) {
-        cacheExpiry[i] = Date.now() + 60000;
-        availableAugs[i] = (await getNsDataThroughFile(ns, `ns.sleeve.getSleevePurchasableAugs(ns.args[0])`,  // list of { name, cost }
-            null, [i])).sort((a, b) => a.cost - b.cost);
-    }
-    if (availableAugs[i].length == 0) return 0;
+    if ((await getAvailableAugs(ns, i)).length == 0) return 0;
 
     const cooldownLeft = Math.max(0, options['buy-cooldown'] - (Date.now() - (lastPurchaseTime[i] || 0)));
     const [batchCount, batchCost] = availableAugs[i].reduce(([n, c], aug) => c + aug.cost <= budget ? [n + 1, c + aug.cost] : [n, c], [0, 0]);
@@ -107,6 +113,47 @@ async function manageSleeveAugs(ns, i, budget) {
     }
     return 0;
 }
+
+/** @param {NS} ns
+ * Retrieve and cache the set of available sleeve augs (cached temporarily, but not forever, in case rules around this change)
+ * @returns {Promise<{name: string, cost: number}[]>} */
+async function getAvailableAugs(ns, i) {
+    if (availableAugs[i] == null || Date.now() > cacheExpiry[i]) {
+        cacheExpiry[i] = Date.now() + 60000;
+        availableAugs[i] = (await getNsDataThroughFile(ns, `ns.sleeve.getSleevePurchasableAugs(ns.args[0])`,  // list of { name, cost }
+            null, [i])).sort((a, b) => a.cost - b.cost);
+    }
+    return availableAugs[i];
+}
+
+/** @param {NS} ns
+ * @param {Player} playerInfo
+ * Build the list of joined factions that still have unowned augmentations requiring more rep than we have, sorted by lowest rep first.
+ * Requires SF4 (singularity). Failures are suppressed (e.g. insufficient RAM for the temp scripts), leaving the previous list in place. */
+async function refreshFactionWorkCandidates(ns, playerInfo) {
+    factionWorkCandidatesExpiry = Date.now() + factionWorkRefreshInterval;
+    try {
+        const factions = (playerInfo.factions || []).filter(f => f != playerGangFaction && !factionWorkUnsupported[f]);
+        if (factions.length == 0) return factionWorkCandidates = [];
+        const ownedAugs = await getNsDataThroughFile(ns, 'ns.singularity.getOwnedAugmentations(true)', '/Temp/player-augs-purchased.txt');
+        const dictFactionRep = await getDict(ns, factions, 'singularity.getFactionRep', '/Temp/sleeve-faction-rep.txt');
+        const dictFactionAugs = await getDict(ns, factions, 'singularity.getAugmentationsFromFaction', '/Temp/sleeve-faction-augs.txt');
+        const wantedAugs = [...new Set(Object.values(dictFactionAugs).flat())].filter(a => !ownedAugs.includes(a) && a != "NeuroFlux Governor");
+        const dictAugRepReqs = wantedAugs.length == 0 ? {} : await getDict(ns, wantedAugs, 'singularity.getAugmentationRepReq', '/Temp/sleeve-aug-repreqs.txt');
+        factionWorkCandidates = factions
+            .map(f => ({ name: f, rep: dictFactionRep[f], repNeeded: Math.max(0, ...dictFactionAugs[f].filter(a => a in dictAugRepReqs).map(a => dictAugRepReqs[a])) }))
+            .filter(f => f.rep < f.repNeeded)
+            .sort((a, b) => a.rep - b.rep)
+            .map(f => f.name);
+        log(ns, `INFO: ${factionWorkCandidates.length} joined factions still need rep for augmentations (lowest rep first): ${factionWorkCandidates.join(", ") || '(none)'}`);
+    } catch (err) {
+        log(ns, `WARNING: Failed to determine which factions sleeves should work for (insufficient RAM for singularity temp scripts?): ` +
+            (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false);
+    }
+}
+
+// Ram-dodging helper to get a dictionary mapping each element to the result of ns.<nsFunction>(element)
+const getDict = async (ns, elements, nsFunction, fileName) => await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(o => [o, ns.${nsFunction}(o)]))`, fileName, elements);
 
 /** @param {NS} ns
  * @returns {Promise<Player>} the result of ns.getPlayer() */
@@ -144,8 +191,18 @@ async function mainLoop(ns) {
     // Estimate the cost of sleeves training over the next time interval to see if (ignoring income) we would drop below our reserve.
     const costByNextLoop = interval / 1000 * task.filter(t => t.startsWith("train")).length * 12000; // TODO: Training cost/sec seems to be a bug. Should be 1/5 this ($2400/sec)
     // Get time in current bitnode (to cap how long we'll train sleeves)
-    const timeInBitnode = Date.now() - (await getNsDataThroughFile(ns, 'ns.getResetInfo()')).lastNodeReset
-    let canTrain = !options['disable-training'] &&
+    const resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
+    const timeInBitnode = Date.now() - resetInfo.lastNodeReset;
+    // Honour the "disableSleeveExpAndAugmentation" bitnode option (sleeves gain no exp and cannot buy augs, so training/aug-buying is pointless)
+    sleeveExpDisabled = resetInfo.bitNodeOptions?.disableSleeveExpAndAugmentation ?? false;
+    // Look up our gang's faction (once), since sleeves cannot work for it (src/NetscriptFunctions/Sleeve.ts setToFactionWork)
+    if (playerInGang && playerGangFaction == null)
+        playerGangFaction = (await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()'))?.faction ?? null;
+    // Periodically refresh the list of factions that other sleeves could usefully work for
+    if (options['max-faction-sleeves'] > 0 && (4 in ownedSourceFiles) && Date.now() > factionWorkCandidatesExpiry)
+        await refreshFactionWorkCandidates(ns, playerInfo);
+    factionsTakenThisLoop = []; // Each faction accepts only one sleeve at a time, so track which are spoken for this loop
+    let canTrain = !options['disable-training'] && !sleeveExpDisabled &&
         // To avoid training forever when mults are crippling, stop training if we've been in the bitnode a certain amount of time
         (options['training-cap-seconds'] * 1000 > timeInBitnode) &&
         // Don't train if we have no money (unless player has given permission to train into debt)
@@ -161,10 +218,13 @@ async function mainLoop(ns) {
     if (playerInBladeburner && (7 in ownedSourceFiles)) {
         const bladeburnerCity = await getNsDataThroughFile(ns, `ns.bladeburner.getCity()`);
         bladeburnerCityChaos = await getNsDataThroughFile(ns, `ns.bladeburner.getCityChaos(ns.args[0])`, null, [bladeburnerCity]);
+        // Since v3.0, getActionEstimatedSuccessChance accepts a sleeve number and evaluates the chance with that sleeve's stats
+        // (src/NetscriptFunctions/Bladeburner.ts getActionEstimatedSuccessChance: action.getSuccessRange(bladeburner, Player.sleeves[n])).
+        // Keyed by sleeve index, since each sleeve has its own designated contract. Only supported for General actions and Contracts.
         bladeburnerContractChances = await getNsDataThroughFile(ns,
-            // There is currently no way to get sleeve chance, so assume it is the same as player chance for now. (EDIT: This is a terrible assumption)
-            'Object.fromEntries(ns.args.map(c => [c, ns.bladeburner.getActionEstimatedSuccessChance("Contracts", c)[0]]))',
-            '/Temp/sleeve-bladeburner-success-chances.txt', sleeveBbContractNames);
+            'Object.fromEntries(JSON.parse(ns.args[0]).map(([i, c]) => [i, ns.bladeburner.getActionEstimatedSuccessChance("Contracts", c, i)[0]]))',
+            '/Temp/sleeve-bladeburner-success-chances.txt',
+            [JSON.stringify(Object.entries(sleeveBbContractBySleeve).map(([i, c]) => [Number(i), c]).filter(([i]) => i < numSleeves))]);
         bladeburnerContractCounts = await getNsDataThroughFile(ns,
             'Object.fromEntries(ns.args.map(c => [c, ns.bladeburner.getActionCountRemaining("Contracts", c)]))',
             '/Temp/sleeve-bladeburner-contract-counts.txt', sleeveBbContractNames);
@@ -177,14 +237,16 @@ async function mainLoop(ns) {
     // If not disabled, set the "follow player" sleeve to be the first sleeve with 0 shock
     followPlayerSleeve = options['disable-follow-player'] ? -1 : undefined;
     for (let i = 0; i < numSleeves; i++) // Hack below: Prioritize sleeves doing bladeburner contracts, don't have them follow player
-        if (sleeveInfo[i].shock == 0 && (i < i || i > 3 || !playerInBladeburner))
+        if (sleeveInfo[i].shock == 0 && (i > 3 || !playerInBladeburner))
             followPlayerSleeve ??= i; // Skips assignment if previously assigned
     followPlayerSleeve ??= 0; // If all have shock, use the first sleeve
+    // Reserve the player's faction for the follow-player sleeve so that a lower-indexed sleeve doesn't claim it first
+    if (followPlayerSleeve >= 0 && playerWorkInfo.type == "FACTION") factionsTakenThisLoop.push(playerWorkInfo.factionName);
 
     for (let i = 0; i < numSleeves; i++) {
         let sleeve = sleeveInfo[i]; // For convenience, merge all sleeve stats/info into one object
         // Manage sleeve augmentations (if available)
-        if (sleeve.shock == 0) // No augs are available augs until shock is 0
+        if (sleeve.shock == 0 && !sleeveExpDisabled) // No augs are available augs until shock is 0
             budget -= await manageSleeveAugs(ns, i, budget);
 
         // Decide what we think the sleeve should be doing for the next little while
@@ -218,8 +280,11 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     // Initialize sleeve dicts on first loop
     if (lastSleeveHp[i] === undefined) lastSleeveHp[i] = sleeve.hp.current;
     if (lastSleeveShock[i] === undefined) lastSleeveShock[i] = sleeve.shock;
-    // Must synchronize first iif you haven't maxed memory on every sleeve
-    if (sleeve.sync < 100)
+    // Synchronization only affects karma gained from sleeve crime (src/PersonObjects/Sleeve/Work/SleeveCrimeWork.ts: karma * syncBonus())
+    // and the exp copied to the player / other sleeves (Work.ts applySleeveGains). The sleeve's own exp, rep and shock recovery are unaffected,
+    // so only bother syncing first when this sleeve's job will be crime for gang karma (or when --sync-first is set).
+    const wantKarmaCrime = !playerInGang && !options['disable-gang-homicide-priority'] && (2 in ownedSourceFiles) && ns.heart.break() > -54000;
+    if (sleeve.sync < 100 && (options['sync-first'] || wantKarmaCrime))
         return ["synchronize", `ns.sleeve.setToSynchronize(ns.args[0])`, [i], `syncing... ${sleeve.sync.toFixed(2)}%`];
     // Opt to do shock recovery if above the --min-shock-recovery threshold
     if (sleeve.shock > options['min-shock-recovery'])
@@ -227,15 +292,21 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     // To time-balance between being useful and recovering from shock more quickly - sleeves have a random chance to be put
     // on shock recovery. To avoid frequently interrupting tasks that take a while to complete, only re-roll every so often.
     if (sleeve.shock > 0 && options['shock-recovery'] > 0) {
-        if (Date.now() - (lastRerollTime[i] || 0) < rerollTime) {
+        if (Date.now() - (lastRerollTime[i] || 0) >= rerollTime) { // Re-roll once the previous roll is at least rerollTime old (or has never been made)
             shockChance[i] = Math.random();
             lastRerollTime[i] = Date.now();
         }
         if (shockChance[i] < options['shock-recovery'])
             return shockRecoveryTask(sleeve, i, `there is a ${(options['shock-recovery'] * 100).toFixed(1)}% chance (--shock-recovery) of picking this task every minute until fully recovered.`);
     }
-    // Train if our sleeve's physical stats aren't where we want them
-    if (canTrain) {
+    // Train if our sleeve's physical stats aren't where we want them.
+    // Class exp is scaled by shockBonus() = (100 - shock)/100 (src/PersonObjects/Sleeve/Work/SleeveClassWork.ts calculateRates) but the class
+    // cost is not, so don't pay to train a heavily shocked sleeve (--train-max-shock). Also, installing any sleeve augmentation zeroes all of
+    // its exp (src/PersonObjects/Sleeve/Sleeve.ts installAugmentation), so don't train while augs remain to be bought (--train-with-pending-augs).
+    let augsPending = false;
+    if (canTrain && sleeve.shock <= options['train-max-shock'] && !options['train-with-pending-augs'] && !sleeveExpDisabled)
+        augsPending = (await getAvailableAugs(ns, i)).length > 0;
+    if (canTrain && sleeve.shock <= options['train-max-shock'] && !augsPending) {
         const univClasses = {
             "hacking": ns.enums.UniversityClassType.algorithms,
             "charisma": ns.enums.UniversityClassType.leadership
@@ -283,13 +354,8 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
         // TODO: We should be able to borrow logic from work-for-factions.js to have more sleeves work for useful factions / companies
         // We'll cycle through work types until we find one that is supported. TODO: Auto-determine the most productive faction work to do.
         const faction = playerWorkInfo.factionName;
-        const work = works[workByFaction[faction] || 0];
-        return [
-            `work for faction '${faction}' (${work})`,
-            `ns.sleeve.setToFactionWork(ns.args[0], ns.args[1], ns.args[2])`,
-            [i, faction, work],
-            `helping earn rep with faction ${faction} by doing ${work} work.`
-        ];
+        if (!factionsTakenThisLoop.includes(faction)) factionsTakenThisLoop.push(faction);
+        return factionWorkTask(i, faction);
     } // Same as above if player is currently working for a megacorp
     if (i == followPlayerSleeve && playerWorkInfo.type == "COMPANY") {
         const companyName = playerWorkInfo.companyName;
@@ -316,7 +382,7 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
             /*7*/options['enable-bladeburner-team-building'] ? ["Recruitment"] : ["Infiltrate Synthoids"]
         ];
         let [action, contractName] = bbTasks[i];
-        const contractChance = bladeburnerContractChances[contractName] ?? 1;
+        const contractChance = bladeburnerContractChances[i] ?? 1; // Per-sleeve estimate (keyed by sleeve index, see mainLoop)
         const contractCount = bladeburnerContractCounts[contractName] ?? Infinity;
         const onCooldown = () => Date.now() <= bladeburnerCooldown[i]; // Function to check if we're on cooldown
         // Detect if the sleeve recently failed the task. If so, put them on a "cooldown" before trying again
@@ -346,12 +412,33 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
         /*   */ `ns.sleeve.setToBladeburnerAction(ns.args[0], ns.args[1], ns.args[2])`, [i, action, contractName ?? ''],
         /*   */ `doing ${action}${contractName ? ` - ${contractName}` : ''} in Bladeburner.`];
     }
+    // Each faction accepts one sleeve (src/NetscriptFunctions/Sleeve.ts setToFactionWork), so up to --max-faction-sleeves sleeves can each work
+    // for a different joined faction that still needs rep for augmentations (lowest rep first). Rep earned is scaled by (100 - shock)%.
+    if (sleeve.shock <= options['faction-work-max-shock'] && factionsTakenThisLoop.length < options['max-faction-sleeves']) {
+        const faction = factionWorkCandidates.find(f => !factionsTakenThisLoop.includes(f) && !factionWorkUnsupported[f]);
+        if (faction) {
+            factionsTakenThisLoop.push(faction);
+            return factionWorkTask(i, faction);
+        }
+    }
     // If there's nothing more productive to do (above) and there's still shock, prioritize recovery
     if (sleeve.shock > 0)
         return shockRecoveryTask(sleeve, i, `there appears to be nothing better to do`);
     // Finally, do crime for Karma. Pick the best crime based on success chances
     var crime = options.crime || (await calculateCrimeChance(ns, sleeve, "Homicide")) >= options['homicide-chance-threshold'] ? 'Homicide' : 'Mug';
     return await crimeTask(ns, crime, i, sleeve, `there appears to be nothing better to do`);
+}
+
+/** Helper to prepare a faction work task. We'll cycle through work types until we find one that is supported (see setSleeveTask).
+ * TODO: Auto-determine the most productive faction work to do. */
+function factionWorkTask(i, faction) {
+    const work = works[workByFaction[faction] || 0];
+    return [
+        `work for faction '${faction}' (${work})`,
+        `ns.sleeve.setToFactionWork(ns.args[0], ns.args[1], ns.args[2])`,
+        [i, faction, work],
+        `helping earn rep with faction ${faction} by doing ${work} work.`
+    ];
 }
 
 /** Helper to prepare the shock recovery task
@@ -397,7 +484,9 @@ async function setSleeveTask(ns, i, designatedTask, command, args) {
         const faction = args[1]; // Hack: Not obvious, but the second argument will be the faction name in this case.
         let nextWorkIndex = (workByFaction[faction] || 0) + 1;
         if (nextWorkIndex >= works.length) {
-            log(ns, `WARN: Failed to ${strAction}. None of the ${works.length} work types appear to be supported. Will loop back and try again.`, true, 'warning');
+            log(ns, `WARN: Failed to ${strAction}. None of the ${works.length} work types appear to be supported. ` +
+                `Other sleeves will no longer be assigned to this faction (it may be our gang's faction, or offer no work).`, true, 'warning');
+            factionWorkUnsupported[faction] = true;
             nextWorkIndex = 0;
         } else
             log(ns, `INFO: Failed to ${strAction} - work type may not be supported. Trying the next work type (${works[nextWorkIndex]})`);

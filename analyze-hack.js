@@ -1,4 +1,4 @@
-import { getConfiguration, disableLogs, formatMoney as importedFormatMoney, formatDuration, scanAllServers } from './helpers.js'
+import { getConfiguration, disableLogs, formatMoney as importedFormatMoney, scanAllServers } from './helpers.js'
 
 const argsSchema = [
     ['all', false], // Set to true to report on all servers, not just the ones within our hack level
@@ -41,6 +41,7 @@ export async function main(ns) {
 
     var player = ns.getPlayer();
     //ns.print(JSON.stringify(player));
+    const realHackLevel = player.skills.hacking; // Needed by the no-formulas fallback to rescale ns.getHackTime (which is at our real level) to another level
 
     if (options['at-hack-level']) player.skills.hacking = options['at-hack-level'];
     let servers = serverNames.map(ns.getServer);
@@ -57,64 +58,89 @@ export async function main(ns) {
      * @param {Server} server
      * @param {Player} player */
     function getRatesAtHackLevel(server, player, hackLevel) {
-        let theoreticalGainRate, cappedGainRate, expRate;
+        // Assume we will have weakened the server to min-security and taken it to max money before targetting
+        const minDifficulty = server.minDifficulty;
+        // Remember the server's real current security (this function may be called several times per server, and the formulas branch overwrites hackDifficulty)
+        server.currentDifficulty ??= server.hackDifficulty;
+        // The per-thread primitives the rate calculation needs. Taken from the formulas API when available, otherwise from closed-form replicas of the game's formulas.
+        let hackTime, growTime, weakenTime; // (ms) at min security and the requested hack level
+        let growGain; // Log of the growth multiplier per (1-core) grow thread
+        let hackGain; // Fraction of the server's money stolen per hack thread
+        let hackChance; // Probability that a hack succeeds
+        let hackExp; // Hack exp per thread for a *successful* hack
         let useFormulas = !options['disable-formulas-api'];
         if (useFormulas) {
             // Temporarily change the hack level on the player object to the requested level
             const real_player_hack_skill = player.skills.hacking;
             player.skills.hacking = hackLevel;
-            // Assume we will have wekened the server to min-security and taken it to max money before targetting
-            server.hackDifficulty = server.minDifficulty;
+            server.hackDifficulty = minDifficulty;
             server.moneyAvailable = server.moneyMax;
             try {
-                // Compute the cost (ram*seconds) for each tool
-                const weakenCost = weaken_ram * ns.formulas.hacking.weakenTime(server, player);
-                const growCost = grow_ram * ns.formulas.hacking.growTime(server, player) + weakenCost * 0.004 / 0.05;
-                const hackCost = hack_ram * ns.formulas.hacking.hackTime(server, player) + weakenCost * 0.002 / 0.05;
-
-                // Compute the growth and hack gain rates
-                const growGain = Math.log(ns.formulas.hacking.growPercent(server, 1, player, 1));
-                const hackGain = ns.formulas.hacking.hackPercent(server, player);
-                // If hack gain is less than this minimum (very high BN12 levels?) We must coerce it to some minimum value to avoid NAN results.
-                const minHackGain = 1e-10;
-                if (hackGain <= minHackGain)
-                    ns.print(`WARN: hackGain is ${hackGain.toPrecision(3)}. Coercing it to the minimum value ${minHackGain} (${server.hostname})`);
-                server.estHackPercent = Math.max(minHackGain, Math.min(0.98,
-                    Math.min(ram_total * hackGain / hackCost, 1 - 1 / Math.exp(ram_total * growGain / growCost)))); // TODO: I think these might be off by a factor of 2x
-                if (use_est_hack_percent) hack_percent = server.estHackPercent;
-                const grows_per_cycle = -Math.log(1 - hack_percent) / growGain;
-                const hacks_per_cycle = hack_percent / hackGain;
-                const hackProfit = server.moneyMax * hack_percent * ns.formulas.hacking.hackChance(server, player);
-                // Compute the relative monetary gain
-                theoreticalGainRate = hackProfit / (growCost * grows_per_cycle + hackCost * hacks_per_cycle) * 1000 /* Convert per-millisecond rate to per-second */;
-                expRate = ns.formulas.hacking.hackExp(server, player) * (1 + 0.002 / 0.05) / (hackCost) * 1000;
-                // The practical cap on revenue is based on your hacking scripts. For my hacking scripts this is about 20% per second, adjust as needed
-                // No idea why we divide by ram_total - Basically ensures that as our available RAM gets larger, the sort order merely becomes "by server max money"
-                cappedGainRate = Math.min(theoreticalGainRate, hackProfit / ram_total);
-                ns.print(`At hack level ${hackLevel} and steal ${(hack_percent * 100).toPrecision(3)}%: ` +
-                    `Theoretical ${formatMoney(theoreticalGainRate)}, Limit: ${formatMoney(hackProfit / ram_total)}, Exp: ${expRate.toPrecision(3)}, ` +
-                    `Hack Chance: ${(ns.formulas.hacking.hackChance(server, player) * 100).toPrecision(3)}% (${server.hostname})`);
+                hackTime = ns.formulas.hacking.hackTime(server, player);
+                growTime = ns.formulas.hacking.growTime(server, player);
+                weakenTime = ns.formulas.hacking.weakenTime(server, player);
+                growGain = Math.log(ns.formulas.hacking.growPercent(server, 1, player, 1));
+                hackGain = ns.formulas.hacking.hackPercent(server, player);
+                hackChance = ns.formulas.hacking.hackChance(server, player);
+                hackExp = ns.formulas.hacking.hackExp(server, player);
             }
-            catch { // Formulas API unavailable?               
+            catch { // Formulas API unavailable?
                 useFormulas = false;
             } finally {
                 player.skills.hacking = real_player_hack_skill; // Restore the real hacking skill if we changed it temporarily
             }
         }
-        // Solution for when formulas API is disabled or unavailable
+        // Solution for when formulas API is disabled or unavailable: replicate the game's formulas (src/Hacking.ts) in closed form.
+        // Multipliers that scale every server by the same factor (bitnode mults, hacking_speed, hacking_exp) are omitted where they would
+        // only rescale the results, since we only need a relative ranking (the same approach daemon.js takes in percentageStolenPerHackThread).
         if (!useFormulas) {
-            // Fall-back to returning a "gain rates" based purely on current hack time (i.e. ignoring the RAM associated with required grow/weaken threads)
-            let timeToHack = ns.getWeakenTime(server.hostname) / 4.0;
-            // Realistically, batching scripts run on carefully timed intervals (e.g. batches scheduled no less than 200 ms apart).
-            // So for very small time-to-weakens, we use a "capped" gain rate based on a more achievable number of hacks per second.
-            let cappedTimeToHack = Math.max(timeToHack, 200)
-            // the server computes experience gain based on the server's base difficulty. To get a rate, we divide that by the timeToWeaken
-            let relativeExpGain = 3 + server.minDifficulty * 0.3; // Ignore HackExpGain mults since they affect all servers equally
-            server.estHackPercent = 1; // Our simple calculations below are based on 100% of server money on every server.
-            [theoreticalGainRate, cappedGainRate, expRate] = [server.moneyMax / timeToHack, server.moneyMax / cappedTimeToHack, relativeExpGain / timeToHack];
-            ns.print(`Without formulas.exe, based on max money ${formatMoney(server.moneyMax)} and hack-time ${formatDuration(timeToHack)} (capped at ${formatDuration(cappedTimeToHack)})): ` +
-                `Theoretical ${formatMoney(theoreticalGainRate)}, Limit: ${formatMoney(cappedGainRate)}, Exp: ${expRate.toPrecision(3)} (${server.hostname})`);
+            const req = server.requiredHackingSkill;
+            const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+            // calculateHackingTime: time = 5 * (2.5 * req * difficulty + 500) / (hack + 50) / (speed mults). We take the absolute time (with all
+            // mults) from ns.getHackTime, which is at our *real* hack level and the server's *current* security, and rescale it to min security
+            // and the requested hack level (all other factors cancel out).
+            const timeFactor = (difficulty, hackLevel) => (2.5 * req * difficulty + 500) / (hackLevel + 50);
+            hackTime = ns.getHackTime(server.hostname) * timeFactor(minDifficulty, hackLevel) / timeFactor(server.currentDifficulty, realHackLevel);
+            growTime = hackTime * 3.2; // calculateGrowTime = 3.2 * hack time
+            weakenTime = hackTime * 4; // calculateWeakenTime = 4 * hack time
+            // calculateServerGrowthLog (src/Server/formulas/grow.ts) for 1 thread on a 1-core host: min(log1p(0.03 / difficulty), log1p(0.0035)) * serverGrowth / 100 * hacking_grow
+            growGain = Math.min(Math.log1p(0.03 / minDifficulty), 0.00349388925425578) * (server.serverGrowth / 100) * player.mults.hacking_grow;
+            // calculatePercentMoneyHacked: (100 - difficulty) / 100 * (hack - (req - 1)) / hack * hacking_money / 240 (BN ScriptHackMoney mult omitted)
+            hackGain = clamp(((100 - minDifficulty) / 100) * ((hackLevel - (req - 1)) / hackLevel) * player.mults.hacking_money / 240, 0, 1);
+            // calculateHackingChance: (1.75 * hack - req) / (1.75 * hack) * (100 - difficulty) / 100 * hacking_chance * intelligence bonus (1 + int^0.8 / 600)
+            const skillMult = Math.max(1, 1.75 * hackLevel);
+            hackChance = clamp(((skillMult - req) / skillMult) * ((100 - minDifficulty) / 100) * player.mults.hacking_chance *
+                (1 + Math.pow(player.skills.intelligence ?? 0, 0.8) / 600), 0, 1);
+            // calculateHackingExpGain: 3 + baseDifficulty * 0.3 (hacking_exp and BN HackExpGain mults omitted)
+            hackExp = 3 + (server.baseDifficulty ?? minDifficulty) * 0.3;
         }
+
+        // Compute the cost (ram*seconds) for each tool, including the weaken threads needed to undo its security hardening
+        // (hack +0.002 / grow +0.004 per thread, weaken -0.05 per thread: src/Server/data/Constants.ts ServerFortifyAmount / ServerWeakenAmount)
+        const weakenCost = weaken_ram * weakenTime;
+        const growCost = grow_ram * growTime + weakenCost * 0.004 / 0.05;
+        const hackCost = hack_ram * hackTime + weakenCost * 0.002 / 0.05;
+        // If hack gain is less than this minimum (very high BN12 levels?) We must coerce it to some minimum value to avoid NAN results.
+        const minHackGain = 1e-10;
+        if (hackGain <= minHackGain)
+            ns.print(`WARN: hackGain is ${hackGain.toPrecision(3)}. Coercing it to the minimum value ${minHackGain} (${server.hostname})`);
+        server.estHackPercent = Math.max(minHackGain, Math.min(0.98,
+            Math.min(ram_total * hackGain / hackCost, 1 - 1 / Math.exp(ram_total * growGain / growCost)))); // TODO: I think these might be off by a factor of 2x
+        if (use_est_hack_percent) hack_percent = server.estHackPercent;
+        const grows_per_cycle = -Math.log(1 - hack_percent) / growGain;
+        const hacks_per_cycle = hack_percent / hackGain;
+        const hackProfit = server.moneyMax * hack_percent * hackChance;
+        // Compute the relative monetary gain
+        const theoreticalGainRate = hackProfit / (growCost * grows_per_cycle + hackCost * hacks_per_cycle) * 1000 /* Convert per-millisecond rate to per-second */;
+        // A failed hack still grants 1/4 of the exp of a successful one (src/Netscript/NetscriptHelpers.tsx hack(): expGainedOnFailure = expGainedOnSuccess / 4)
+        const expectedExpPerHackThread = hackExp * (hackChance + (1 - hackChance) / 4);
+        const expRate = expectedExpPerHackThread * (1 + 0.002 / 0.05) / (hackCost) * 1000;
+        // The practical cap on revenue is based on your hacking scripts. For my hacking scripts this is about 20% per second, adjust as needed
+        // No idea why we divide by ram_total - Basically ensures that as our available RAM gets larger, the sort order merely becomes "by server max money"
+        const cappedGainRate = Math.min(theoreticalGainRate, hackProfit / ram_total);
+        ns.print(`${useFormulas ? '' : '(Without formulas.exe, closed-form estimate) '}At hack level ${hackLevel} and steal ${(hack_percent * 100).toPrecision(3)}%: ` +
+            `Theoretical ${formatMoney(theoreticalGainRate)}, Limit: ${formatMoney(hackProfit / ram_total)}, Exp: ${expRate.toPrecision(3)}, ` +
+            `Hack Chance: ${(hackChance * 100).toPrecision(3)}% (${server.hostname})`);
         return [theoreticalGainRate, cappedGainRate, expRate];
     }
 

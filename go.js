@@ -17,7 +17,10 @@ import {
 const argsSchema = [
     ['cheats', true], // (Now true by default - but still an option for backwards compatibility) This is only possible if you have BN14.2
     ['disable-cheats', false], // Set to true if you want to *not* use cheats for some reason.
-    ['cheat-chance-threshold', 0.9], // Don't cheat if our success chance is less than this
+    ['cheat-chance-threshold', 0.9], // Don't cheat (after the first cheat of a game) if our success chance is less than this. Failing a 2nd+ cheat has a 10% chance of ejection (loses the game)
+    ['first-cheat-chance-threshold', 0.55], // The first cheat of a game can never eject us (a failure only skips our turn), so it may be attempted at this lower threshold
+    ['opponents', []], // Ordered preference list of opponents to play (e.g. --opponents Daedalus --opponents Illuminati). Default: see defaultOpponentPreference below
+    ['size', 13], // Board size to play (5, 7, 9 or 13). Note: a 5x5 board vs Illuminati has a node-power difficulty multiplier of 8 (vs (komi+0.5)*0.25 = 2 for 13x13) and games are ~6x faster
     ['logtime', false], // Logs time time it takes for each player to take their move
     ['runOnce', false], // Will only play one game if enabled
     ['silent', false], // (Obsolete) This script used to automatically tail. Now if you want to do this, call with --tail like normal.
@@ -34,6 +37,10 @@ export function autocomplete(data, args) {
 export async function main(ns) {
     let cheats = false;
     let cheatChanceThreshold = 1.0;
+    let firstCheatChanceThreshold = 1.0;
+    let opponentPreference = (/**@returns{string[]}*/() => [])();
+    let boardSize = 13;
+    let maxFavorRep = 100_000; // Max "rep" (favor converted to rep) obtainable from win streaks per faction (src/Go/effects/effect.ts getMaxRep)
     let logtime = false;
     let runOnce = true;
     let silent = false;
@@ -80,12 +87,12 @@ export async function main(ns) {
         ["?WWW?", "W.*.W", "WXXXW", "?????", "?????"], //Take the 3x3 back corner
     ];
 
-    // Testing
-    //const opponent = ["Slum Snakes", "Tetrads", "Daedalus", "Illuminati"]
-    //const opponent2 = ["????????????"]
-    // Original
-    const opponent = ["Netburners", "Slum Snakes", "The Black Hand", "Tetrads", "Daedalus", "Illuminati"];
-    const opponent2 = ["Netburners", "Slum Snakes", "The Black Hand", "Tetrads", "Daedalus", "Illuminati", "????????????"];
+    // Node power, win streaks and favor are tracked per opponent (src/Go/boardAnalysis/scoring.ts), and each opponent boosts a different
+    // stat (src/Go/effects/effect.ts calculateMults): Netburners = hacknet production, Slum Snakes = crime success, The Black Hand = hacking money,
+    // Tetrads = combat stats, Daedalus = faction & company rep, Illuminati = hack/grow/weaken speed, ???????????? (w0r1d_d43m0n) = hacking skill.
+    // Rather than spreading wins randomly, we focus on one opponent at a time (in this order) until its win-streak favor bonus is capped.
+    const defaultOpponentPreference = ["Daedalus", "????????????", "Illuminati", "The Black Hand", "Netburners", "Slum Snakes", "Tetrads"];
+    const allOpponents = ["Netburners", "Slum Snakes", "The Black Hand", "Tetrads", "Daedalus", "Illuminati", "????????????"];
 
     await start();
 
@@ -97,10 +104,28 @@ export async function main(ns) {
         logtime = runOptions.logtime;
         runOnce = runOptions.runOnce;
 
-        const sourceFiles = await getActiveSourceFiles(ns, true);
-        // Enable cheats if we have SF14.2 or higher (unless the user disabled cheats).
-        cheats = !runOptions['disable-cheats'] && (sourceFiles[14] ?? 0) >= 2;
+        // Note: We need the *owned* SF14 level (not the effective level from being in BN14), since the game's own check is based on it.
+        const sourceFiles = await getActiveSourceFiles(ns, false);
+        const resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
+        const sf14Level = sourceFiles[14] ?? 0;
+        // Enable cheats if the game allows them (unless the user disabled cheats). The game (src/Go/effects/netscriptGoImplementation.ts
+        // checkCheatApiAccess) allows the cheat API with SF14.2+, or with SF14.1 while in BN14.
+        cheats = !runOptions['disable-cheats'] && (sf14Level >= 2 || (sf14Level >= 1 && resetInfo.currentNode == 14));
         cheatChanceThreshold = runOptions['cheat-chance-threshold'];
+        firstCheatChanceThreshold = runOptions['first-cheat-chance-threshold'];
+        // src/Go/effects/effect.ts getMaxRep: 100k with no SF14, 200k at SF14.1, 300k at SF14.2, 400k at SF14.3+
+        maxFavorRep = sf14Level >= 3 ? 400_000 : sf14Level == 2 ? 300_000 : sf14Level == 1 ? 200_000 : 100_000;
+        opponentPreference = (runOptions.opponents?.length ? runOptions.opponents : defaultOpponentPreference).filter(o => {
+            if (allOpponents.includes(o)) return true;
+            log(ns, `WARNING: Ignoring unknown opponent "${o}" (--opponents). Valid opponents are: ${allOpponents.join(", ")}`, true, 'warning');
+            return false;
+        });
+        if (opponentPreference.length == 0) opponentPreference = defaultOpponentPreference;
+        boardSize = runOptions.size;
+        if (![5, 7, 9, 13].includes(boardSize)) {
+            log(ns, `WARNING: --size must be one of 5, 7, 9, 13 (got ${boardSize}). Using 13.`, true, 'warning');
+            boardSize = 13;
+        }
 
         ns.disableLog("go.makeMove")
 
@@ -139,9 +164,9 @@ export async function main(ns) {
     async function go_analysis_getChains(ns) {
         return await getNsDataThroughFile(ns, `ns.go.analysis.getChains()`);
     }
-    /** @param {NS} ns @returns {Promise<number>} */
-    async function go_cheat_getCheatSuccessChance(ns) {
-        return await getNsDataThroughFile(ns, `ns.go.cheat.getCheatSuccessChance()`);
+    /** @param {NS} ns @returns {Promise<[number, number]>} The number of cheats already attempted this game, and the success chance of the next one */
+    async function go_cheat_getCheatCountAndSuccessChance(ns) {
+        return await getNsDataThroughFile(ns, `[ns.go.cheat.getCheatCount(), ns.go.cheat.getCheatSuccessChance()]`, '/Temp/go-cheat-count-and-chance.txt');
     }
     /** @param {NS} ns @param {number} x1 @param {number} y1 @param {number} x2 @param {number} y2
      * @returns {Promise<{type: "move" | "pass" | "gameOver";x: number;y: number;}>} */
@@ -361,11 +386,34 @@ export async function main(ns) {
     function checkNewGame(ns, gameInfo) {
         if (gameInfo.type === "gameOver") {
             if (runOnce) ns.exit()
-            try { ns.go.resetBoardState(opponent2[Math.floor(Math.random() * opponent2.length)], 13) }
-            catch { ns.go.resetBoardState(opponent[Math.floor(Math.random() * opponent.length)], 13) }
+            startNewGame(ns);
             turn = 0
             ns.clearLog()
         }
+    }
+
+    /** Start a new game against the most-preferred opponent whose win-streak favor bonus isn't capped yet.
+     * ns.go.analysis.getStats() (0 GB) reports per-opponent "rep" = favor gained via win streaks (src/Go/boardAnalysis/scoring.ts), which
+     * stops accruing at getMaxRep() (src/Go/effects/effect.ts). Once every preferred opponent is capped, we rotate randomly among them.
+     * @param {NS} ns */
+    function startNewGame(ns) {
+        const stats = ns.go.analysis.getStats();
+        const uncapped = opponentPreference.filter(o => (stats[o]?.rep ?? 0) < maxFavorRep);
+        const candidates = uncapped.length > 0 ? uncapped : opponentPreference.slice().sort(() => Math.random() - 0.5);
+        for (const candidate of candidates) {
+            try {
+                ns.go.resetBoardState(candidate, boardSize);
+                log(ns, `INFO: Starting a new ${boardSize}x${boardSize} game vs ${candidate} ` +
+                    `(favor rep ${(stats[candidate]?.rep ?? 0).toLocaleString()}/${maxFavorRep.toLocaleString()}, ` +
+                    `win streak ${stats[candidate]?.winStreak ?? 0}, ${uncapped.length} uncapped opponents in preference list).`);
+                return;
+            } catch (err) { // e.g. "????????????" is not available until late in the BN
+                log(ns, `INFO: Could not start a game vs ${candidate} (${getErrorInfo(err)}). Trying the next preferred opponent...`);
+            }
+        }
+        // Fall back to any always-available opponent
+        const fallbacks = allOpponents.filter(o => o != "????????????");
+        ns.go.resetBoardState(fallbacks[Math.floor(Math.random() * fallbacks.length)], boardSize);
     }
     /** @param {NS} ns
      * @param {number} x
@@ -1316,12 +1364,16 @@ export async function main(ns) {
         if (attack.coords === undefined || !cheats) return false
         const [s1x, s1y, s2x, s2y] = attack.coords
         if (s1x === undefined) return false
-        const chance = await go_cheat_getCheatSuccessChance(ns);
-        if (chance < cheatChanceThreshold) return false
+        // Cheat success chance (src/Go/effects/netscriptGoImplementation.ts cheatSuccessChance) = min(1, 0.6 * (0.7 - 0.02c)^c * crime_success + (SF14.3 ? 0.25 : 0))
+        // where c is the number of cheats already attempted this game. On failure, the turn is skipped, and (determineCheatSuccess) only if there
+        // was a *prior* cheat this game is there a 10% chance of being ejected (losing the game). So the first cheat is low-risk and can use a lower threshold.
+        const [cheatCount, chance] = await go_cheat_getCheatCountAndSuccessChance(ns);
+        const threshold = cheatCount == 0 ? firstCheatChanceThreshold : cheatChanceThreshold;
+        if (chance < threshold) return false
         try {
             let mid = performance.now()
             const results = await go_cheat_playTwoMoves(ns, s1x, s1y, s2x, s2y)
-            ns.printf("%s  Chance: %.2f%%  Result: %s", attack.msg, chance * 100, results.type);
+            ns.printf("%s  Cheat #%d Chance: %.2f%% (threshold %.0f%%)  Result: %s", attack.msg, cheatCount + 1, chance * 100, threshold * 100, results.type);
             let END = performance.now()
             if (logtime) ns.printf("Time: Me: %s  Them: %s", formatTime(ns, mid - START, true), formatTime(ns, END - mid, true))
             START = performance.now()

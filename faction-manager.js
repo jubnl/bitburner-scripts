@@ -48,6 +48,7 @@ const argsSchema = [ // The set of all command line arguments
     ['ignore-faction', ["Shadows of Anarchy"]], // Factions to omit from all data, stats, and calcs, (e.g.) if you do not want to purchase augs from them, or do not want to see them because they are impractical to join at this time
     ['after-faction', []], // Pretend we were to buy all augs offered by these factions. Show us only what remains.
     ['force-join', null], // Always join these factions if we have an invite (useful to force join a gang faction)
+    ['join-all-invites', true], // v3.0: every joined non-special, non-gang faction you aren't working for earns passive rep, so join every pending invite (except city factions that would lock you out of others). Set `--join-all-invites false` to only join factions with desired augs.
     // Augmentation purchasing-related options. Controls what augmentations are included in cost calculations, and optionally purchased
     ['priority-aug', []], // If accessible, every effort is made not to drop these from the sort purchase order.
     ['omit-aug', []], // Augmentations to exclude from the augmentation list (e.g. because we do not wish to purchase it yet)
@@ -179,19 +180,22 @@ export async function main(ns) {
         log(ns, 'INFO: Skipping joining available factions due to the --ignore-player-data flag set.');
     else {
         log(ns, 'Joining available factions...');
-        let forceJoinFactions = options['force-join'] || [];
+        // Normalize the user's --force-join list (ns.flags gives a string for a single value, an array for repeated flags, or null if unset)
+        const userForceJoin = options['force-join'] == null ? [] : [].concat(options['force-join']).map(f => f.replaceAll("_", " "));
+        let forceJoinFactions = [...userForceJoin];
         // If the user didn't set the 'force-join' option, there are some defaults we should apply
-        if (!forceJoinFactions) {
+        // (Bug fix: this used to test `!forceJoinFactions` on an array, which is never true, so these defaults never applied)
+        if (userForceJoin.length == 0) {
             // If we're in BN 10, we can purchase special Sleeve-related things from the Covenant, so we should always join it
             if (bitNode == 10)
                 forceJoinFactions.push("The Covenant");
             // If gangs are an available feature, we should by default want to join any available gang factions
             if (!gangFaction && 2 in ownedSourceFiles && ns.heart.break() <= -53000) {
-                forceJoinFactions.push(potentialGangFactions); // Try to join all gang factions as we near unlocking gangs, regardless of their augmentations
+                forceJoinFactions.push(...potentialGangFactions); // Try to join all gang factions as we near unlocking gangs, regardless of their augmentations
                 log(ns, `INFO: Will join any gang faction because Karma is at ${formatNumberShort(ns.heart.break())}`, printToTerminal, printToTerminal ? 'info' : undefined);
             }
         }
-        let joined = await joinFactions(ns, forceJoinFactions);
+        let joined = await joinFactions(ns, forceJoinFactions, options['join-all-invites']);
         if (joined) log(ns, `SUCCESS: Joined ${joined} factions.`);
         displayJoinedFactionSummary(ns);
     }
@@ -498,8 +502,12 @@ class AugmentationData {
 
 /** Helper function to join any factions we have an invite to, and which have augmentations we want.
  * @param {NS} ns
- * @param {string[]} forceJoinFactions A list of factions to join even if they have no remaining augmentations. **/
-async function joinFactions(ns, forceJoinFactions) {
+ * @param {string[]} forceJoinFactions A list of factions to join even if they have no remaining augmentations.
+ * @param {boolean} joinAllInvites If true (default), join every pending invite, even ones with no desired augs. In v3.0 every joined
+ *   faction that is not "special" and not our gang faction earns passive rep whenever we are not working for it
+ *   (src/Faction/FactionHelpers.tsx processPassiveFactionRepGain: max(work-rep-rate * (favor/1000 + 0.01), 1/120) rep/sec),
+ *   so there is no downside to joining - except city factions, which ban their `enemies` (src/Faction/FactionInfo.tsx) on join. **/
+async function joinFactions(ns, forceJoinFactions, joinAllInvites = true) {
     let manualJoin = ["Sector-12", "Chongqing", "New Tokyo", "Ishima", "Aevum", "Volhaven"];
     // If we have already joined one of the "precluding" factions, we are free to join the remainder
     if (joinedFactions.some(f => manualJoin.includes(f)))
@@ -517,13 +525,16 @@ async function joinFactions(ns, forceJoinFactions) {
         let newAugs = unownedAugs.filter(aug => !accessibleAugmentations.has(aug)); //  Filter out augmentations we can purchase from another faction we've already joined
         let desiredAugs = newAugs.filter(aug => augmentationData[aug].desired); //  Filter out augmentations we have no interest in
         log(ns, `${faction.name} has ${faction.augmentations.length} augs, ${unownedAugs.length} unpurchased, ${newAugs.length} not offered by joined factions, ` +
-            `${desiredAugs.length} with desirable stats` + (desiredAugs.length == 0 ? ' (not joining)' : `: ${JSON.stringify(desiredAugs)}`));
-        if (desiredAugs.length == 0 && !forceJoinFactions.includes(faction.name)) continue;
+            `${desiredAugs.length} with desirable stats` + (desiredAugs.length == 0 ? ((joinAllInvites || forceJoinFactions.includes(faction.name)) ? '' : ' (not joining)') : `: ${JSON.stringify(desiredAugs)}`));
+        if (desiredAugs.length == 0 && !forceJoinFactions.includes(faction.name) && !joinAllInvites) continue;
+        // City factions are mutually exclusive (Sector-12/Aevum vs Chongqing/New Tokyo/Ishima vs Volhaven), so never auto-join those
+        // unless explicitly forced, or we've already joined one (at which point the game has already banned the incompatible ones)
         if (manualJoin.includes(faction.name) && !forceJoinFactions.includes(faction.name))
             log(ns, `INFO: You have an invite from faction ${faction.name}, but it will not be automatically joined, ` +
                 `because this would prevent you from joining some other factions.`, printToTerminal, printToTerminal ? 'info' : undefined);
         else {
-            log(ns, `Joining faction ${faction.name} which has ${desiredAugs.length} desired augmentations: ${desiredAugs}`);
+            log(ns, `Joining faction ${faction.name} which has ${desiredAugs.length} desired augmentations: ${desiredAugs}` +
+                (desiredAugs.length == 0 ? (forceJoinFactions.includes(faction.name) ? ' (force-joined)' : ' (joining anyway for passive rep, see --join-all-invites)') : ''));
             let response;
             if (response = await getNsDataThroughFile(ns, `ns.singularity.joinFaction(ns.args[0])`, null, [faction.name])) {
                 faction.joined = true;
