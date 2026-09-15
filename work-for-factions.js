@@ -90,7 +90,7 @@ const allGangFactions = ["Speakers for the Dead", "The Dark Army", "The Syndicat
 const loopSleepInterval = 5000; // 5 seconds
 const statusUpdateInterval = 60 * 1000; // 1 minute (outside of this, minor updates in e.g. stats aren't logged)
 const checkForNewPrioritiesInterval = 10 * 60 * 1000; // 10 minutes. Interrupt whatever we're doing and check whether we could be doing something more useful.
-const waitForFactionInviteTime = 30 * 1000; // The game will only issue one new invite every 25 seconds, so if you earned two by travelling to one city, might have to wait a while
+const waitForFactionInviteTime = 30 * 1000; // The game re-checks every faction's invite requirements every 10 cycles (2 s, src/engine.tsx), so this is just a generous upper bound
 
 let shouldFocus; // Whether we should focus on work or let it be backgrounded (based on whether "Neuroreceptor Management Implant" is owned, or "--no-focus" is specified)
 // And a bunch of globals because managing state and encapsulation is hard.
