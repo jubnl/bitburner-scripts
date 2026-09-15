@@ -1,5 +1,5 @@
 import { log, getConfiguration, instanceCount, disableLogs, getActiveSourceFiles, getNsDataThroughFile, runCommand, formatMoney, formatDuration, getErrorInfo } from './helpers.js'
-import { canAffordTraining, karmaRatePerAttempt, shouldFillWithKarmaHomicide } from './lib/sleeve-logic.js'
+import { canAffordTraining, karmaRatePerAttempt, shouldFillWithKarmaHomicide, bladeburnerSleeveTasks } from './lib/sleeve-logic.js'
 
 const argsSchema = [
     ['min-shock-recovery', 97], // Minimum shock recovery before attempting to train or do crime (Set to 100 to disable, 0 to recover fully)
@@ -383,16 +383,9 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     }
     // If the player is in bladeburner, and has already unlocked gangs with Karma, generate contracts and operations
     if (playerInBladeburner) {
-        // Hack: Without paying much attention to what's happening in bladeburner, pre-assign a variety of tasks by sleeve index
-        const bbTasks = [
-            // Note: Sleeve 0 might still be used for faction work (unless --disable-follow-player is set), so don't assign them a 'unique' task
-            /*0*/options['enable-bladeburner-team-building'] ? ["Support main sleeve"] : ["Infiltrate Synthoids"],
-            // Note: Each contract type can only be performed by one sleeve at a time (similar to working for factions)
-            /*1*/["Take on contracts", "Retirement"], /*2*/["Take on contracts", "Bounty Hunter"], /*3*/["Take on contracts", "Tracking"],
-            // Other bladeburner work can be duplicated, but tackling a variety is probably useful. Overrides occur below
-            /*4*/["Infiltrate Synthoids"], /*5*/["Diplomacy"], /*6*/["Field Analysis"],
-            /*7*/options['enable-bladeburner-team-building'] ? ["Recruitment"] : ["Infiltrate Synthoids"]
-        ];
+        // Pre-assign tasks by sleeve index (lib/sleeve-logic.js bladeburnerSleeveTasks): contracts for sleeves 1-3, Infiltrate Synthoids for the
+        // rest, since every infiltrating sleeve adds contract/operation count for the player. Chaos and cooldown overrides occur below.
+        const bbTasks = bladeburnerSleeveTasks(options['enable-bladeburner-team-building']);
         let [action, contractName] = bbTasks[i];
         const contractChance = bladeburnerContractChances[i] ?? 1; // Per-sleeve estimate (keyed by sleeve index, see mainLoop)
         const contractCount = bladeburnerContractCounts[contractName] ?? Infinity;

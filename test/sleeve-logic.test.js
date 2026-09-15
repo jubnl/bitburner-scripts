@@ -1,7 +1,7 @@
 // Pure decision helpers of sleeve.js (lib/sleeve-logic.js) checked against the game constants they encode.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { trainingCostPerExp, canAffordTraining, karmaRatePerAttempt, shouldFillWithKarmaHomicide } from "../lib/sleeve-logic.js";
+import { trainingCostPerExp, canAffordTraining, karmaRatePerAttempt, shouldFillWithKarmaHomicide, bladeburnerSleeveTasks } from "../lib/sleeve-logic.js";
 
 // SL-2: Powerhouse Gym costs $120/s x costMult 20 = $2400/s for 1 exp/s x expMult 10 = 10 exp/s; sleeve exp is scaled by
 // (100 - shock)/100 (SleeveClassWork.ts calculateRates), the fee is not.
@@ -34,4 +34,22 @@ test("SL-1: a fresh sleeve (0.5 % homicide, 1 % sync) never qualifies; a trained
     assert.equal(shouldFillWithKarmaHomicide(0.5, 100, 0.1), true);  // trained and fully synced
     assert.equal(shouldFillWithKarmaHomicide(0.1, 100, 0.1), true);  // exactly at the gate
     assert.equal(shouldFillWithKarmaHomicide(0.005, 1, 0), true);    // gate disabled
+});
+
+// SL-3: each infiltrating sleeve adds sqrt(n)/2 count per minute to EVERY contract and operation (Bladeburner.ts sleeveSupport /
+// SleeveInfiltrateWork.ts), worth several rank/min; a stat-1 sleeve on Field Analysis or Diplomacy is worth ~0.2 rank/min or nothing.
+test("SL-3: by default only sleeves 1-3 take contracts, everyone else infiltrates", () => {
+    const tasks = bladeburnerSleeveTasks(false);
+    assert.equal(tasks.length, 8);
+    assert.deepEqual(tasks[1], ["Take on contracts", "Retirement"]);
+    assert.deepEqual(tasks[2], ["Take on contracts", "Bounty Hunter"]);
+    assert.deepEqual(tasks[3], ["Take on contracts", "Tracking"]);
+    for (const i of [0, 4, 5, 6, 7]) assert.deepEqual(tasks[i], ["Infiltrate Synthoids"], `sleeve ${i}`);
+});
+
+test("SL-3: team building only changes sleeves 0 and 7", () => {
+    const tasks = bladeburnerSleeveTasks(true);
+    assert.deepEqual(tasks[0], ["Support main sleeve"]);
+    assert.deepEqual(tasks[7], ["Recruitment"]);
+    for (const i of [4, 5, 6]) assert.deepEqual(tasks[i], ["Infiltrate Synthoids"], `sleeve ${i}`);
 });
