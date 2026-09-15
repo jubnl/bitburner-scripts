@@ -1,4 +1,5 @@
 import { log, disableLogs, getConfiguration, instanceCount, getNsDataThroughFile, runCommand, getFilePath, getActiveSourceFiles, formatNumberShort, formatDuration } from './helpers.js'
+import { chanceRangeVerdict } from './lib/bladeburner-logic.js'
 
 const cityNames = ["Sector-12", "Aevum", "Volhaven", "Chongqing", "New Tokyo", "Ishima"];
 const antiChaosOperation = "Stealth Retirement Operation"; // Note: Faster and more effective than Diplomacy at reducing city chaos
@@ -41,7 +42,7 @@ const argsSchema = [
     // Since v3.0.0 action difficulty is no longer randomized, and since v3.0.1 failing an action no longer costs faction rep (changelog.md),
     // so a 90% success chance is a reasonable default (failures still cost rank and HP).
     ['success-threshold', 0.9], // Attempt the best contract/operation whose minimum chance of success exceeds this threshold (its level is tuned to meet it)
-    ['blackop-success-threshold', 0.99], // Black ops are attempted only when their chance exceeds this (failure is very costly, and their estimate can be optimistic)
+    ['blackop-success-threshold', 0.99], // Black ops are attempted only when the LOW end of their estimated chance range exceeds this (failure costs 10-20k rank, HP and a team member)
     ['disable-action-leveling', false], // By default, contract/operation levels are set to the highest level whose estimated success chance meets --success-threshold
     ['chaos-recovery-threshold', 50], // Prefer to do "Stealth Retirement" operations to reduce chaos when it reaches this number
     ['max-chaos', 100], // If chaos exceeds this amount in every city, we will reluctantly resort to diplomacy to reduce it.
@@ -245,11 +246,12 @@ async function mainLoop(ns) {
     const contractChances = await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Contracts", contractNames);
     const operationChances = await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Operations", operationNames);
     // Black ops ignore population (src/Bladeburner/Actions/BlackOperation.ts getPopulationSuccessFactor() = 1), so their estimated and real
-    // chances are identical, but Action.ts getSuccessRange still multiplies one end of the returned range by pop/popEst. One end of the pair
-    // is therefore the true chance; we use the max (exact when the population is over-estimated, optimistic otherwise - hence the separate,
-    // stricter --blackop-success-threshold).
+    // chances are identical, but Action.ts getSuccessRange still returns [real * r, real] when the population is over-estimated (r = pop/popEst < 1)
+    // and [real, real * r] when it is under-estimated. Only the LOW end never exceeds the true chance, so the go/no-go uses it (minChance /
+    // chanceRangeVerdict), and a range that straddles --blackop-success-threshold is resolved first by improving the population estimate
+    // (populationUncertain below): both Field Analysis and Investigation/Undercover move popEst toward pop, and lo == hi only when popEst == pop.
     const blackOpsChance = nextBlackOp === null || rank < blackOpsRanks[nextBlackOp] ? [0, 0] : // Insufficient rank for blackops means chance is zero
-        (([lo, hi]) => [Math.max(lo, hi), Math.max(lo, hi)])((await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Black Operations", [nextBlackOp]))[nextBlackOp]);
+        (([lo, hi]) => [Math.min(lo, hi), Math.max(lo, hi)])((await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Black Operations", [nextBlackOp]))[nextBlackOp]);
     // Gather current/max levels of levelable actions so we can tune them to meet our success threshold (4 GB each, ram-dodged)
     let currentLevels = {}, maxLevels = {};
     if (!options['disable-action-leveling']) {
@@ -293,8 +295,8 @@ async function mainLoop(ns) {
     } else { // Otherwise, pick the "highest-tier" action we can confidently perform, which should lead to the fastest rep-gain.
         // Note: Candidate actions will be maintained in order of highest-rep to lowest-rep earning, so we can pick the first after filtering.
         let candidateActions = limitedActions;
-        // We should deal with population uncertainty if its causing some mission to be on the verge of our success threshold
-        let populationUncertain = candidateActions.some(a => maxChance(a) > options['success-threshold'] && minChance(a) < options['success-threshold']);
+        // We should deal with population uncertainty if it is causing some mission (including the next BlackOp, at its own threshold) to straddle its success threshold
+        let populationUncertain = candidateActions.some(a => chanceRangeVerdict(getChance(a), thresholdFor(a)) == "uncertain");
         // If current population uncertainty is such that some actions have a maxChance of ~100%, but not a minChance of ~100%,
         //   focus on actions that improve the population estimate, otherwise, reserve these actions for later
         // TODO: "Field Analysis" is the only population action that scales with player stats, so we should calculate and sort by
@@ -314,8 +316,8 @@ async function mainLoop(ns) {
             break;
         }
 
-        if (!bestActionName) // If there were none, allow us to fall-back to an action with a minimum chance >50%, and maximum chance > threshold
-            bestActionName = candidateActions.filter(a => minChance(a) > 0.5 && maxChance(a) > thresholdFor(a) && getCount(a) >= 1)[0];
+        if (!bestActionName) // If there were none, allow us to fall-back to an action with a minimum chance >50%, and maximum chance > threshold (never a BlackOp: its range is resolved first)
+            bestActionName = candidateActions.filter(a => a != nextBlackOp && minChance(a) > 0.5 && maxChance(a) > thresholdFor(a) && getCount(a) >= 1)[0];
         if (bestActionName) // If we found something to do, log details about its success chance range
             reason = actionSummaryString(bestActionName) + (bestActionLevel > 0 && bestActionLevel != currentLevels[bestActionName] ?
                 ` (setting level ${currentLevels[bestActionName]} -> ${bestActionLevel} to meet --success-threshold ${options['success-threshold']})` : '');
