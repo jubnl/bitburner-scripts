@@ -14,8 +14,10 @@ export async function main(ns) {
     let idx = 0;
     while (true) {
         const cmd = parseCmd(ns.read(FILES.cmd));
-        if (cmd.stop || cmd.promoteSymbols.length === 0) break;
-        const sym = cmd.promoteSymbols[idx % cmd.promoteSymbols.length];
+        if (cmd.stop) break;
+        const stillPresent = symbols.some(s => cmd.promoteSymbols.includes(s));
+        if (!stillPresent) break;
+        const sym = symbols[idx % symbols.length];
         await ns.dnet.promoteStock(sym);
         calls++;
         idx++;

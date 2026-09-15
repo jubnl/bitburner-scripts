@@ -13,7 +13,7 @@ export async function main(ns) {
     let calls = 0;
     while (true) {
         const cmd = parseCmd(ns.read(FILES.cmd));
-        if (cmd.migrateTarget !== target) break;
+        if (cmd.stop || cmd.migrateTarget !== target) break;
         const result = await ns.dnet.induceServerMigration(target);
         if (result.code !== 200) break;
         calls++;

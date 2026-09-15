@@ -18,11 +18,17 @@ export async function main(ns) {
     const known = parsePasswords(ns.read(FILES.passwords)); const clues = [];
     if (known[target]) clues.push(known[target]);
     for (const f of ns.ls(me, ".data.txt")) { const c = parseClueText(ns.read(f), [target]); if (c.passwords[target]) clues.push(c.passwords[target]); for (const p of (c.passwords.unknown || [])) clues.push(p); }
+    let attempts = 0;
     const attemptFn = async (password) => {
+        let incremented = false;
         for (let tries = 0; tries < 5; tries++) {
             const r = await ns.dnet.authenticate(target, password);
-            if (r.success) return { success: true, feedback: { code: 200, message: r.message, data: r.data } };
+            if (r.success) {
+                if (!incremented) attempts++;
+                return { success: true, feedback: { code: 200, message: r.message, data: r.data } };
+            }
             if (r.code === 408) continue;                       // timeout: independent of correctness, retry
+            if (!incremented) { attempts++; incremented = true; }
             if (r.code === 351 || r.code === 503) throw new Error("unreachable");
             const hb = await ns.dnet.heartbleed(target, { peek: true, logsToCapture: 1 });
             if (!hb.success) { if (hb.code === 451) throw new Error("charisma"); throw new Error("heartbleed:" + hb.code); }
@@ -34,7 +40,7 @@ export async function main(ns) {
     };
     let result;
     try { result = await solve(details, attemptFn, { clues, log: m => ns.print(m) }); }
-    catch (e) { return send({ host: target, modelId: details.modelId, difficulty: details.difficulty, success: false, attempts: 0, reason: String(e.message || e), chaReq: details.requiredCharismaSkill }); }
+    catch (e) { return send({ host: target, modelId: details.modelId, difficulty: details.difficulty, success: false, attempts, reason: String(e.message || e), chaReq: details.requiredCharismaSkill }); }
     if (result.password !== null) {
         known[target] = result.password; ns.write(FILES.passwords, JSON.stringify(known), "w");   // persist first
         send({ host: target, modelId: details.modelId, difficulty: details.difficulty, success: true, password: result.password, attempts: result.attempts, reason: result.reason });
