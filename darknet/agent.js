@@ -34,6 +34,7 @@ export async function main(ns) {
     let selfReportedAt = 0;                   // last time we force-reported ourselves regardless of change
     const notifiedFiles = new Set();
     let phishThreads = 0;                     // threads of the phish.js we last launched (0 = unknown / none)
+    let promoteThreads = 0;                   // threads of the promote.js we last launched (0 = unknown / none)
     const myDetails = ns.dnet.getServerDetails(me);
     dispatch("hello", { host: me, maxRam: ns.getServerMaxRam(me), freeRam: ns.getServerMaxRam(me) - ns.getServerUsedRam(me), depth: myDetails.depth, difficulty: myDetails.difficulty, exes: ns.ls(me, ".exe") });
     while (true) {
@@ -69,7 +70,7 @@ export async function main(ns) {
         }), detailsByHost, cmd.charisma);
         // NOTE: `reserve` is deliberately only subtracted from promote/phish/share below.
         // realloc and migrate outrank the crack reservation on purpose: that is the spending
-        // order the spec gives (section 6 -- realloc, migrate, promote, share, phish), realloc
+        // order the spec gives (section 6 -- realloc, migrate, promote, phish, share), realloc
         // is what *creates* the RAM a crack worker needs, and a migration charge is lost work
         // if it stalls. Promote/phish/share are pure filler and always yield to a pending crack.
         let reserve = pending.length ? (cmd.threads.crack || 6) * WORKER_RAM.crack : 0;
@@ -114,16 +115,27 @@ export async function main(ns) {
             const pid = ns.exec("darknet/agent.js", h, { threads: 1, preventDuplicates: true }, "--port", port);
             dispatch("worker", { kind: "agent", host: h, workerPid: pid });
         }
-        // 4. spend free RAM: realloc self, migrate, promote, share, phish
+        // 4. spend free RAM: realloc self, migrate, promote, phish, share
         if (ns.dnet.getBlockedRam(me) > 0) spawnRealloc(ns, me, "self", cmd, port);
         if (cmd.migrateTarget && !isLabHost(cmd.migrateTarget) && neighbours.includes(cmd.migrateTarget) && !ns.isRunning("darknet/migrate.js", me, hostArg(cmd.migrateTarget), "--port", port) && (cmd.threads.migrate || 0) > 0) {
             const migrateThreads = Math.min(cmd.threads.migrate, Math.floor(freeRam(ns, me) / WORKER_RAM.migrate));
             if (migrateThreads >= 1) ns.exec("darknet/migrate.js", me, { threads: migrateThreads, preventDuplicates: true }, hostArg(cmd.migrateTarget), "--port", port);
         }
-        if (cmd.promoteSymbols.length && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
-            const promoteThreads = Math.min(cmd.threads.promote, Math.floor((freeRam(ns, me) - reserve) / WORKER_RAM.promote));
-            if (promoteThreads >= 1) ns.exec("darknet/promote.js", me, { threads: promoteThreads, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port);
-        }
+        // promote.js runs until told to stop (like phish.js), so the agent sizes it with
+        // fillerPlan and asks it to exit via FILES.promoteResize whenever it is the wrong size --
+        // including down to 0 threads on a walk host, which buildCmd's threads.promote = 0 alone
+        // used to leave running at its original size forever (R9 fix round 1).
+        const promoteRunning = cmd.promoteSymbols.length > 0
+            && ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port);
+        if (!promoteRunning) promoteThreads = 0;
+        if (cmd.promoteSymbols.length && (cmd.threads.promote || 0) > 0) {
+            const sizing = fillerPlan({ free: freeRam(ns, me), reserve, unitRam: WORKER_RAM.promote, running: promoteRunning, launched: promoteThreads, cap: cmd.threads.promote });
+            if (sizing.resize) ns.write(FILES.promoteResize, "1", "w");
+            else if (!promoteRunning && sizing.launch > 0) {
+                ns.write(FILES.promoteResize, "0", "w");
+                if (ns.exec("darknet/promote.js", me, { threads: sizing.launch, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port)) promoteThreads = sizing.launch;
+            }
+        } else if (promoteRunning) ns.write(FILES.promoteResize, "1", "w");   // no longer budgeted here: let it exit
         // The labyrinth walker has to run on a host directly connected to the lab, and ns.exec
         // needs a direct connection to its target, so only this agent can start it -- the
         // controller just names the host in the command file.

@@ -131,3 +131,17 @@ test("agent.js launches phish up to its cap before sharing, and promote has no R
     assert.ok(agent.indexOf('ns.exec("darknet/phish.js"') < agent.indexOf('ns.exec("Remote/share.js"'), "phish is sized before share takes the rest");
     assert.doesNotMatch(src("darknet/phish.js"), /cmd\["share"\]/, "phish.js keeps running while the daemon shares");
 });
+
+// R9 fix round 1: with the 4-thread cap gone, promote.js could be launched with 30+ threads and had no way to
+// shrink -- it only ever read cmd.stop and cmd.promoteSymbols, never cmd.threads.promote, so a host that became
+// a walk host (threads.promote forced to 0 by buildCmd) stayed oversized for as long as the symbol was held.
+test("promote.js exits when the agent raises its resize flag, like phish.js", () => {
+    assert.match(src("darknet/promote.js"), /FILES\.promoteResize/);
+});
+
+test("agent.js sizes promote with fillerPlan and a cap, and clears the resize flag on launch, mirroring phish", () => {
+    const agent = src("darknet/agent.js");
+    assert.match(agent, /cap: cmd\.threads\.promote/);
+    assert.match(agent, /ns\.write\(FILES\.promoteResize, "1", "w"\)/);
+    assert.match(agent, /ns\.write\(FILES\.promoteResize, "0", "w"\)/);
+});

@@ -35,6 +35,11 @@ export const FILES = {
     // Written by the agent on its own server: "1" asks a running phish.js to exit so the agent
     // can re-size it next tick (see fillerPlan), "0" once a fresh one has been launched.
     phishResize: "darknet/phish-resize.txt",
+    // Same marker, for promote.js: promote.js otherwise never reads threads.promote and only
+    // exits on cmd.stop or its symbols leaving cmd.promoteSymbols, so nothing shrank an
+    // oversized promote (e.g. on a host that just became a walk host) before this existed (R9
+    // fix round 1).
+    promoteResize: "darknet/promote-resize.txt",
     shareActive: "/Temp/share-active.txt",
 };
 

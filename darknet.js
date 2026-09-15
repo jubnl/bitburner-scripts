@@ -110,13 +110,19 @@ export async function main(ns) {
             state.plan.promoteSymbols = plan.promoteSymbols;
             state.plan.charismaGoal = plan.charismaGoal;
             state.plan.shareActive = plan.shareActive;
-            state.plan.phishByHost = plan.phishByHost;
-            state.plan.promoteByHost = plan.promoteByHost;
 
             state.labs.current = plan.lab ? plan.lab.host : null;
             // Before buildCmd: planning a walker only writes `walk`/`walkThreads` into the
             // chosen hosts' command files, and the lab-adjacent agent starts it from there.
             if (mode === "labyrinth") launchWalkers(ns, state, plan, options);
+            // planFillers runs here, not inside planLabyrinth: plan.walkHosts only exists once
+            // launchWalkers has run, and planFillers must skip those hosts (R9 fix round 1) --
+            // otherwise a lab-adjacent host (deepest and biggest, exactly what planFillers
+            // prefers) soaks up phish/promote budget that buildCmd then zeroes and never
+            // reassigns. planLoot already called planFillers itself (loot mode never walks).
+            if (mode === "labyrinth") planFillers(state, plan);
+            state.plan.phishByHost = plan.phishByHost;
+            state.plan.promoteByHost = plan.promoteByHost;
 
             bootstrap(ns, state, plan, options);
             pushFiles(ns, state, plan);
@@ -482,9 +488,16 @@ function commandable(state) {
 
 /** Hand out the filler budgets: phish to the deepest hosts (the money factor is 0.1 + 0.05 x depth and the
  * cache chance is capped by a global 3-minute cooldown, so ~14 threads saturate it network-wide), then promote
- * to the biggest hosts, 24 threads per held symbol. Whatever is left over shares when the daemon shares. */
+ * to the biggest hosts, 24 threads per held symbol. Whatever is left over shares when the daemon shares.
+ *
+ * `plan.walkHosts` is excluded from every host list: buildCmd zeroes threads.phish/threads.promote on a walk
+ * host and never reassigns them, so budgeting one there just throws that share of the network-wide total away
+ * (R9 fix round 1). In labyrinth mode this only sees the right hosts because the controller calls planFillers
+ * again in `main`, after `launchWalkers` has populated `plan.walkHosts` -- planLabyrinth itself no longer calls
+ * it (walkHosts is always still empty at that point). */
 export function planFillers(state, plan) {
-    const hosts = commandable(state).map(name => [name, state.servers[name]]);
+    const walking = new Set(plan.walkHosts ?? []);
+    const hosts = commandable(state).filter(name => !walking.has(name)).map(name => [name, state.servers[name]]);
     const room = {};
     for (const [name, entry] of hosts) {
         room[name] = Math.max(0, Math.floor(((Number(entry.maxRam) || 0) - (Number(entry.blockedRam) || 0) - WORKER_RAM.agent) / WORKER_RAM.phish));
@@ -720,7 +733,8 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     plan.lab = lab;
     if (!lab) {
         plan.charismaGoal = planCharismaGoal(state, charisma, null);
-        planFillers(state, plan);
+        // planFillers is NOT called here: main calls it after launchWalkers, once plan.walkHosts
+        // is known (R9 fix round 1) -- see the call site in main and planFillers' own docblock.
         return plan;
     }
 
@@ -768,7 +782,8 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     // ignores priority and RAM is not yet scarce enough for the controller to withhold claims. YAGNI.
 
     plan.charismaGoal = planCharismaGoal(state, charisma, lab);
-    planFillers(state, plan);
+    // planFillers is NOT called here either, for the same reason as the early return above:
+    // plan.walkHosts is not known yet (see main's call site, after launchWalkers).
     return plan;
 }
 

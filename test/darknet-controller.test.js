@@ -169,9 +169,14 @@ test("phish threads survive while the daemon shares; a walk host still gets none
     assert.equal(plan.shareActive, true);
     assert.equal(buildCmd(state, plan, "deep").threads.phish, 14, "sharing no longer zeroes the cache stream");
     assert.equal(buildCmd(state, plan, "deep")["share"], true, "the remainder still shares");
+    // R9 fix round 1: simulate deep becoming a walk host, the way launchWalkers would in
+    // labyrinth mode, and main's corrected ordering re-running planFillers afterward -- the
+    // budget planFillers would otherwise have stranded on deep (zeroed by buildCmd and never
+    // reassigned) now flows to the non-walk host instead of being lost.
     plan.walkHosts = ["deep"]; plan.walkLab = LAB; plan.walkThreadsByHost = { deep: 4 };
-    assert.equal(buildCmd(state, plan, "deep").threads.phish, 0);
-    assert.equal(buildCmd(state, plan, "other").threads.phish, 0, "the budget went to deep; other only shares");
+    planFillers(state, plan);
+    assert.equal(buildCmd(state, plan, "deep").threads.phish, 0, "a walk host never gets phish budget");
+    assert.equal(buildCmd(state, plan, "other").threads.phish, 14, "the budget now flows to the non-walk host instead of being stranded");
 });
 
 // ------------------------------------------------------------------ planPromotions

@@ -22,6 +22,7 @@ export async function main(ns) {
         if (cmd.stop) break;
         const stillPresent = symbols.some(s => cmd.promoteSymbols.includes(s));
         if (!stillPresent) break;
+        if (ns.read(FILES.promoteResize) === "1") break;   // the agent wants to re-size us (R9 fix round 1)
         const sym = symbols[idx % symbols.length];
         await ns.dnet.promoteStock(sym);
         calls++;
