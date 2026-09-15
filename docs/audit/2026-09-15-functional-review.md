@@ -11,7 +11,7 @@ bladeburner; darknet crawler; stocks/hacknet/stanek/go). The coordinator re-read
 finding (labyrinth identification and stasis immutability in the darknet, the Silhouette job path, sleeve sync and
 shock rates, the BlackOp success range) and corrected one reviewer error (Silhouette CFO numbers, see section 2).
 
-Totals: 11 high, 20 medium, 26 low (57 findings). None fixed yet.
+Totals: 12 high, 20 medium, 26 low (58 findings). None fixed yet. (R15 added after a live report.)
 
 ## Executive summary
 
@@ -72,7 +72,7 @@ Cross-cutting patterns:
 | Hacking core (daemon, host-manager, Remote, Tasks) | HC-1, HC-2 | HC-3..HC-6 | HC-7..HC-11 | 1 |
 | Progression (autopilot, faction-manager, work-for-factions, crime) | Silhouette | install-for-augs, city factions, stat-grind crime | invite grinding, NF sourcing, temp scripts, rep sampling | 2 |
 | Gangs / sleeves / bladeburner | SL-1, SL-2, BB-1 | GG-1, GG-2, SL-3, BB-2 | GG-3, GG-4, BB-3, BB-4, SL-4 | 3 |
-| Darknet crawler | R1..R5 | R6..R11 | R12..R14 | 4 |
+| Darknet crawler | R1..R5, R15 | R6..R11 | R12..R14 | 4 |
 | Stocks / hacknet / stanek / go | - | SM-1, ST-1, GO-1 | SM-2..4, HN-1..4, ST-2, GO-2, GO-3 | 5 |
 
 Suggested fix order if these are taken on: HC-1, SL-2, SL-1, R1+R2+R3, BB-1, HC-2, R4+R5, ST-1, GG-1, Silhouette,
@@ -769,6 +769,7 @@ Read-only review; nothing was modified.
 | low | R12 | `--crack-threads`/`--lab-threads` and the 64 GB promote floor are tuned without regard to the game's RAM tiers and thread curve | confirmed |
 | low | R13 | `pushFiles` re-scp's identical `passwords.txt`/`cmd.txt` to every host every loop | confirmed |
 | low | R14 | `2G_cellular` could use the timing side channel instead of heartbleed (2.5× faster) | confirmed |
+| high | R15 | A darknet server deleted before a game reload makes `connectToSession` throw `Invalid host`; `pushFiles` throws before `saveState`, so the controller loop fails at the same host every 10 s forever (reported live by the user: `byte%oasis`) | confirmed |
 
 ---
 
@@ -923,6 +924,22 @@ Conclusion on the spending order `realloc, migrate, promote, share, phish` (`age
 
 ### R13 (low, confirmed): `pushFiles` re-pushes unchanged files every loop
 - Script: `darknet.js:830-864` — per commandable host per 10 s: `connectToSession` (useful: it is the liveness probe) then `write` + `scp` of two files even when neither changed. No RAM cost, but it is O(hosts) scp per loop and log noise. Cache the last pushed `cmd` JSON per host and skip the `scp` when both `passwords.txt` and the host's `cmd` are unchanged.
+
+### R15 (high, confirmed): a host deleted before a game reload throws `Invalid host` and stalls the controller loop permanently
+- Reported live: `ERROR: darknet controller loop failed: RUNTIME ERROR darknet.js@home (PID - 216) dnet.connectToSession: Invalid host: 'byte%oasis' Stack: darknet.js:L849@pushFiles darknet.js:L120@main`.
+- Script: `darknet.js:849` (`pushFiles`: `ns.dnet.connectToSession(host, secret)` for every `state.servers` entry with `online: true`, no try/catch; the comment assumes a gone server answers 503), `:1091` (same call in `--status`), `:120-124` (the loop's catch logs and retries; `saveState` at `:122` is never reached once `pushFiles` throws).
+- Game source: `src/Netscript/NetscriptHelpers.tsx:504-515`
+  ```ts
+  const server = GetServer(host);
+  if (server != null && (server.serversOnNetwork.length > 0 || server instanceof DarknetServer)) return [server, host];
+  if (DarknetState.offlineServers.has(host)) { log(ctx, () => `Server ${host} is offline.`); return [null, host]; }
+  throw errorMessage(ctx, `Invalid host: ${str}`);
+  ```
+  `src/DarkNet/controllers/NetworkMovement.ts:165-190` `deleteDarknetServer` adds the hostname to `DarknetState.offlineServers` then `DeleteServer(hostname)` — so right after a deletion the name resolves to "offline" (503). But `src/DarkNet/effects/SaveLoad.ts:4-14` persists only `storedCycles` and `hasUsedHeartbleed`; `offlineServers` is plain in-memory state (`src/DarkNet/models/DarknetState.ts:77`), so after any save reload every previously deleted hostname is in neither table and resolves to the throw.
+- What the script assumes: a server that stopped existing returns `code: 503` (the comment at `:851-853`).
+- What the game does: that is only true within one game session. After a reload the name is unknown, and every `dnet` call with it throws.
+- Effect: `darknet/state.txt` survives reloads and still lists the host with `online: true` and a password, so `pushFiles` throws on it every loop; nothing after it runs (no file pushes, no walker launches, no `saveState`), and no code path ever marks the host offline. The controller is dead from the first loop after the reload until the state file is edited by hand. Any deletion followed by a reload triggers it (deletions are 10 % of network mutations, roughly one every 10 min at net depth 12).
+- Suggested change: treat an `Invalid host` throw from `connectToSession` like a 503 plus a stale password (`entry.online = false; entry.lastSeen = Date.now(); state.passwords[host].stale = true`), in both call sites, via a small wrapper that catches only that message and rethrows anything else; add a Node test with a fake `ns` whose `connectToSession` throws for one host and check the other hosts still get their files. Workaround until then: `run darknet.js --kill`, then `nano darknet/state.txt` and remove the `byte%oasis` entries from `servers` and `passwords` (or delete `darknet/state.txt` and its backup copies to start from a clean state, which re-cracks everything).
 
 ### R14 (low, confirmed): `2G_cellular` has a free side channel
 - Script: `darknet/solvers.js:462-482` reads the mismatch index from heartbleed `message`.
