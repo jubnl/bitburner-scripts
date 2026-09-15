@@ -496,9 +496,13 @@ export function planPromotions(ns, options) {
 /** The cheapest charisma level that unlocks a currently blocked action. */
 function planCharismaGoal(state, charisma, lab) {
     let goal = 0;
+    // effects.ts calculateAuthenticationTime applies the underleveled factor at charisma <= required, so the
+    // level that actually removes the penalty (and clears heartbleed's `<` gate) is required + 1 (R11).
     const consider = (value) => {
         const required = Number(value) || 0;
-        if (required > charisma && (goal === 0 || required < goal)) goal = required;
+        if (required <= 0) return;
+        const wanted = required + 1;
+        if (wanted > charisma && (goal === 0 || wanted < goal)) goal = wanted;
     };
     for (const [name, entry] of Object.entries(state.servers)) {
         if (!entry.online || isLabHost(name)) continue;
@@ -739,7 +743,7 @@ export function chooseMode(ns, state, options, charisma = 0) {
     // This reset's labyrinth is already solved: the reward augmentation is queued and the next
     // lab only appears once it is installed, so there is nothing left to walk toward.
     if (state.labs.rewardQueuedAt) return "loot";
-    if (charisma < lab.cha) return "loot";
+    if (charisma <= lab.cha) return "loot";   // equality pays the 2.5x underleveled factor on every lab call (R11)
     const frontier = frontierDepth(state);
     if (frontier >= lab.depth - LAB_DEPTH_SLACK) return "labyrinth";
     // Blocked by an air gap: rows 8/16/24/32 hold no servers and connections only join adjacent rows
@@ -946,20 +950,20 @@ export function launchWalkers(ns, state, plan, options) {
     if (state.labs.rewardQueuedAt) return [];
     if (state.labs.completed.includes(lab.host)) return [];
 
-    // The lab's own charisma gate. Below it every authenticate comes back as the gate message,
-    // so a walker would burn network delays forever without taking a single step.
-    if (charisma < lab.cha) {
-        announceOnce(ns, `cha:${lab.host}`, `INFO: darknet is holding labyrinth walkers back: ${lab.host} needs ${lab.cha} charisma (have ${Math.floor(charisma)}).`);
+    // The lab's own charisma gate. Below it every authenticate comes back as the gate message, so a
+    // walker would burn network delays forever without taking a single step; AT it every call pays the
+    // >= 2.5x underleveled factor (effects.ts, charisma <= required), so wait for one more level (R11).
+    if (charisma <= lab.cha) {
+        announceOnce(ns, `cha:${lab.host}`, `INFO: darknet is holding labyrinth walkers back: ${lab.host} needs more than ${lab.cha} charisma (have ${Math.floor(charisma)}).`);
         return [];
     }
     forgetAnnouncement(`cha:${lab.host}`);
     // A walker already hit the gate and reported the requirement. Believe it over LABS until
-    // charisma has actually risen to meet what it reported. The game's own test is
-    // `charisma < cha`, so equality is enough to pass and must clear the block.
+    // charisma has actually risen past what it reported (past, not to: see the gate above).
     const blocked = state.labs.charismaBlocked;
     if (blocked && blocked.lab === lab.host) {
         const required = Number(blocked.chaReq) || lab.cha;
-        if (charisma < required) {
+        if (charisma <= required) {
             const when = new Date(Number(blocked.at) || Date.now()).toLocaleTimeString();
             announceOnce(ns, `blocked:${lab.host}`, `INFO: a walker reported at ${when} that ${lab.host} needs ${required} charisma (have ${Math.floor(charisma)}); not launching more.`);
             return [];

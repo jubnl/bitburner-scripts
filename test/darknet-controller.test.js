@@ -335,7 +335,7 @@ test("a host holding a link the plan dropped is commanded to release it", () => 
 test("launchWalkers picks the lab-adjacent commandable host and sizes its walker", () => {
     const options = { ...baseOptions, "lab-walkers": 2, "lab-threads": 6 };
     const ns = makeNs({
-        charisma: LAB_CHA,
+        charisma: LAB_CHA + 1,
         stasisLimit: 1,
         details: { [LAB]: { isOnline: true, depth: 7 } },
         maxRam: { near: 20, tiny: 8, far: 256 },
@@ -348,7 +348,7 @@ test("launchWalkers picks the lab-adjacent commandable host and sizes its walker
     });
 
     assert.equal(currentLab(ns, state).host, LAB);
-    const plan = planLabyrinth(ns, state, options, LAB_CHA);
+    const plan = planLabyrinth(ns, state, options, LAB_CHA + 1);
     const hosts = launchWalkers(ns, state, plan, options);
 
     assert.deepEqual(hosts, ["near"], "tiny is too small, far is not adjacent, locked has no password");
@@ -369,11 +369,35 @@ test("launchWalkers holds back below the lab's charisma gate and after a win", (
     const lowState = makeState(hosts);
     assert.deepEqual(launchWalkers(low, lowState, planLabyrinth(low, lowState, options, 10), options), []);
 
-    const ns = makeNs({ ...config, charisma: LAB_CHA });
+    const ns = makeNs({ ...config, charisma: LAB_CHA + 1 });
     const state = makeState(hosts);
     state.labs.rewardQueuedAt = Date.now();
-    assert.deepEqual(launchWalkers(ns, state, planLabyrinth(ns, state, options, LAB_CHA), options), [],
+    assert.deepEqual(launchWalkers(ns, state, planLabyrinth(ns, state, options, LAB_CHA + 1), options), [],
         "one win per reset: the reward has to be installed before the next lab exists");
+});
+
+// R11: effects.ts applies the underleveled factor (>= 2.5x on every lab call) at charisma <= chaRequired, and
+// NetworkGenerator.ts:257 gives the lab its own gate as requiredCharismaSkill. At charisma == lab.cha the maze
+// is enterable but every step pays 2.5x, and the study goal stopped one point short of removing that.
+test("the charisma goal is one above the requirement and walkers wait for it", () => {
+    const options = { ...baseOptions, "lab-walkers": 1 };
+    const ns = makeNs({ charisma: LAB_CHA, details: { [LAB]: { isOnline: true, depth: 7 } }, maxRam: { near: 64 } });
+    const state = makeState({
+        near: { depth: 6, maxRam: 64, neighbours: [LAB] },
+        locked: { depth: 5, maxRam: 32, chaReq: 120, cracked: false },
+    });
+    assert.equal(chooseMode(ns, state, { ...baseOptions, mode: "balanced" }, LAB_CHA), "loot", "equality still pays the penalty");
+    const plan = planLabyrinth(ns, state, options, LAB_CHA);
+    assert.equal(plan.charismaGoal, LAB_CHA + 1);
+    assert.deepEqual(launchWalkers(ns, state, plan, options), [], "held back at exactly the gate");
+
+    const above = makeNs({ charisma: LAB_CHA + 1, details: { [LAB]: { isOnline: true, depth: 7 } }, maxRam: { near: 64 } });
+    const plan2 = planLabyrinth(above, state, options, LAB_CHA + 1);
+    assert.deepEqual(launchWalkers(above, state, plan2, options), ["near"]);
+    assert.equal(chooseMode(above, state, { ...baseOptions, mode: "balanced" }, LAB_CHA + 1), "labyrinth");
+
+    assert.equal(planLoot(ns, state, baseOptions, 120).charismaGoal, 121, "an uncracked host at chaReq 120 needs 121, the lab is further away");
+    assert.equal(planLoot(ns, state, baseOptions, 121).charismaGoal, LAB_CHA + 1, "121 clears that host; the next blocked action is the lab");
 });
 
 // ------------------------------------------------------------------ stasis candidates
@@ -422,14 +446,14 @@ test("planLabyrinth picks air-gap migration targets by difficulty, strongest fir
 });
 
 test("chooseMode counts a charging migration by the same difficulty rule", () => {
-    const ns = makeNs({ charisma: 600, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings], details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
+    const ns = makeNs({ charisma: 601, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings], details: { cru3l_l4byr1nth: { isOnline: true, depth: 12, cha: 600 } } });
     const state = makeState({ deep: { depth: 5, difficulty: 5, neighbours: [] } });
     const options = { ...baseOptions, mode: "balanced" };
-    assert.equal(chooseMode(ns, state, options, 600), "loot");
+    assert.equal(chooseMode(ns, state, options, 601), "loot");
     state.servers.deep.migrationCharge = 0.5; state.servers.deep.migrationChargeAt = Date.now();
-    assert.equal(chooseMode(ns, state, options, 600), "labyrinth");
+    assert.equal(chooseMode(ns, state, options, 601), "labyrinth");
     state.servers.deep.difficulty = 3;
-    assert.equal(chooseMode(ns, state, options, 600), "loot", "a charge that cannot cross the gap does not count");
+    assert.equal(chooseMode(ns, state, options, 601), "loot", "a charge that cannot cross the gap does not count");
 });
 
 // ------------------------------------------------------------------ R1: which labyrinth is current
@@ -549,7 +573,7 @@ test("pushFiles treats an `Invalid host` throw from connectToSession as a delete
 test("chooseMode flips to labyrinth when the frontier sits just above an air gap below the lab", () => {
     const ns = makeNs({
         charisma: 2000, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings, LAB_AUGMENTATIONS.TheBoots],
-        details: { m3rc1l3ss_l4byr1nth: { isOnline: true, depth: -1 } },
+        details: { m3rc1l3ss_l4byr1nth: { isOnline: true, depth: -1, cha: 1500 } },
     });
     const options = { ...baseOptions, mode: "balanced" };
     const blocked = makeState({ edge: { depth: 7, difficulty: 6 }, mid: { depth: 4, difficulty: 2 } });
@@ -562,14 +586,14 @@ test("chooseMode flips to labyrinth when the frontier sits just above an air gap
 
     // Gap rule only: slack cannot satisfy this, only the gap check can.
     const ns2 = makeNs({
-        charisma: 2500, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings, LAB_AUGMENTATIONS.TheBoots, LAB_AUGMENTATIONS.TheHammer],
-        details: { ub3r_l4byr1nth: { isOnline: true, depth: -1 } },
+        charisma: 2501, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings, LAB_AUGMENTATIONS.TheBoots, LAB_AUGMENTATIONS.TheHammer],
+        details: { ub3r_l4byr1nth: { isOnline: true, depth: -1, cha: 2500 } },
     });
     assert.equal(currentLab(ns2, makeState({})).host, "ub3r_l4byr1nth");
     const gapBlocked = makeState({ deep: { depth: 15, difficulty: 12 } });
-    assert.equal(chooseMode(ns2, gapBlocked, options, 2500), "labyrinth", "frontier 15 = row 16 - 1, lab at 23, slack 17 > 15");
+    assert.equal(chooseMode(ns2, gapBlocked, options, 2501), "labyrinth", "frontier 15 = row 16 - 1, lab at 23, slack 17 > 15");
     const gapNotBlocked = makeState({ deep: { depth: 14, difficulty: 12 } });
-    assert.equal(chooseMode(ns2, gapNotBlocked, options, 2500), "loot", "frontier 14 is not row-1 of any gap");
+    assert.equal(chooseMode(ns2, gapNotBlocked, options, 2501), "loot", "frontier 14 is not row-1 of any gap");
 });
 
 // ------------------------------------------------------------------ R3: never migrate a pinned host
