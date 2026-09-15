@@ -12,7 +12,7 @@ Already fixed before this audit (not listed again): darknet hostnames starting w
 (commit `4c4d85e`); phish.js starving cache/stasis workers and stasis planning picking hosts that cannot hold a
 link (commit `ea64c1a`).
 
-Totals: 5 high, 15 medium, 31 low (51 findings). None fixed yet.
+Totals: 5 high, 15 medium, 31 low (51 findings). Fixed 2026-09-15: all 5 high and all 15 medium (see the `Status` line under each entry); the 31 low findings are still open.
 
 Origin column: `branch` = introduced (or made worse) by this branch's patches; `upstream` = present in alainbryden's
 original scripts.
@@ -118,6 +118,7 @@ Findings: 1 high, 4 medium, 4 low.
 - Severity: **high** (silently loses completed crack work and starves every other report type)
 - Suggested fix: key on a canonical order — `[...neighbours].sort()` — inside the `myKey` computation (leave the
   dispatched `neighbours` payload as-is, or sort it too; nothing downstream depends on probe order).
+- Status: fixed — commit `bdeae49` (new `selfReportKey` in darknet/lib.js sorts the neighbour list; Node test added).
 
 ---
 
@@ -152,6 +153,7 @@ Findings: 1 high, 4 medium, 4 low.
 - Severity: **medium** (permanent no-progress loop on an entire model class whenever a clue file exists)
 - Suggested fix: accept the log when `details.modelId === "Pr0verFl0"` and `fb.passwordAttempted` is a prefix of
   the attempt (or simply skip the identity check for that model and rely on `fb.code`/`fb.passwordExpected`).
+- Status: fixed — commit `3011bb0` (new `logMatchesAttempt` in darknet/lib.js reproduces the BufferOverflow receivedBuffer rewrite; Node test added).
 
 ---
 
@@ -182,6 +184,7 @@ Findings: 1 high, 4 medium, 4 low.
 - Severity: **medium** (a whole model class is permanently uncrackable, and the retries burn auth delays)
 - Suggested fix: raise `BUDGETS.DeepGreen` to at least `cs.length + L*(L-1)/2 + 2` (≈ 120 for the alphanumeric case),
   or compute the budget from `details.passwordFormat`/`passwordLength` instead of a flat constant.
+- Status: fixed — commit `bb21fd9` (`BUDGETS.DeepGreen` / `RateMyPix.Auth` are now functions of the password (`charset + L*(L-1)/2`, floors 30 / 120) via `budgetFor(details)`; Node tests force the alphanumeric branch. Also fixed in the same lines: `charset()` returned digits for `passwordFormat === "alphabetic"` (see "Found while fixing")).
 
 ---
 
@@ -216,6 +219,7 @@ Findings: 1 high, 4 medium, 4 low.
 - Suggested fix: select air-gap migration candidates by `entry.difficulty` (need `difficulty + 4 > row`, i.e.
   `difficulty >= row - 3`) rather than by `entry.depth`; `difficulty` is already stored in `state.servers`
   from `getServerDetails`.
+- Status: fixed — commit `70c78b5` (`canCrossAirGap(entry, row)` = `difficulty + 4 > row`, used by `planLabyrinth` (candidates sorted by difficulty) and `chooseMode`; Node tests added).
 
 ---
 
@@ -257,6 +261,7 @@ Findings: 1 high, 4 medium, 4 low.
 - Suggested fix: have `deliverAgent` write a neutral command file to the lab (stasis false, walk null, all threads 0,
   cache work only) instead of copying the walk host's `cmd.txt`; and/or stop filtering lab hosts out of `linked`
   in `assignStasis` so a stray lab link is at least counted and released.
+- Status: fixed — commit `2e40e1f` (`deliverAgent` no longer ships `cmd.txt` (lab agent runs on `parseCmd` defaults), and `assignStasis` counts lab-held links against the limit; Node tests added).
 
 ---
 
@@ -521,6 +526,7 @@ missing_scripts.forEach(s => targetServer._files[s] = true); // Make note that t
 - Severity: **medium**
 - Suggested fix: use `targetServer._files.add(s.startsWith('/') ? s.substring(1) : s)` (matching the
   leading-slash normalisation `hasFile` applies) instead of property assignment.
+- Status: fixed — commit `12ec72a` (`targetServer._files?.add(...)` with the leading slash stripped, matching `hasFile`).
 
 ---
 
@@ -553,6 +559,7 @@ return getCloudServerCost(ram) - getCloudServerCost(server.maxRam);
 - Suggested fix: on the upgrade path, re-derive the affordable exponent against
   `ns.cloud.getServerUpgradeCost(worstServerName, 2^n)` (or equivalently `cost(2^n) − cost(worstServerRam)`),
   and skip/return early when the best affordable size is `<= worstServerRam`.
+- Status: fixed — commit `c80cfb7` (the upgrade path re-derives the largest size whose `cost(2^n) - cost(worstRam)` fits the budget and returns early when even the next size is unaffordable).
 
 ---
 
@@ -582,6 +589,7 @@ DefenseLevelMultiplier: 0.5,
 - Suggested fix: set `DarknetMoneyMultiplier` to `[1,1,0.4,0.4,0.7,1,1,0,0.05,0.4,1,1,0.1,1,1]` and
   `DefenseLevelMultiplier` BN14 to `0.5`. (Everything else in the table, including the whole new BN15 column
   and the `DaedalusAugsRequirement` BN12 value of 31 — `floor(30 + 1.02^lvl)` — was verified correct.)
+- Status: fixed — commit `c51cd4d` (table corrected; new `test/helpers-bitnode-mults.test.js` compares every table key for BN1-15 (except BN12) against BitNode.tsx).
 
 ---
 
@@ -605,6 +613,7 @@ shouldRun: () => 4 in dictSourceFiles && reqRam(256 / (2 ** dictSourceFiles[4]) 
   and cancel the university course the daemon is about to sleep 10 s waiting on — the study XP is lost.
 - Severity: **medium**
 - Suggested fix: `reqRam(256 / (2 ** dictSourceFiles[4])) && !studying`.
+- Status: fixed — commit `e7a1ff2` (parenthesis fixed).
 
 ---
 
@@ -964,7 +973,7 @@ Findings: 2 high, 2 medium, 3 low.
   casino run never happens, and augmentations are never installed — the BN stalls completely.
 - Severity: **high** (kills the hacking daemon in a loop, no casino money, no automatic ascension)
 - Suggested fix: drop the `_ = ` (just `await getNsDataThroughFile(...)`), or declare a local variable.
-- Status: fixed — commit `f881e4d` (removed the `_ = ` prefix; the value was never used).
+- Status: fixed — commit `7ec94ed` (removed the `_ = ` prefix; the value was never used).
 
 ### SG-F2: `crime.js` crashes on its first loop — `work-for-factions.js` module globals are `undefined` when imported
 - Script: `/home/jubnl/dev/bitburner/bitburner-scripts/crime.js:2,15` imports and calls
@@ -995,6 +1004,7 @@ Findings: 2 high, 2 medium, 3 low.
 - Severity: **high** (the script's default mode is completely non-functional)
 - Suggested fix: guard the imported-use case in `isValidInterruption` (e.g. `if (!dictSourceFiles || !options) return false;`)
   and at `work-for-factions.js:675` (`options?.['no-tail-windows']`).
+- Status: fixed — commit `4e676da` (`isValidInterruption` skips the bladeburner check and the tail-window lines use `options?.` when the module globals are unset (imported use)).
 
 ### SG-F3: `work-for-factions.js` IT-track hacking requirements are 100 too low for tiers 2 and 3
 - Script: `/home/jubnl/dev/bitburner/bitburner-scripts/work-for-factions.js:49-55`
@@ -1025,6 +1035,7 @@ Findings: 2 high, 2 medium, 3 low.
   Charisma at ZB (`:1231-1259`) for a promotion that is actually blocked by hacking level — wasted hours of study.
 - Severity: medium (degraded automation: wrong job tier, wasted study time, error-log spam)
 - Suggested fix: change the IT row to `reqHck: [225, 250, 375, 475] // [1, 26, 151, 251] + 224` (charisma/rep rows are correct).
+- Status: fixed — commit `0e9713b` (`reqHck: [225, 250, 375, 475]`).
 
 ### SG-F4: `autopilot.js` operator-precedence bug makes the "low SF4 level" fallback unreachable — start-up loops forever
 - Script: `/home/jubnl/dev/bitburner/bitburner-scripts/autopilot.js:167-181`
@@ -1052,6 +1063,7 @@ Findings: 2 high, 2 medium, 3 low.
   nothing at all (no daemon management, no installs) until home RAM grows, which nothing is driving.
 - Severity: medium (stuck loop for low-SF4 players — exactly the audience the fallback targets)
 - Suggested fix: `if ((unlockedSFs[4] || 0) == 3) throw err;`
+- Status: fixed — commit `d80ecd6` (`(unlockedSFs[4] || 0) == 3`).
 
 ### SG-F5: `casino.js` can never read a dealer "10" card
 - Script: `/home/jubnl/dev/bitburner/bitburner-scripts/casino.js:596-601`
@@ -1241,6 +1253,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: normal foreground play, gang below 100% territory. `onTerritoryTick` sets `territoryNextTick = now + 800 ms`. Two loop iterations later (`gangs.js:221`) the script sets **every** member to `"Territory Warfare"`. The tick-detection fallback at `gangs.js:226` (`thisLoopStart > territoryNextTick + 5000`) then fires ~5.8 s later, re-runs `onTerritoryTick`, logs `WARNING: Power stats weren't updated, assuming we've lost track of territory tick` (toasted, `gangs.js:247-248`), and restarts the same 5.8 s cycle. Net effect: members do crime for ~0.4 s out of every ~5.8 s and Territory Warfare the rest — money/respect/wanted-reduction income collapses, and low-defense members are repeatedly exposed to clash deaths. Secondary effect: `computeWantedGains` divides the vigilante decay term by 25 instead of 10, so the script under-estimates wanted recovery by 2.5x and the self-check at `gangs.js:383` emits spurious `WARNING: Calculated new rates would be ...` messages whenever anyone is on Vigilante Justice / Ethical Hacking.
 - Severity: **high**
 - Suggested fix: compare against a real bonus-time threshold, e.g. `ns.gang.getBonusTime() > 5000` (matching `BonusTime.tsx`), or at minimum `> GangConstants.maxCyclesToProcess * 200`. Use the same test in `getGangCyclesPerUpdate()`.
+- Status: fixed — commit `149dadf` (bonus time now means `getBonusTime() >= 25 cycles * 200 ms` (5 s), in both `onTerritoryTick` and `getGangCyclesPerUpdate`).
 
 ---
 
@@ -1321,6 +1334,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: `factionWorkCandidates` is rebuilt every 5 minutes and sorted by current rep (`sleeve.js:144-148`), so its order changes as rep accrues. Suppose sleeve 4 works for faction A and sleeve 5 for faction B; after a refresh the order flips, so sleeve 4 is designated B while sleeve 5 still *is* working for B → throw → recorded as unsupported work type. Sleeve 5 is then designated A while sleeve 4 is still on A → throw as well. Three consecutive loops of this (~3 s, and each attempt burns 5 `getNsDataThroughFile` retries because the temp script writes an `ERROR: ` result) and **both** factions are blacklisted permanently, so no sleeve ever works for them again this run.
 - Severity: **medium**
 - Suggested fix: only blacklist when the thrown message does not mention another sleeve/faction membership — or, simpler, keep the current sleeve's designated faction stable across loops (remember `factionBySleeve[i]`) so reordering the candidate list cannot create cross-assignments.
+- Status: fixed — commit `b8f8ab1` (`factionBySleeve` keeps each sleeve on its faction and excludes other sleeves' factions; an "is already working for them" failure is no longer treated as an unsupported work type).
 
 ---
 
@@ -1340,6 +1354,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: player is already in a gang (so `wantKarmaCrime` is false, `sleeve.js:287`) and `--sync-first` is not set, so no sleeve ever synchronises. darknet.js writes a charisma goal; an idle sleeve is sent to ZB Institute and studies Leadership essentially forever, paying tuition each tick, while the player's charisma creeps up at 1% of the rate the script's exit condition assumes.
 - Severity: **medium**
 - Suggested fix: require `sleeve.sync` to be meaningful (e.g. `>= 50`) before taking the darknet-charisma job, or synchronise the chosen sleeve first — otherwise the player-facing goal can't be reached by that sleeve.
+- Status: fixed — commit `0900ce3` (the study task requires `sleeve.sync >= 50`. Syncing first is not viable: `SleeveSynchroWork` gains 0.0002 sync per 200 ms cycle (~1 day from 1 to 100)).
 
 ---
 
@@ -1469,6 +1484,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: BN entered with "Disable 4S Data". Once the corpus exceeds ~`totalCost / (buy-4s-budget − fracH)` (≈ \$43b at defaults in BN1), every iteration liquidates all long and short positions (2 commissions + full bid/ask spread per stock, up to 33 stocks), fails the purchase, and the next iteration re-buys everything. At `sleepInterval = 1000 ms` that is a full round-trip every 1-2 s, bleeding ~\$6.6m of commission plus ~1% of corpus in spread per cycle, forever.
 - Severity: **high**
 - Suggested fix: after a purchase attempt fails while `playerStats.money >= totalCost`, latch a `can4S = false` flag so `tryGet4SApi` returns immediately thereafter; and never call `liquidate(ns)` again once an attempt has already failed with sufficient funds.
+- Status: fixed — commit `ba42df7` (`tryGet4SApi` returns early when `resetInfo.bitNodeOptions.disable4SData` is set, and latches off after a refused purchase with sufficient money).
 
 ### FT-F11: spend-hacknet-hashes.js treats permanently-impossible `spendHashes` failures as transient and retries forever, buying hacknet capacity with real money to chase them
 
@@ -1491,6 +1507,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: `bladeburner.js:502` tells users to `run spend-hacknet-hashes.js --spend-on Exchange_for_Bladeburner_Rank --spend-on Exchange_for_Bladeburner_SP --liquidate`. If the player has not joined Bladeburner, every purchase fails forever; hashes pile up to capacity, `remaining < hashesEarnedNextTick` becomes permanently true, and the capacity-upgrade branch (`:193-222`) spends the player's **money** on `purchaseNode()` / `upgradeCache()` every tick until max capacity (20 servers × cache 15), with nothing shown on the terminal.
 - Severity: **medium**
 - Suggested fix: count consecutive failures per spend action; after N failures with sufficient hashes, drop that action from `toBuy` and emit a terminal/toast error carrying the game's reason. Validate `--spend-on-server` is not player-owned before starting.
+- Status: fixed — commit `0f864bc` (failures that leave the hashes in hand count as hard failures; 3 in a row disable that action with a terminal error, and the script exits when every requested action is refused).
 
 ### FT-F12: `if (ns.hacknet.purchaseNode())` mis-reads the return value — a failed purchase is logged as SUCCESS
 
@@ -1522,6 +1539,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: an enemy chain adjacent only below the candidate point is never recognised as an attack target. `getAggroAttack` / `getDefAttack` run in every play style (e.g. `go.js:236`), so roughly a quarter of capture/pressure opportunities are silently skipped for the whole session and play falls through to weaker generators.
 - Severity: **medium**
 - Suggested fix: `validLibMoves[x][y + 1] <= libsMax` on both lines.
+- Status: fixed — commit `1f7fc15` (both lines now compare `validLibMoves[x][y + 1]`).
 
 ### FT-F14: go.js opponent rotation can never advance — `rep` only accrues for factions you have already joined, and `????????????` is not a faction
 
@@ -1541,6 +1559,7 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - Concrete failure scenario: default preference is `["Daedalus", "????????????", ...]`. A player not yet in Daedalus plays Daedalus forever — rep stays 0, `uncapped` always contains it, and the other five opponents (and their distinct stat bonuses) are never played. Even after Daedalus caps, `????????????` can never accrue rep, so the script is pinned there permanently; the `uncapped.length > 0 ? ... : shuffle` fallback at `:402` is unreachable whenever `????????????` is in the list. The status log ("favor rep 0/400,000") is also misleading.
 - Severity: **medium**
 - Suggested fix: treat an opponent as "capped" when it is not a joinable faction or the player is not a member (check `ns.getPlayer().factions`), or rotate on `winStreak`/`nodePower` instead of `rep`.
+- Status: fixed — commit `5a9a914` (`startNewGame` only treats joined factions (`ns.getPlayer().factions`) as uncapped; it and `checkNewGame` are now async).
 
 ### FT-F15: go.js chooses its play style once and never re-reads the opponent when a new game starts
 
@@ -1705,3 +1724,19 @@ Scripts: `/home/jubnl/dev/bitburner/bitburner-scripts` (branch `game-optimisatio
 - `getCacheUpgradeCost` / `hashCost` / `numHashes` / `hashCapacity` return `Infinity`/`0` (not throw) without hacknet servers; both scripts detect this via `hashCapacity() == 0`.
 - `spendHashes(name, undefined, count)` correctly falls through to `_upgTarget = ""`; `count` is validated non-negative (`Hacknet.ts:205-208`).
 - RAM: only the hacknet functions actually called (0.5 GB each, deduplicated), `getServerMoneyAvailable`, and `getPlayer` (0.5 GB). The new `ns.formulas.hacknet*` calls on this branch cost 0 GB, so the patch adds no RAM.
+
+## Found while fixing (2026-09-15, confirmed against game source)
+
+### DN-F10: `charset()` in `darknet/solvers.js` treated `passwordFormat === "alphabetic"` as numeric, so a letters-only DeepGreen / RateMyPix / NIL / 2G_cellular / PHP 5.4 password could never be solved
+- Script: `darknet/solvers.js` `charset(d)` (was `d.passwordFormat === "alphanumeric" ? NUMERIC + ALPHA : NUMERIC`), and the test
+  mock `test/darknet-mock.js` `makeServer` (was `/^[0-9]+$/.test(password) ? "numeric" : "alphanumeric"`), which is why the
+  Node tests never saw the case.
+- Game source: `src/NetscriptFunctions/Darknet.ts:405` `passwordFormat: getPasswordType(targetServer.password)` and
+  `src/DarkNet/controllers/ServerGenerator.ts:581-595` `getPasswordType`, which returns `"alphabetic"` when every character is a
+  letter. `getPassword(length, allowLetters = true)` draws uniformly from `numbers + letters` (62 symbols), so an alphanumeric roll
+  of length L contains no digit with probability `(52/62)^L` — 59 % at L = 3 (DeepGreen difficulty 17-19), 17 % at L = 10.
+- Effect: for such a server every solver that walks `charset(d)` probes only `0-9`, exhausts its budget and reports `budget`, and
+  the agent retries the host forever.
+- Status: fixed — commit `bb21fd9` (`charset()` returns letters only for `"alphabetic"`; the mock now uses the game's
+  `getPasswordType`, and the DN-F3 tests assert both `alphanumeric` and `alphabetic` passwords are solved).
+
