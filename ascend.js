@@ -2,6 +2,7 @@ import {
     log, getConfiguration, getFilePath, runCommand, waitForProcessToComplete, getNsDataThroughFile,
     getActiveSourceFiles, getStockSymbols
 } from './helpers.js'
+import { filterCityFactionInvites } from './progression-rules.js'
 
 const argsSchema = [
     ['install-augmentations', false], // By default, augs will only be purchased. Set this flag to install (a.k.a reset)
@@ -149,8 +150,10 @@ export async function main(ns) {
     pid = await runCommand(ns, `while(ns.singularity.upgradeHomeCores()); { await ns.sleep(10); }`, '/Temp/upgrade-home-ram.js');
     await waitForProcessToComplete(ns, pid, true); // Wait for the script to shut down, indicating it has bought all it can.
 
-    // STEP 9: Join every faction we've been invited to (gives a little INT XP)
-    let invites = await getNsDataThroughFile(ns, 'ns.singularity.checkFactionInvitations()');
+    // STEP 9: Join every faction we've been invited to (gives a little INT XP) - except city factions, which ban each other.
+    // (Bans are cleared by the install anyway, but keep the same rule as work-for-factions.js / faction-manager.js in case the install is aborted.)
+    const joinedFactions = (await getNsDataThroughFile(ns, 'ns.getPlayer()')).factions;
+    let invites = filterCityFactionInvites(await getNsDataThroughFile(ns, 'ns.singularity.checkFactionInvitations()'), joinedFactions);
     if (invites.length > 0) {
         pid = await runCommand(ns, 'ns.args.forEach(f => ns.singularity.joinFaction(f))', '/Temp/join-factions.js', invites);
         await waitForProcessToComplete(ns, pid, true);

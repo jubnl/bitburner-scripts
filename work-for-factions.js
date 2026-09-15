@@ -2,7 +2,7 @@ import {
     instanceCount, getConfiguration, getNsDataThroughFile, getFilePath, getActiveSourceFiles, tryGetBitNodeMultipliers,
     formatDuration, formatMoney, formatNumberShort, disableLogs, log, getErrorInfo, tail
 } from './helpers.js'
-import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements } from './progression-rules.js'
+import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites } from './progression-rules.js'
 
 let options;
 const argsSchema = [
@@ -98,6 +98,7 @@ let hasFocusPenalty, hasSimulacrum, favorToDonate, fulcrumHackReq, notifiedAbout
 let dictSourceFiles, dictFactionFavors, playerGang, mainLoopStart, scope, numJoinedFactions, lastTravel, crimeCount;
 let firstFactions, skipFactions, completedFactions, softCompletedFactions, mostExpensiveAugByFaction, mostExpensiveDesiredAugByFaction;
 let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)(); // Trick to get strong typing in mono
+let lastCityInviteNotice = ""; // De-duplicates the "not auto-joining city faction" log line
 
 export function autocomplete(data, args) {
     data.flags(argsSchema);
@@ -234,6 +235,29 @@ async function loadStartupData(ns) {
     fulcrumHackReq = await getServerRequiredHackLevel(ns, "fulcrumassets");
 }
 
+/** The consolidated list of factions to work for, in order: --first factions, then the preferred early (or crime) faction order,
+ *  minus factions that are skipped, soft-completed, or (Fulcrum) unreachable at our hack level. Depends only on the current globals.
+ * @param {NS} ns @param {Player} player @param {boolean} verbose Log the Fulcrum / BN10 adjustments (once per main loop)
+ * @returns {string[]} */
+function getFactionWorkOrder(ns, player, verbose = false) {
+    // Remove Fulcrum from our "EarlyFactionOrder" if hack level is insufficient to backdoor their server
+    let priorityFactions = options['crime-focus'] ? preferredCrimeFactionOrder.slice() : preferredEarlyFactionOrder.slice();
+    if (player.skills.hacking < fulcrumHackReq - 10) { // Assume that if we're within 10, we'll get there by the time we've earned the invite
+        const fulcrumIdx = priorityFactions.findIndex(c => c == "Fulcrum Secret Technologies")
+        if (fulcrumIdx !== -1) {
+            priorityFactions.splice(fulcrumIdx, 1);
+            if (verbose) ns.print(`Fulcrum faction server requires ${fulcrumHackReq} hack, so removing from our initial priority list for now.`);
+        }
+    } // TODO: Otherwise, if we get Fulcrum, we have no need for a couple other company factions
+    // If we're in BN 10, we can purchase special Sleeve-related things from the Covenant, so we should always try join it
+    if (currentBitnode == 10 && !priorityFactions.includes("The Covenant")) {
+        priorityFactions.push("The Covenant");
+        if (verbose) ns.print(`We're in BN10, which means we should add The Covenant to our priority faction list, so you can purchase sleeves and sleeve memory.`);
+    }
+    return firstFactions.concat(priorityFactions.filter(f => // Remove factions from our initial "work order" if we've bought all desired augmentations.
+        !firstFactions.includes(f) && !skipFactions.includes(f) && !softCompletedFactions.includes(f)));
+}
+
 let lastMainLoopMessage = "";
 
 /** @param {NS} ns */
@@ -256,9 +280,19 @@ async function mainLoop(ns) {
     // Immediately accept any outstanding faction invitations for factions we want to earn rep with soon
     // TODO: If check if we would qualify for an invite to any factions just by travelling, and do so to start earning passive rep
     const invites = await checkFactionInvites(ns);
-    const invitesToAccept = options['get-invited-to-every-faction'] || options['prioritize-invites'] ?
+    let invitesToAccept = options['get-invited-to-every-faction'] || options['prioritize-invites'] ?
         invites.filter(f => !skipFactions.includes(f)) :
         invites.filter(f => !skipFactions.includes(f) && !softCompletedFactions.includes(f));
+    // City factions ban each other for the whole reset (Volhaven bans the other five), so never join one just because its invite arrived first.
+    // Only --first factions and the next entry of our work order are joined here; any other city is joined deliberately by earnFactionInvite.
+    const nextWorkOrderFaction = getFactionWorkOrder(ns, player).find(f => !player.factions.includes(f));
+    const allowedCities = firstFactions.concat(nextWorkOrderFaction ? [nextWorkOrderFaction] : []);
+    const filteredInvites = filterCityFactionInvites(invitesToAccept, player.factions, allowedCities);
+    const heldBackCities = invitesToAccept.filter(f => !filteredInvites.includes(f));
+    const cityInviteNotice = heldBackCities.length == 0 ? "" : `INFO: Not auto-joining city faction invite(s) ${heldBackCities.join(", ")} ` +
+        `(joining one bans the others for this reset). They will be joined when they come up in the work order.`;
+    if (cityInviteNotice != lastCityInviteNotice) ns.print((lastCityInviteNotice = cityInviteNotice) || "INFO: No more city faction invites held back.");
+    invitesToAccept = filteredInvites;
     for (const invite of invitesToAccept)
         await tryJoinFaction(ns, invite);
     // Get some information about gangs (if unlocked)
@@ -286,24 +320,8 @@ async function mainLoop(ns) {
         wasGrafting = false;
     }
 
-    // Remove Fulcrum from our "EarlyFactionOrder" if hack level is insufficient to backdoor their server
-    let priorityFactions = options['crime-focus'] ? preferredCrimeFactionOrder.slice() : preferredEarlyFactionOrder.slice();
-    if (player.skills.hacking < fulcrumHackReq - 10) { // Assume that if we're within 10, we'll get there by the time we've earned the invite
-        const fulcrumIdx = priorityFactions.findIndex(c => c == "Fulcrum Secret Technologies")
-        if (fulcrumIdx !== -1) {
-            priorityFactions.splice(fulcrumIdx, 1);
-            ns.print(`Fulcrum faction server requires ${fulcrumHackReq} hack, so removing from our initial priority list for now.`);
-        }
-    } // TODO: Otherwise, if we get Fulcrum, we have no need for a couple other company factions
-    // If we're in BN 10, we can purchase special Sleeve-related things from the Covenant, so we should always try join it
-    if (currentBitnode == 10 && !priorityFactions.includes("The Covenant")) {
-        priorityFactions.push("The Covenant");
-        ns.print(`We're in BN10, which means we should add The Covenant to our priority faction list, so you can purchase sleeves and sleeve memory.`);
-    }
-
     // Strategy 1: Tackle a consolidated list of desired faction order, interleaving simple factions and megacorporations
-    const factionWorkOrder = firstFactions.concat(priorityFactions.filter(f => // Remove factions from our initial "work order" if we've bought all desired augmentations.
-        !firstFactions.includes(f) && !skipFactions.includes(f) && !softCompletedFactions.includes(f)));
+    const factionWorkOrder = getFactionWorkOrder(ns, player, true);
     for (const faction of factionWorkOrder) {
         if (breakToMainLoop()) break; // Only continue on to the next faction if it isn't time for a high-level update.
         let earnedNewFactionInvite = false;

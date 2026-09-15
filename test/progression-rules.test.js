@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
     jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT,
-    pickSilhouetteCompany, jobTierRequirements,
+    pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites,
 } from "../progression-rules.js";
 
 const SRC = "/home/jubnl/dev/bitburner/bitburner-src/src/";
@@ -78,4 +78,18 @@ test("pickSilhouetteCompany minimises remaining CFO rep / (100 + favor)", () => 
     assert.equal(pickSilhouetteCompany(["ECorp", "Four Sigma"], rep, favor, backdoored), "ECorp");
     // Missing rep/favor entries count as 0
     assert.equal(pickSilhouetteCompany(["NWO", "ECorp"], {}, {}, {}), "NWO");
+});
+
+test("filterCityFactionInvites: city invites are held back unless allowed or a city is already joined", () => {
+    assert.deepEqual([...cityFactions].sort(), ["Aevum", "Chongqing", "Ishima", "New Tokyo", "Sector-12", "Volhaven"]);
+    const invites = ["Volhaven", "CyberSec", "Aevum", "Tian Di Hui"];
+    // No city joined, nothing allowed: only non-city invites survive
+    assert.deepEqual(filterCityFactionInvites(invites, ["CyberSec"]), ["CyberSec", "Tian Di Hui"]);
+    // --first / next work-order entry allows exactly that city
+    assert.deepEqual(filterCityFactionInvites(invites, [], ["Aevum"]), ["CyberSec", "Aevum", "Tian Di Hui"]);
+    // A city faction already joined: the game has already banned the incompatible ones, so everything may be joined
+    assert.deepEqual(filterCityFactionInvites(invites, ["Sector-12"]), invites);
+    // Input is not mutated
+    assert.deepEqual(invites, ["Volhaven", "CyberSec", "Aevum", "Tian Di Hui"]);
+    assert.deepEqual(filterCityFactionInvites([], []), []);
 });

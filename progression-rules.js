@@ -53,3 +53,15 @@ export function jobTierRequirements(trackName, tier, statModifier = 0, backdoore
     const withOffset = v => v === 0 ? 0 : v + statModifier; // A 0 requirement stays 0 (the game has no requirement at all)
     return { rep: job.reqRep[tier] * (backdoored ? BACKDOOR_REP_MULT : 1), hacking: withOffset(job.reqHck[tier]), cha: withOffset(job.reqCha[tier]) };
 }
+
+/** The six city factions are mutually exclusive: joining one bans its `enemies` for the whole reset
+ *  (src/Faction/FactionInfo.tsx; src/Faction/FactionHelpers.tsx joinFaction; bans clear only in Faction.prestigeAugmentation). */
+export const cityFactions = ["Sector-12", "Aevum", "Chongqing", "New Tokyo", "Ishima", "Volhaven"];
+
+/** Decide which pending invites may be auto-accepted. A city faction is only accepted when (a) some city faction is already joined
+ *  (the game has already banned the incompatible ones), or (b) it is explicitly allowed (--first, or the next faction in our work order).
+ * @param {string[]} invites @param {string[]} joinedFactions @param {string[]} allowedFactions @returns {string[]} */
+export function filterCityFactionInvites(invites, joinedFactions, allowedFactions = []) {
+    if (joinedFactions.some(f => cityFactions.includes(f))) return invites.slice();
+    return invites.filter(f => !cityFactions.includes(f) || allowedFactions.includes(f));
+}
