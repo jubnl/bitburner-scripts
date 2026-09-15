@@ -1316,7 +1316,7 @@ export async function main(ns) {
     let dictServerMinSecurityLevels = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
     let dictServerMaxMoney = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
     let dictServerMaxRam = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
-    let dictServerProfitInfo = (/**@returns{{[serverName: string]: {gainRate: number, expRate: number}}}*/() => undefined)();
+    let dictServerProfitInfo = (/**@returns{{[serverName: string]: {gainRate: number, expRate: number, growExpRate: number}}}*/() => undefined)();
     let dictServerGrowths = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
     let dictServerCores = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 
@@ -1423,6 +1423,8 @@ export async function main(ns) {
         cpuCores() { return dictServerCores?.[this.name] ?? this.server?.cpuCores ?? 1; }
         getMoneyPerRamSecond() { return dictServerProfitInfo ? dictServerProfitInfo[this.name]?.gainRate ?? 0 : (dictServerMaxMoney[this.name] ?? 0); }
         getExpPerSecond() { return dictServerProfitInfo ? dictServerProfitInfo[this.name]?.expRate ?? 0 : (1 / dictServerMinSecurityLevels[this.name] ?? 0); }
+        /** HC-7: exp per RAM-second of the basic weaken/grow farm (unweighted by hack chance). Falls back to getExpPerSecond for old analyze-hack output. */
+        getGrowExpPerSecond() { return dictServerProfitInfo?.[this.name]?.growExpRate ?? this.getExpPerSecond(); }
         getMoney() { return this.ns.getServerMoneyAvailable(this.name); }
         getSecurity() { return this.ns.getServerSecurityLevel(this.name); }
         canCrack() { return ownedCracks.length >= this.portsRequired; }
@@ -2146,10 +2148,12 @@ export async function main(ns) {
         return prepSucceeding;
     }
 
-    /** @returns {Server[]} All hackable servers, in order of best Hack Exp to worst */
+    /** @returns {Server[]} All hackable servers, in order of best Hack Exp to worst. HC-7: --xp-only farms with hack() (chance-weighted expRate);
+     * otherwise the farm only runs weaken/grow, which always succeed, so rank by the unweighted growExpRate. */
     function getXPFarmTargetsByExp() {
+        const rate = /** @param {Server} s */ s => xpOnly ? s.getExpPerSecond() : s.getGrowExpPerSecond();
         return getAllServers().filter(server => (server.hasRoot() || server.canCrack()) && server.canHack() && server.shouldHack())
-            .sort((a, b) => b.getExpPerSecond() - a.getExpPerSecond());
+            .sort((a, b) => rate(b) - rate(a));
     }
 
     /** @returns {Server} The best server to target for Hack Exp */

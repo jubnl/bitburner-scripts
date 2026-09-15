@@ -14,6 +14,20 @@ export function autocomplete(data, args) {
     return [];
 }
 
+/** Hack-exp rates per RAM-second, relative units (HC-7).
+ * expRate: per hack thread, weighted by success chance (a failed hack grants 1/4 exp, src/Netscript/NetscriptHelpers.tsx hack()) and including the weaken
+ *   needed to undo the hack's hardening - the right ranking for hack-based (--xp-only / advanced) XP farming.
+ * growExpRate: per grow thread. grow() and weaken() grant calculateHackingExpGain * threads unconditionally (src/NetscriptFunctions.ts grow/weaken),
+ *   grow takes 0.8x weaken time, and a grow at max money adds no security (src/Server/ServerHelpers.ts processSingleServerGrowth only fortifies when
+ *   money changed), so the basic weaken/grow farm needs no chance weighting and no recovery weaken. */
+export function xpRatesPerRamSecond(hackExp, hackChance, hackCost, growRam, growTime) {
+    const expectedExpPerHackThread = hackExp * (hackChance + (1 - hackChance) / 4);
+    return {
+        expRate: expectedExpPerHackThread * (1 + 0.002 / 0.05) / hackCost * 1000,
+        growExpRate: hackExp / (growRam * growTime) * 1000,
+    };
+}
+
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
@@ -117,6 +131,8 @@ export async function main(ns) {
 
         // Compute the cost (ram*seconds) for each tool, including the weaken threads needed to undo its security hardening
         // (hack +0.002 / grow +0.004 per thread, weaken -0.05 per thread: src/Server/data/Constants.ts ServerFortifyAmount / ServerWeakenAmount)
+        // HC-8: this assumes a thread holds RAM for its own duration, which daemon.js now does (batch tasks are exec'd about 1 s before they start,
+        // HC-1); do not scale these toward weaken time.
         const weakenCost = weaken_ram * weakenTime;
         const growCost = grow_ram * growTime + weakenCost * 0.004 / 0.05;
         const hackCost = hack_ram * hackTime + weakenCost * 0.002 / 0.05;
@@ -132,16 +148,16 @@ export async function main(ns) {
         const hackProfit = server.moneyMax * hack_percent * hackChance;
         // Compute the relative monetary gain
         const theoreticalGainRate = hackProfit / (growCost * grows_per_cycle + hackCost * hacks_per_cycle) * 1000 /* Convert per-millisecond rate to per-second */;
-        // A failed hack still grants 1/4 of the exp of a successful one (src/Netscript/NetscriptHelpers.tsx hack(): expGainedOnFailure = expGainedOnSuccess / 4)
-        const expectedExpPerHackThread = hackExp * (hackChance + (1 - hackChance) / 4);
-        const expRate = expectedExpPerHackThread * (1 + 0.002 / 0.05) / (hackCost) * 1000;
+        // A failed hack still grants 1/4 of the exp of a successful one (src/Netscript/NetscriptHelpers.tsx hack(): expGainedOnFailure = expGainedOnSuccess / 4);
+        // the basic weaken/grow farm gets the unweighted growExpRate (HC-7)
+        const { expRate, growExpRate } = xpRatesPerRamSecond(hackExp, hackChance, hackCost, grow_ram, growTime);
         // The practical cap on revenue is based on your hacking scripts. For my hacking scripts this is about 20% per second, adjust as needed
         // No idea why we divide by ram_total - Basically ensures that as our available RAM gets larger, the sort order merely becomes "by server max money"
         const cappedGainRate = Math.min(theoreticalGainRate, hackProfit / ram_total);
         ns.print(`${useFormulas ? '' : '(Without formulas.exe, closed-form estimate) '}At hack level ${hackLevel} and steal ${(hack_percent * 100).toPrecision(3)}%: ` +
             `Theoretical ${formatMoney(theoreticalGainRate)}, Limit: ${formatMoney(hackProfit / ram_total)}, Exp: ${expRate.toPrecision(3)}, ` +
             `Hack Chance: ${(hackChance * 100).toPrecision(3)}% (${server.hostname})`);
-        return [theoreticalGainRate, cappedGainRate, expRate];
+        return [theoreticalGainRate, cappedGainRate, expRate, growExpRate];
     }
 
     ns.print(`All? ${options['all']} Player hack: ${player.skills.hacking} Ram total: ${ram_total}`);
@@ -154,7 +170,7 @@ export async function main(ns) {
     // First address the servers within our hacking level
     const unlocked_servers = servers.filter(s => s.requiredHackingSkill <= player.skills.hacking)
         .map(function (server) {
-            [server.theoreticalGainRate, server.gainRate, server.expRate] = getRatesAtHackLevel(server, player, player.skills.hacking);
+            [server.theoreticalGainRate, server.gainRate, server.expRate, server.growExpRate] = getRatesAtHackLevel(server, player, player.skills.hacking);
             return server;
         });
     // The best server's gain rate will be used to pro-rate the relative gain of servers that haven't been unlocked yet (if they were unlocked at this level)
@@ -165,13 +181,15 @@ export async function main(ns) {
         .map(function (server) {
             // We will need to fake the hacking skill to get the numbers for when this server will first be unlocked, but to keep the comparison
             // fair, we will need to scale down the gain by the amount current best server gains now, verses what it would gain at that hack level.
-            const [bestUnlockedScaledGainRate, _, bestUnlockedScaledExpRate] = getRatesAtHackLevel(best_unlocked_server, player, server.requiredHackingSkill);
+            const [bestUnlockedScaledGainRate, _, bestUnlockedScaledExpRate, bestUnlockedScaledGrowExpRate] = getRatesAtHackLevel(best_unlocked_server, player, server.requiredHackingSkill);
             const gainRateScaleFactor = bestUnlockedScaledGainRate ? best_unlocked_server.theoreticalGainRate / bestUnlockedScaledGainRate : 1;
             const expRateScaleFactor = bestUnlockedScaledExpRate ? best_unlocked_server.expRate / bestUnlockedScaledExpRate : 1;
-            const [theoreticalGainRate, cappedGainRate, expRate] = getRatesAtHackLevel(server, player, server.requiredHackingSkill);
+            const growExpRateScaleFactor = bestUnlockedScaledGrowExpRate ? best_unlocked_server.growExpRate / bestUnlockedScaledGrowExpRate : 1;
+            const [theoreticalGainRate, cappedGainRate, expRate, growExpRate] = getRatesAtHackLevel(server, player, server.requiredHackingSkill);
             // Apply the scaling factors, as well as the same cap as above
             server.theoreticalGainRate = theoreticalGainRate * gainRateScaleFactor;
             server.expRate = expRate * expRateScaleFactor;
+            server.growExpRate = growExpRate * growExpRateScaleFactor;
             server.gainRate = Math.min(server.theoreticalGainRate, cappedGainRate);
             ns.print(`${server.hostname}: Scaled theoretical gain by ${gainRateScaleFactor.toPrecision(3)} to ${formatMoney(server.theoreticalGainRate)} ` +
                 `(capped at ${formatMoney(cappedGainRate)}) and exp by ${expRateScaleFactor.toPrecision(3)} to ${server.expRate.toPrecision(3)}`);
@@ -206,7 +224,8 @@ export async function main(ns) {
     ns.write('/Temp/analyze-hack.txt', JSON.stringify(server_eval.map(s => ({
         hostname: s.hostname,
         gainRate: s.gainRate,
-        expRate: s.expRate
+        expRate: s.expRate,
+        growExpRate: s.growExpRate // HC-7: unweighted weaken/grow exp rate for daemon.js's basic XP farm
     }))), "w");
     // Below is stats for hacknet servers - uncomment at cost of 4 GB Ram
     /*
