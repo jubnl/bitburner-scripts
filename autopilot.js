@@ -111,6 +111,7 @@ export async function main(ns) {
     let playerInstalledAugCount = (/**@returns{null|number}*/() => null)(); // Number of augs installed, or null if we don't have SF4 and can't tell.
     let installedAugmentations = [];
     let acceptedStanek = false, stanekLaunched = false;
+    let stanekChargedHomeRam = 0; // ST-1: home RAM when stanek.js was last launched; a --top-up charge is due once home RAM has doubled since
     let daemonStartTime = 0; // The time we personally launched daemon.
     let installCountdown = 0; // Start of a countdown before we install augmentations.
     let installCountdownResets = 0; // Number of times we've reset the countdown because our affordable augs has increased
@@ -681,10 +682,15 @@ export async function main(ns) {
         }
 
         // Once stanek's gift is accepted, launch it once per reset before we launch daemon (Note: stanek's gift is auto-purchased by faction-manager.js on your first install)
+        // ST-1: the Stanek bonus scales with ln(highest single charge + 1) (src/CotMG/formulas/effect.ts), so once home RAM has doubled since the
+        // last charge, launch stanek.js again in --top-up mode (one peak-raising charge per fragment). While it runs, daemon is kept off home (below).
         let stanekRunning = (13 in unlockedSFs) && findScript('stanek.js') !== undefined;
-        if ((13 in unlockedSFs) && !stanekLaunched && !stanekRunning && installedAugmentations.includes(augStanek)) {
-            stanekLaunched = true; // Once we've know we've launched stanek once, we never have to again this reset.
+        const stanekTopUpDue = stanekLaunched && homeRam >= 2 * stanekChargedHomeRam;
+        if ((13 in unlockedSFs) && (!stanekLaunched || stanekTopUpDue) && !stanekRunning && installedAugmentations.includes(augStanek)) {
             const stanekArgs = ["--on-completion-script", getFilePath('daemon.js')]
+            if (stanekLaunched) stanekArgs.push("--top-up"); // Not the first charge this reset: only raise each fragment's peak
+            stanekLaunched = true; // Once we've know we've launched stanek once, we never have to again this reset (except for top-ups).
+            stanekChargedHomeRam = homeRam;
             if (options['no-tail-windows']) stanekArgs.push('--no-tail'); // Relay the option to suppress tail windows
             if (daemonArgs.length >= 0) stanekArgs.push("--on-completion-script-args", JSON.stringify(daemonArgs)); // Pass in all the args we wanted to run daemon.js with
             launchScriptHelper(ns, 'stanek.js', stanekArgs);
@@ -698,7 +704,9 @@ export async function main(ns) {
         // Hack: Ignore numeric arguments in the comparison, since we e.g. tweak --recovery-thread-padding over time
         let launchDaemon = !existingDaemon || daemonArgs.some(arg => !existingDaemon.args.includes(arg) && !Number.isFinite(arg)) ||
             // Special cases: We also must relaunch daemon if it is running with certain flags we wish to remove
-            (["--xp-only"].some(arg => !daemonArgs.includes(arg) && existingDaemon.args.includes(arg)))
+            (["--xp-only"].some(arg => !daemonArgs.includes(arg) && existingDaemon.args.includes(arg))) ||
+            // ST-1: a running daemon that already had a (finite) --reserved-ram (SF4 < 3 case above) must still be relaunched to vacate home for stanek.js
+            (stanekRunning && !existingDaemon.args.includes(1E100))
         if (launchDaemon) {
             if (existingDaemon) {
                 daemonRelaunchMessage ??= `Relaunching daemon.js with new arguments since the current instance doesn't include all the args we want.`;

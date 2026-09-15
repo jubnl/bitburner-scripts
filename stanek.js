@@ -21,6 +21,12 @@ const argsSchema = [
     ['on-completion-script-args', []], // Optional args to pass to the script when launched
     ['no-tail', false], // By default, keeps a tail window open, because it's pretty important to know when this script is running (can't use home for anything else)
     ['reputation-threshold', 0.2], // By default, if we are this close to the rep needed for an unowned stanek upgrade (e.g. "Stanek's Gift - Serenity"), we will keep charging despite the 'max-charges' setting
+    // ST-1: the Stanek bonus scales with ln(highest single charge + 1) (src/CotMG/formulas/effect.ts), so home RAM bought after the initial
+    // charging is wasted on Stanek unless every fragment gets one more charge with the larger RAM. autopilot.js re-launches this script with
+    // --top-up once home RAM has doubled since the last charge.
+    ['top-up', false], // Give each stat fragment one charge that beats its current peak (highestCharge) and exit, instead of charging to --max-charges
+    ['top-up-min-gain', 1.5], // In --top-up mode only charge a fragment when the free threads are at least this multiple of its current peak (a smaller charge adds threads/peak of a charge, worth ~nothing)
+    ['top-up-timeout', 600], // In --top-up mode give up (and still run --on-completion-script) after this many seconds if home RAM never frees up enough
 ];
 
 export function autocomplete(data, args) {
@@ -29,6 +35,7 @@ export function autocomplete(data, args) {
 }
 
 let options, currentServer, maxCharges, idealReservedRam, chargeAttempts, sf4Level, shouldContinueForAug;
+let topUp, topUpDeadline, toppedUp; // ST-1 --top-up state: mode flag, Date.now() deadline, Set of fragment ids charged above their previous peak this run
 
 /** Maximizes charge on stanek fragments based on current home RAM.
  * NOTE: You should have no other scripts running on home while you do this to get the best peak charge possible
@@ -53,6 +60,9 @@ export async function main(ns) {
 
     currentServer = await getNsDataThroughFile(ns, `ns.getHostname()`);
     maxCharges = options['max-charges']; // Don't bother adding charges beyond this amount
+    topUp = options['top-up'];
+    topUpDeadline = Date.now() + options['top-up-timeout'] * 1000;
+    toppedUp = new Set();
     idealReservedRam = 32; // Reserve this much RAM, if it wouldnt make a big difference anyway. Leaves room for other temp-scripts to spawn.
     let startupScript = options['on-startup-script'];
     let startupArgs = unEscapeArrayArgs(options['on-startup-script-args']);
@@ -113,7 +123,13 @@ export async function main(ns) {
                 (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false, 'warning');
         }
     }
-    log(ns, `SUCCESS: All stanek fragments at desired charge ${maxCharges}`, true, 'success');
+    if (topUp) {
+        const pending = selectTopUpFragments(await getActiveFragments(ns), toppedUp, chargeAttempts).length;
+        log(ns, pending == 0 ? `SUCCESS: Stanek top-up complete: ${toppedUp.size} fragments were charged above their previous peak.` :
+            `WARNING: Stanek top-up timed out (--top-up-timeout ${options['top-up-timeout']}s): ${toppedUp.size} fragments charged, ` +
+            `${pending} never saw ${options['top-up-min-gain']}x their peak in free threads.`, true, pending == 0 ? 'success' : 'warning');
+    } else
+        log(ns, `SUCCESS: All stanek fragments at desired charge ${maxCharges}`, true, 'success');
 
     // Run the completion script before shutting down
     let completionScript = options['on-completion-script'];
@@ -137,6 +153,13 @@ async function getFragmentsToCharge(ns) {
     if (fragments.length == 0) {
         log(ns, "ERROR: Stanek fragments were cleared. You must re-populate the grid before charging can continue.", true, 'error');
         return undefined;
+    }
+    if (topUp) { // ST-1: one peak-raising charge per stat fragment, then stop (no --max-charges / reputation logic)
+        const pending = selectTopUpFragments(fragments, toppedUp, chargeAttempts);
+        if (pending.length == 0 || Date.now() > topUpDeadline) return [];
+        log(ns, `Top-up: ${pending.length}/${fragments.length} fragments still need a charge of >= ${options['top-up-min-gain']}x their peak:\n` +
+            pending.map(f => `Fragment ${String(f.id).padStart(2)} at [${f.x},${f.y}] Peak: ${formatNumberShort(f.highestCharge)} Charges: ${f.numCharge.toFixed(1)}`).join('\n'));
+        return pending;
     }
     // If we have SF4, get our updated faction rep, and determine if we should continue past --max-charges to earn rep for the next augmentation
     const churchRep = sf4Level ? await getNsDataThroughFile(ns, 'ns.singularity.getFactionRep(ns.args[0])', null, ["Church of the Machine God"]) : 0;
@@ -183,6 +206,11 @@ async function tryChargeAllFragments(ns, fragmentsToCharge) {
                 `(${formatRam(availableRam)} free - ${formatRam(reservedRam)} reserved). Will try again later...`);
             continue;
         }
+        if (topUp && threads < options['top-up-min-gain'] * fragment.highestCharge) { // ST-1: a charge below the peak is wasted, wait for daemon's home scripts to drain
+            log(ns, `Top-up: ${threads} free threads on ${currentServer} is below ${options['top-up-min-gain']}x the peak charge ` +
+                `(${formatNumberShort(fragment.highestCharge)}) of fragment ${fragment.id}. Waiting for RAM to free up...`);
+            continue;
+        }
         const pid = ns.run(chargeScript, { threads: threads, temporary: true }, fragment.x, fragment.y);
         if (!pid) {
             log(ns, `WARNING: Failed to charge Stanek with ${threads} threads thinking there was ${formatRam(availableRam)} free on ${currentServer}. ` +
@@ -191,7 +219,15 @@ async function tryChargeAllFragments(ns, fragmentsToCharge) {
         }
         await waitForProcessToComplete(ns, pid);
         chargeAttempts[fragment.id] = 1 + (chargeAttempts[fragment.id] || 0);
+        if (topUp) toppedUp.add(fragment.id);
     }
+}
+
+/** ST-1: the stat fragments (id < 100) that have not yet received a peak-raising charge in this --top-up run, skipping fragments that
+ * were flagged as not accepting charge (chargeAttempts == 2, see getFragmentsToCharge).
+ * @param {ActiveFragment[]} fragments @param {Set<number>} toppedUpIds @param {{[id: number]: number}} attempts */
+export function selectTopUpFragments(fragments, toppedUpIds, attempts) {
+    return fragments.filter(f => f.id < 100 && !toppedUpIds.has(f.id) && (attempts[f.id] || 0) < 2);
 }
 
 /** Get the current active stanek fragments
