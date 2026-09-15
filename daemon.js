@@ -186,6 +186,24 @@ export function computeHostManagerBudget(maxSpendFraction, hackingIncome, totalI
     return Math.max(0, maxSpendFraction * hackingIncome - purchasedServerSpend, totalIncome * 0.001 - purchasedServerSpend);
 }
 
+// --- HC-3: prep timing (pure) ---
+
+/** Start times for a W-G-W prep mini-batch. The game evaluates a grow's growth at the security the target has when the grow RESOLVES
+ * (src/Server/formulas/grow.ts calculateServerGrowthLog reads server.hackDifficulty; src/NetscriptFunctions.ts grow applies it after netscriptDelay),
+ * and prep grow threads are sized for min security, so the grow must land after the prep weaken (one delayInterval later), and a second weaken
+ * must land one delayInterval after the grow to undo its hardening. Each duration is fixed at script start (src/Netscript/NetscriptHelpers.tsx hack()),
+ * so all three start before the first weaken lands and use the durations read now (at the current, higher security).
+ * @param {number} now ms epoch
+ * @param {number} weakenTime ms, at current security
+ * @param {number} growTime ms, at current security
+ * @param {number} delayInterval ms (cycle-timing-delay / 4)
+ * @param {boolean} needsWeaken false when the target is already at min security
+ * @returns {{weakenStart: number, growStart: number, weaken2Start: number}} */
+export function prepTiming(now, weakenTime, growTime, delayInterval, needsWeaken = true) {
+    if (!needsWeaken) return { weakenStart: now, growStart: now, weaken2Start: now };
+    return { weakenStart: now, growStart: now + weakenTime - growTime + delayInterval, weaken2Start: now + 2 * delayInterval };
+}
+
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
@@ -2004,14 +2022,13 @@ export async function main(ns) {
         // Check if already prepped or in targeting mode, in which case presume prep server is to be skipped.
         if (currentTarget.isPrepped() || (await currentTarget.isTargeting())) return null;
         let start = Date.now();
-        let now = new Date(start.valueOf());
         let weakenTool = getTool("weak"), growTool = getTool("grow");
         // Note: We must prioritize weakening before growing, or hardened security will make everything take longer
         let weakenThreadsAllowable = weakenTool.getMaxThreads(); // Note: Max is based on total ram across all servers (since thread spreading is allowed)
         let weakenThreadsNeeded = currentTarget.getWeakenThreadsNeeded();
         if (verbose) log(ns, `INFO: Need ${weakenThreadsNeeded} threads to weaken from ${currentTarget.getSecurity()} to ${currentTarget.getMinSecurity()}. There is room for ${weakenThreadsAllowable} threads (${currentTarget.name})`);
         // Plan grow if needed, but don't bother if we didn't have enough ram to schedule all weaken threads to reach min security
-        let growThreadsAllowable, growThreadsNeeded, growThreadsScheduled = 0;
+        let growThreadsAllowable, growThreadsNeeded, growThreadsScheduled = 0, weaken2ThreadsScheduled = 0;
         if (weakenThreadsNeeded < weakenThreadsAllowable && (growThreadsNeeded = currentTarget.getGrowThreadsNeeded())) {
             // During the prep-phase only, we allow grow threads to be split, despite the risks of added security hardening, because in practice is speeds the prep phase along more than waiting for separate batches.
             growThreadsAllowable = growTool.getMaxThreads(/*^*/ true /*^*/) - weakenThreadsNeeded; // Take into account RAM that will be consumed by weaken threads scheduled
@@ -2030,40 +2047,45 @@ export async function main(ns) {
                 growThreadsScheduled = scaledGrowThreads;
                 weakenForGrowthThreadsNeeded = scaledWeakThreads;
             }
-            weakenThreadsNeeded += weakenForGrowthThreadsNeeded;
             growThreadsAllowable -= weakenForGrowthThreadsNeeded; // For purposes of logging this below if we fail to schedule all grow threads
+            weakenThreadsAllowable -= weakenForGrowthThreadsNeeded; // HC-3: the recovery weaken is a separate task now (W2), reserve its room from W1's allowance
+            weaken2ThreadsScheduled = weakenForGrowthThreadsNeeded;
         }
 
-        // Schedule weaken first, in case ram conditions change, it's more important (security affects speed of future tools)
-        let prepSucceeding = true;
-        let weakenThreadsScheduled = Math.min(weakenThreadsAllowable, weakenThreadsNeeded);
-        if (weakenThreadsScheduled) {
-            if (weakenThreadsScheduled < weakenThreadsNeeded)
-                log(ns, `INFO: At this time, we only have enough RAM to schedule ${weakenThreadsScheduled} of the ${weakenThreadsNeeded} ` +
-                    `prep weaken threads needed to lower the target from current security (${formatNumber(currentTarget.getSecurity())}) ` +
-                    `to min security (${formatNumber(currentTarget.getMinSecurity())}) (${currentTarget.name})`);
-            prepSucceeding = await arbitraryExecution(ns, weakenTool, weakenThreadsScheduled,
-                // Note: Because we are scheduling prep tasks to fire ASAP, we should override the "silent misfires" (last arg) to true
-                [currentTarget.name, now.getTime(), currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
-                undefined, undefined, undefined, weakenThreadsByCores(weakenThreadsScheduled)); // Fewer threads are needed on hosts with more cores
-            if (prepSucceeding == false)
-                log(ns, `WARN: Failed to schedule ${weakenThreadsScheduled} prep weaken threads despite there ostensibly being room for ${weakenThreadsAllowable} (${currentTarget.name})`);
-        }
-        // Schedule any prep grow threads next
-        if (prepSucceeding && growThreadsScheduled > 0) {
-            prepSucceeding = await arbitraryExecution(ns, growTool, growThreadsScheduled,
-                [currentTarget.name, now.getTime(), currentTarget.timeToGrow(), "prep", ...getFlagsArgs("grow", currentTarget.name, false, true)],
-                undefined, undefined, /*allowThreadSplitting*/ true, // Special case: for prep we allow grow threads to be split
+        // HC-3: W-G-W mini-batch. W1 starts now; the grow is timed to land one delay after W1 (so the game applies it at min security, which is what
+        // getGrowThreadsNeeded sized it for) and W2 lands one delay after the grow to remove its hardening. All three are queued for launchDueTasks;
+        // W1 (and W2, which starts 2 delays from now) are launched below immediately, the grow ~0.2x weaken-time later.
+        const timing = prepTiming(start, currentTarget.timeToWeaken(), currentTarget.timeToGrow(), cycleTimingDelay / 4, weakenThreadsNeeded > 0);
+        const weakenThreadsScheduled = Math.min(weakenThreadsAllowable, weakenThreadsNeeded);
+        if (weakenThreadsScheduled < weakenThreadsNeeded)
+            log(ns, `INFO: At this time, we only have enough RAM to schedule ${weakenThreadsScheduled} of the ${weakenThreadsNeeded} ` +
+                `prep weaken threads needed to lower the target from current security (${formatNumber(currentTarget.getSecurity())}) ` +
+                `to min security (${formatNumber(currentTarget.getMinSecurity())}) (${currentTarget.name})`);
+        // Note: prep tasks fire at their planned time from a cold start, so override "silent misfires" (last flag arg) to true
+        if (weakenThreadsScheduled > 0)
+            enqueueTask(currentTarget, timing.weakenStart, "weak", weakenThreadsScheduled,
+                [currentTarget.name, timing.weakenStart, currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
+                weakenThreadsByCores(weakenThreadsScheduled), null, "prep"); // Fewer threads are needed on hosts with more cores
+        if (growThreadsScheduled > 0) {
+            enqueueTask(currentTarget, timing.growStart, "grow", growThreadsScheduled,
+                [currentTarget.name, timing.growStart, currentTarget.timeToGrow(), "prep", ...getFlagsArgs("grow", currentTarget.name, false, true)],
                 // Fewer threads are needed on hosts with more cores. If we could afford the full grow, hosts with cores can compute the exact count from current money
-                growThreadsByCores(currentTarget, growThreadsScheduled, growThreadsScheduled == growThreadsNeeded ? currentTarget.getMoney() : null));
-            if (prepSucceeding == false)
-                log(ns, `WARN: Failed to schedule ${growThreadsScheduled} prep grow threads despite there ostensibly being room for ${growThreadsAllowable} (${currentTarget.name})`);
+                growThreadsByCores(currentTarget, growThreadsScheduled, growThreadsScheduled == growThreadsNeeded ? currentTarget.getMoney() : null),
+                /*allowThreadSplitting*/ true, "prep"); // Special case: for prep we allow grow threads to be split
+            enqueueTask(currentTarget, timing.weaken2Start, "weak", weaken2ThreadsScheduled,
+                [currentTarget.name, timing.weaken2Start, currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
+                weakenThreadsByCores(weaken2ThreadsScheduled), null, "prep");
         }
+        // Launch what is due now (W1, and W2 which starts 2 delays from now). A failure here means we are out of RAM despite the checks above.
+        const prepSucceeding = (await launchDueTasks(ns)) == 0;
+        if (!prepSucceeding)
+            log(ns, `WARN: Failed to launch the prep weaken threads for ${currentTarget.name} despite there ostensibly being room for ${weakenThreadsAllowable} (see warning above)`);
 
         // Log a summary of what we did here today
         if (verbose && prepSucceeding && (weakenThreadsScheduled > 0 || growThreadsScheduled > 0))
-            log(ns, `Prepping with ${weakenThreadsScheduled} weaken, ${growThreadsScheduled} grow threads (${weakenThreadsNeeded || 0} / ${growThreadsNeeded || 0} needed)` +
-                ' ETA ' + Math.floor((currentTarget.timeToWeaken() + queueDelay) / 1000) + 's (' + currentTarget.name + ')' +
+            log(ns, `Prepping with ${weakenThreadsScheduled} weaken, ${growThreadsScheduled} grow, ${weaken2ThreadsScheduled} recovery weaken threads ` +
+                `(${weakenThreadsNeeded || 0} / ${growThreadsNeeded || 0} needed) grow lands at ${formatDateTime(new Date(timing.growStart + currentTarget.timeToGrow()))}` +
+                ' ETA ' + Math.floor((currentTarget.timeToWeaken() + cycleTimingDelay / 2) / 1000) + 's (' + currentTarget.name + ')' +
                 ' Took: ' + (Date.now() - start) + 'ms');
         return prepSucceeding;
     }
