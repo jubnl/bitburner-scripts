@@ -247,6 +247,10 @@ export async function main(ns) {
     // HC-1: per target, where its current round of batches ends (used to chain the next round without a gap) - see performScheduling
     let roundState = (/**@returns{{[serverName: string]: {lastBatchStart: number, readyAt: number, nextBatchNumber: number}}}*/() => ({}))();
     let launchFailuresThisLoop = 0, launchFailuresLastLoop = 0; // Queued tasks that could not be exec'd when due (out of RAM). Throttles new planning.
+    // HC-3 fix: tasks that failed to launch or were dropped with their batch, by target name, from only the most recent launchDueTasks() call
+    // (reset at the top of every call) - lets a caller like prepServer judge success for its own target without being drained by an unrelated
+    // target's RAM failure in the same call.
+    let lastLaunchFailuresByTarget = (/**@returns{Map<string, number>}*/() => new Map())();
     let maxTargets = 0; // (Set in command line args) Initial value, will grow if there is an abundance of RAM
     let maxPreppingAtMaxTargets = 3; // The max servers we can prep when we're at our current max targets and have spare RAM
     // Allows some home ram to be reserved for ad-hoc terminal script running and when home is explicitly set as the "preferred server" for starting a helper
@@ -409,6 +413,7 @@ export async function main(ns) {
         ownedCracks = [], ownedPrograms = [], ownTorRouter = false;
         psCache = {};
         batchQueue = [], roundState = {}, launchFailuresThisLoop = launchFailuresLastLoop = 0; // HC-1 launcher state
+        lastLaunchFailuresByTarget = new Map(); // HC-3 fix
         // XpMode Related Caches
         singleServerLimit = 0, lastCycleTotalRam = 0; // Cache of total ram on the server to check whether we should attempt to lift the above restriction.
         targetsByExp = [], jobHostMappings = {}, farmXpReentryLock = [], nextXpCycleEnd = [];
@@ -840,9 +845,12 @@ export async function main(ns) {
 
     /** HC-1: exec every queued task whose planned start is within loopInterval. A task that cannot be started (no RAM) is dropped, and with it
      * the rest of its batch (see dropBatchAfterFailure) - a half-launched batch would harden the target or steal money nothing grows back.
+     * HC-3 fix: also (re)builds `lastLaunchFailuresByTarget`, the failed+dropped task count broken down by target name for this call only, so a
+     * caller (prepServer) can judge success for just its own target instead of being drained by an unrelated target's RAM failure in this call.
      * @param {NS} ns
-     * @returns {Promise<number>} tasks that failed to launch or were dropped with their batch, in this call */
+     * @returns {Promise<number>} tasks that failed to launch or were dropped with their batch, in this call (queue-wide total) */
     async function launchDueTasks(ns) {
+        lastLaunchFailuresByTarget = new Map(); // HC-3 fix: scoped to this call
         if (batchQueue.length == 0) return 0;
         let [due, pending] = partitionDueTasks(batchQueue, Date.now(), loopInterval);
         batchQueue = pending;
@@ -861,6 +869,10 @@ export async function main(ns) {
                 due = remainingDue[0], batchQueue = remainingQueued[0];
                 const droppedNow = remainingDue[1] + remainingQueued[1];
                 dropped += droppedNow;
+                // HC-3 fix: dropBatchAfterFailure only ever drops tasks of the same target as the failed task, so this whole
+                // failure+drop event (1 + droppedNow) belongs to task.target.name alone.
+                const targetName = task.target.name;
+                lastLaunchFailuresByTarget.set(targetName, (lastLaunchFailuresByTarget.get(targetName) ?? 0) + 1 + droppedNow);
                 if (verbose || failures == 1)
                     log(ns, `WARNING: Could not launch ${task.threads}x ${task.toolShortName} "${task.description}" against ${task.target.name} ` +
                         `(due to start in ${Math.round(task.start - Date.now())} ms): insufficient RAM. ` +
@@ -2077,7 +2089,10 @@ export async function main(ns) {
                 weakenThreadsByCores(weaken2ThreadsScheduled), null, "prep");
         }
         // Launch what is due now (W1, and W2 which starts 2 delays from now). A failure here means we are out of RAM despite the checks above.
-        const prepSucceeding = (await launchDueTasks(ns)) == 0;
+        // HC-3 fix: launchDueTasks may also launch other targets' due tasks in this same call; judge success from only this target's own
+        // failures/drops (lastLaunchFailuresByTarget), not the queue-wide total, so an unrelated target's RAM failure doesn't fail this prep.
+        await launchDueTasks(ns);
+        const prepSucceeding = (lastLaunchFailuresByTarget.get(currentTarget.name) ?? 0) === 0;
         if (!prepSucceeding)
             log(ns, `WARN: Failed to launch the prep weaken threads for ${currentTarget.name} despite there ostensibly being room for ${weakenThreadsAllowable} (see warning above)`);
 
