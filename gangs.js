@@ -10,6 +10,10 @@ let wantedPenaltyThreshold = 0.01; // Don't let the wanted penalty get worse tha
 // and at most maxCyclesToProcess (25 cycles = 5s) per 200ms engine tick. So the game runs 1 cycle/tick normally, 25 cycles/tick in bonus time.
 const gangCyclesPerNormalUpdate = 10;
 const gangCyclesPerBonusUpdate = 25;
+// ns.gang.getBonusTime() is just storedCycles * 200ms, and storedCycles is non-zero on 9 of every 10 engine ticks in normal play (it counts
+// 1..9 then gets processed at 10), so any "> 0" test is almost always true. The gang only processes 25 cycles/tick while storedCycles >= 25,
+// i.e. while getBonusTime() >= 5s (the game's own BonusTime.tsx uses the same 5s cut-off).
+const gangBonusTimeThreshold = gangCyclesPerBonusUpdate * 200;
 const offStatCostPenalty = 50; // Equipment that doesn't contribute to our main stats suffers a percieved cost penalty of this multiple
 const defaultMaxSpendPerTickTransientEquipment = 0.002; // If the --equipment-budget is not specified, spend up to this percent of non-reserved cash on temporary upgrades (equipment)
 const defaultMaxSpendPerTickPermanentEquipment = 0.2; // If the --augmentation-budget is not specified, spend up to this percent of non-reserved cash on permanent member upgrades
@@ -237,7 +241,7 @@ async function mainLoop(ns) {
 async function onTerritoryTick(ns, myGangInfo) {
     // Reset the time the next tick will occur. In bonus time, the game processes 25 cycles per 200ms engine tick instead of 1
     // (src/Gang/Gang.ts process(): Math.min(storedCycles, maxCyclesToProcess=25)), so territory ticks 25x faster.
-    territoryNextTick = lastLoopTime + territoryTickTime / (ns.gang.getBonusTime() > 0 ? gangCyclesPerBonusUpdate : 1);
+    territoryNextTick = lastLoopTime + territoryTickTime / (ns.gang.getBonusTime() >= gangBonusTimeThreshold ? gangCyclesPerBonusUpdate : 1);
     if (lastTerritoryPower != myGangInfo.power || lastTerritoryPower == null) {
         log(ns, `Territory power updated from ${formatNumberShort(lastTerritoryPower)} to ${formatNumberShort(myGangInfo.power)}.`)
         consecutiveTerritoryDetections++;
@@ -660,7 +664,7 @@ function computeWantedGains(myGangInfo, currentTask, memberInfo, cyclesPerUpdate
 /** @param {NS} ns
  * @returns {number} How many game cycles the gang processes per update (src/Gang/data/Constants.ts minCyclesToProcess / maxCyclesToProcess) */
 function getGangCyclesPerUpdate(ns) {
-    return ns.gang.getBonusTime() > 0 ? gangCyclesPerBonusUpdate : gangCyclesPerNormalUpdate; // getBonusTime costs 0 GB
+    return ns.gang.getBonusTime() >= gangBonusTimeThreshold ? gangCyclesPerBonusUpdate : gangCyclesPerNormalUpdate; // getBonusTime costs 0 GB
 }
 
 /** @param {GangGenInfo} myGangInfo
