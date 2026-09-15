@@ -846,13 +846,13 @@ export function pushFiles(ns, state, plan) {
             if (!entry || !entry.online) continue;
             const secret = live[host];
             if (secret === undefined) continue;
-            const session = ns.dnet.connectToSession(host, secret);
+            const session = trySession(ns, host, secret);
             if (!session.success) {
-                // 401: the password no longer works (the server was replaced). 503: the server
-                // is gone entirely -- nothing else ever tells us that, since a deleted host
-                // simply stops appearing in its neighbours' probes.
-                if (session.code === 401 && state.passwords[host]) state.passwords[host].stale = true;
-                if (session.code === 503) { entry.online = false; entry.lastSeen = Date.now(); }
+                // 401: the password no longer works (the server was replaced). 503: the server was
+                // deleted this game session. 404 (trySession): deleted before a reload, so the game
+                // no longer knows the name at all -- gone, and the password is worthless too (R15).
+                if ((session.code === 401 || session.code === 404) && state.passwords[host]) state.passwords[host].stale = true;
+                if (session.code === 503 || session.code === 404) { entry.online = false; entry.lastSeen = Date.now(); }
                 continue;
             }
             entry.lastSeen = Date.now();   // a live session is proof the host still exists
@@ -1088,9 +1088,10 @@ async function stopEverything(ns, state) {
             const entry = state.servers[host];
             const secret = state.passwords[host];
             if (!entry || !entry.online || !secret || secret.stale || secret.password === undefined) continue;
-            const session = ns.dnet.connectToSession(host, secret.password);
+            const session = trySession(ns, host, secret.password);
             if (!session.success) {
-                if (session.code === 503) { entry.online = false; entry.lastSeen = Date.now(); }
+                if (session.code === 503 || session.code === 404) { entry.online = false; entry.lastSeen = Date.now(); }
+                if (session.code === 404) secret.stale = true;
                 continue;
             }
         }
@@ -1130,4 +1131,23 @@ async function stopEverything(ns, state) {
         }
     }
     log(ns, `SUCCESS: darknet --kill finished; stopped ${stopped} processes on ${hostsWithKills} hosts.`, true, "success");
+}
+
+// ---------------------------------------------------------------- sessions
+
+/** connectToSession, with a server the game no longer knows treated as gone. After a reload the game's
+ * DarknetState.offlineServers is empty (src/DarkNet/effects/SaveLoad.ts persists only storedCycles and
+ * hasUsedHeartbleed), so a host deleted before the reload is in neither the server table nor the offline
+ * table and every dnet call on it throws `Invalid host` (src/Netscript/NetscriptHelpers.tsx getServer)
+ * instead of answering 503. The game throws that as a plain string (ErrorMessages.ts errorMessage), so
+ * both shapes are read. Only that throw is caught; anything else propagates (R15).
+ * @param {NS} ns */
+function trySession(ns, host, secret) {
+    try {
+        return ns.dnet.connectToSession(host, secret);
+    } catch (err) {
+        const message = String(err?.message ?? err);
+        if (message.includes("Invalid host")) return { success: false, code: 404, message };
+        throw err;
+    }
 }

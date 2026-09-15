@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { parseCmd, emptyState, encodeMsg, WORKER_RAM } from "../darknet/lib.js";
 import {
     applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
-    loadState, planLabyrinth, planLoot, planPromotions, saveState,
+    loadState, planLabyrinth, planLoot, planPromotions, pushFiles, saveState,
 } from "../darknet.js";
 
 /* Node-only tests for darknet.js's planning and state machine.
@@ -425,4 +425,43 @@ test("chooseMode counts a charging migration by the same difficulty rule", () =>
     assert.equal(chooseMode(ns, state, options, 600), "labyrinth");
     state.servers.deep.difficulty = 3;
     assert.equal(chooseMode(ns, state, options, 600), "loot", "a charge that cannot cross the gap does not count");
+});
+
+// ------------------------------------------------------------------ R15: a host the game no longer knows
+
+// After a reload the game's DarknetState.offlineServers is empty (src/DarkNet/effects/SaveLoad.ts persists only
+// storedCycles and hasUsedHeartbleed), so a host deleted before the reload resolves to neither the server table
+// nor the offline table and every dnet call on it throws `Invalid host` (NetscriptHelpers.tsx getServer) instead
+// of answering 503. darknet/state.txt survives the reload with the host online, so pushFiles threw on it every
+// loop and nothing after it ran (no pushes, no walkers, no saveState).
+test("pushFiles treats an `Invalid host` throw from connectToSession as a deleted server", () => {
+    const ns = makeNs({});
+    let sessions = 0;
+    ns.dnet.connectToSession = (host) => {
+        sessions++;
+        if (host === "byte%oasis") throw new Error("dnet.connectToSession: Invalid host: 'byte%oasis'");
+        return { success: true, code: 200 };
+    };
+    const state = makeState({ "byte%oasis": { depth: 3 }, keeper: { depth: 2 } });
+    const plan = planLoot(ns, state, baseOptions, 10);
+    assert.doesNotThrow(() => pushFiles(ns, state, plan));
+    assert.equal(state.servers["byte%oasis"].online, false, "a name the game no longer knows is a deleted server");
+    assert.equal(state.passwords["byte%oasis"].stale, true, "and its password is worthless too");
+    assert.equal(state.servers.keeper.online, true);
+    assert.equal(state.passwords.keeper.stale, undefined);
+    assert.deepEqual(ns.scps.map(row => row.host), ["darkweb", "keeper"], "the loop carried on past the dead host");
+    assert.equal(sessions, 2, "one session per stored host; darkweb needs none");
+
+    // In the game errorMessage() throws a plain string, not an Error: the wrapper must read both.
+    ns.dnet.connectToSession = () => { throw "RUNTIME ERROR\ndarknet.js@home (PID - 216)\n\ndnet.connectToSession: Invalid host: 'gone'"; };
+    const stringState = makeState({ gone: {} });
+    assert.doesNotThrow(() => pushFiles(ns, stringState, plan));
+    assert.equal(stringState.servers.gone.online, false);
+
+    // Anything else still propagates: a real bug must not be filed as a deletion.
+    ns.dnet.connectToSession = () => { throw new Error("dnet.connectToSession: something else"); };
+    assert.throws(() => pushFiles(ns, makeState({ other: {} }), plan), /something else/);
+
+    const controller = readFileSync(new URL("../darknet.js", import.meta.url), "utf8");
+    assert.equal((controller.match(/ns\.dnet\.connectToSession\(/g) ?? []).length, 1, "the only raw call is inside trySession; pushFiles and --kill go through it");
 });
