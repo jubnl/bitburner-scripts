@@ -63,9 +63,10 @@ const argsSchema = [
     ['cycle-timing-delay', 2000],
     ['queue-delay', 1000], // (ms) Delay before the first script begins, to give time for all scripts to be scheduled
     ['recovery-thread-padding', 1], // Multiply the number of grow/weaken threads needed by this amount to automatically recover more quickly from misfires.
-    // Maximum overlapping cycles to schedule in advance for one target. Note that once scheduled, we must wait for all batches to complete before we can schedule more.
-    // The number of batches that fit is ~ weaken-time / cycle-timing-delay, so halving the delay (above) needs roughly double the batches to fully use the window.
-    // Each batch is 4 running scripts, so very high values (e.g. 200 for --cycle-timing-delay 1000) cost IRL RAM/CPU for the game to track.
+    // Maximum overlapping cycles to plan per round for one target. The next round is planned as soon as the last batch of the current one begins
+    // launching (HC-1), so rounds chain without a gap. The number of batches that fit is ~ weaken-time / cycle-timing-delay, so halving the delay
+    // (above) needs roughly double the batches to fully use the window. Each batch is 4 scripts (queued until ~1 s before their start), so very
+    // high values (e.g. 200 for --cycle-timing-delay 1000) cost IRL RAM/CPU for the game to track.
     ['max-batches', 100],
     ['max-steal-percentage', 0.75], // Don't steal more than this in case something goes wrong with timing or scheduling, it's hard to recover frome
 
@@ -91,6 +92,31 @@ export function autocomplete(data, args) {
     if (lastFlag == "--disable-script" || lastFlag == "--run-script")
         return data.scripts;
     return [];
+}
+
+// --- HC-1: just-in-time batch launcher helpers (pure; exported for unit tests, they reference no ns function so they cost no RAM) ---
+
+/** Splits the launch queue into the tasks that must be exec'd now (start within `leadMs` of `now`, sorted by start) and the rest.
+ * @param {{start: number}[]} queue
+ * @returns {[due: {start: number}[], pending: {start: number}[]]} */
+export function partitionDueTasks(queue, now, leadMs) {
+    const due = [], pending = [];
+    for (const task of queue) (task.start - leadMs <= now ? due : pending).push(task);
+    due.sort((a, b) => a.start - b.start);
+    return [due, pending];
+}
+
+/** The batch start time of a target's next round: continue the previous round's cadence (one cycle-timing-delay after its last batch) when that
+ * is still at least queueDelay away, otherwise start queueDelay from now. Never plans a batch whose first task would already be overdue. */
+export function nextRoundStart(now, queueDelay, prevLastBatchStart, cycleTimingDelay) {
+    return Math.max(now + queueDelay, (prevLastBatchStart ?? 0) + cycleTimingDelay);
+}
+
+/** Whether a target's next round may be planned yet: once the launcher has launched (or will launch within `leadMs`) the first task of the
+ * current round's last batch. Planning earlier would size the next round against RAM the current round has not claimed yet.
+ * @param {{lastBatchStart: number, readyAt: number, nextBatchNumber: number}|undefined} roundInfo */
+export function canPlanNextRound(roundInfo, now, leadMs) {
+    return roundInfo != null && now >= roundInfo.readyAt - leadMs;
 }
 
 // script entry point
@@ -129,7 +155,13 @@ export async function main(ns) {
     // For timing reasons the delay between each step should be *close* 1/4th of this number, but there is some imprecision
     let cycleTimingDelay = 0; // (Set in command line args)
     let queueDelay = 0; // (Set in command line args) The delay that it can take for a script to start, used to pessimistically schedule things in advance
-    let maxBatches = 0; // (Set in command line args) The max number of batches this daemon will spool up to avoid running out of IRL ram (TODO: Stop wasting RAM by scheduling batches so far in advance. e.g. Grind XP while waiting for cycle start!)
+    let maxBatches = 0; // (Set in command line args) The max number of batches this daemon will plan per round for one target (each is 4 queued tasks until launched)
+    // HC-1: planned batch/prep tasks waiting to be exec'd. launchDueTasks() execs each one loopInterval before its planned start time; the remote
+    // scripts sleep the remainder via additionalMsec, so a script only holds RAM for (about) its own duration instead of for the whole round.
+    let batchQueue = (/**@returns{{target: Server, start: number, toolShortName: string, threads: number, threadsByCores: ((cores: number) => number)|null, args: any[], allowSplit: boolean|null, description: string}[]}*/() => [])();
+    // HC-1: per target, where its current round of batches ends (used to chain the next round without a gap) - see performScheduling
+    let roundState = (/**@returns{{[serverName: string]: {lastBatchStart: number, readyAt: number, nextBatchNumber: number}}}*/() => ({}))();
+    let launchFailuresThisLoop = 0, launchFailuresLastLoop = 0; // Queued tasks that could not be exec'd when due (out of RAM). Throttles new planning.
     let maxTargets = 0; // (Set in command line args) Initial value, will grow if there is an abundance of RAM
     let maxPreppingAtMaxTargets = 3; // The max servers we can prep when we're at our current max targets and have spare RAM
     // Allows some home ram to be reserved for ad-hoc terminal script running and when home is explicitly set as the "preferred server" for starting a helper
@@ -290,6 +322,7 @@ export async function main(ns) {
         resetServerSortCache();
         ownedCracks = [], ownedPrograms = [], ownTorRouter = false;
         psCache = {};
+        batchQueue = [], roundState = {}, launchFailuresThisLoop = launchFailuresLastLoop = 0; // HC-1 launcher state
         // XpMode Related Caches
         singleServerLimit = 0, lastCycleTotalRam = 0; // Cache of total ram on the server to check whether we should attempt to lift the above restriction.
         targetsByExp = [], jobHostMappings = {}, farmXpReentryLock = [], nextXpCycleEnd = [];
@@ -710,6 +743,41 @@ export async function main(ns) {
         server.resetCaches(); // If rooted status was cached, we must now reset it
     }
 
+    /** HC-1: put a planned task on the launch queue. `args` must be the complete remote-script args (target, start, duration, description, flags...)
+     * @param {Server} target */
+    function enqueueTask(target, start, toolShortName, threads, args, threadsByCores = null, allowSplit = null, description = '') {
+        batchQueue.push({ target, start, toolShortName, threads, threadsByCores, args, allowSplit, description });
+    }
+
+    /** HC-1: number of queued (not yet launched) tasks against a server, optionally only those whose description starts with a prefix ("Batch", "prep") */
+    function queuedTaskCount(serverName, descriptionPrefix = '') {
+        return batchQueue.filter(t => t.target.name == serverName && t.description.startsWith(descriptionPrefix)).length;
+    }
+
+    /** HC-1: exec every queued task whose planned start is within loopInterval. A task that cannot be started (no RAM) is dropped and counted;
+     * because tasks are launched in start order (W1, W2, grow, then hack last), RAM pressure drops hacks first, which leaves the target prepped.
+     * @param {NS} ns
+     * @returns {Promise<number>} launch failures in this call */
+    async function launchDueTasks(ns) {
+        if (batchQueue.length == 0) return 0;
+        const [due, pending] = partitionDueTasks(batchQueue, Date.now(), loopInterval);
+        batchQueue = pending;
+        let failures = 0;
+        for (const task of due) {
+            const ok = await arbitraryExecution(ns, getTool(task.toolShortName), task.threads, task.args, undefined, undefined, task.allowSplit, task.threadsByCores);
+            if (ok == false) {
+                failures++;
+                if (verbose || failures == 1)
+                    log(ns, `WARNING: Could not launch ${task.threads}x ${task.toolShortName} "${task.description}" against ${task.target.name} ` +
+                        `(due to start in ${Math.round(task.start - Date.now())} ms): insufficient RAM. Dropping it.`, false, 'warning');
+            }
+        }
+        launchFailuresThisLoop += failures;
+        if (verbose && due.length > 0)
+            log(ns, `INFO: Launched ${due.length - failures} of ${due.length} due tasks (${batchQueue.length} still queued, ${failures} failed)`);
+        return failures;
+    }
+
     // Main targeting loop
     /** @param {NS} ns **/
     async function doTargetingLoop(ns) {
@@ -722,6 +790,8 @@ export async function main(ns) {
             try {
                 let start = Date.now();
                 psCache = {}; // Clear the cache of the process list we update once per loop
+                launchFailuresLastLoop = launchFailuresThisLoop; launchFailuresThisLoop = 0;
+                await launchDueTasks(ns); // HC-1: exec batch/prep tasks that are due, before any of the slower bookkeeping below
                 await buildServerList(ns, true); // Check if any new servers have been purchased by the external host_manager process
                 await updateCachedServerData(ns); // Update server data that only needs to be refreshed once per loop
                 await updatePortCrackers(ns); // Check if any new port crackers have been purchased
@@ -788,8 +858,11 @@ export async function main(ns) {
 
                 // If this gets set to true, the loop will continue (e.g. to gather information), but no more work will be scheduled
                 let workCapped = false;
+                // HC-1: continuing an active target's rounds is capped only by RAM (the target-count caps below govern *new* targets)
+                const isContinuationCapped = () => failed.length > 0 || launchFailuresLastLoop > 0 || getTotalNetworkUtilization() >= maxUtilization;
                 // Function to assess whether we've hit some cap that should prevent us from scheduling any more work
                 let isWorkCapped = () => workCapped = workCapped || failed.length > 0 // Scheduling fails when there's insufficient RAM. We've likely encountered a "soft cap" on ram utilization e.g. due to fragmentation
+                    || launchFailuresLastLoop > 0 // HC-1: queued tasks could not be launched last loop - the network is over-committed, plan nothing new
                     || getTotalNetworkUtilization() >= maxUtilization // "hard cap" on ram utilization, can be used to reserve ram or reduce the rate of encountering the "soft cap"
                     || targeting.length >= maxTargets // variable cap on the number of simultaneous targets
                     || (targeting.length + prepping.length) >= (maxTargets + maxPreppingAtMaxTargets); // Only allow a couple servers to be prepped in advance when at max-targets
@@ -823,7 +896,17 @@ export async function main(ns) {
                         else if (await server.isPrepping())
                             cantHackButPrepping.push(server);
                     } else if (await server.isTargeting()) { // Note servers already being targeted from a prior loop
-                        targeting.push(server); // TODO: Switch to continuously queing batches in the seconds leading up instead of far in advance with large delays
+                        targeting.push(server);
+                        // HC-1: chain rounds. Once the last batch of the current round has begun launching, plan the next round so that its first
+                        // hack lands one cycle-timing-delay after this round's last hack (previously a target idled a full weaken-time between rounds).
+                        // A targeted server is momentarily un-prepped between each hack landing and its W2, so do not route this through prepServer.
+                        if (!xpOnly && canPlanNextRound(roundState[server.name], Date.now(), loopInterval) && !isContinuationCapped()) {
+                            const performanceSnapshot = optimizePerformanceMetrics(ns, server);
+                            if (server.actualPercentageToSteal() === 0)
+                                log(ns, `INFO: Not enough free RAM to plan the next round for ${server.name} yet (RAM Utilization: ${(getTotalNetworkUtilization() * 100).toFixed(2)}%). Will retry next loop.`);
+                            else if (true != await performScheduling(ns, server, performanceSnapshot))
+                                log(ns, `WARNING: Failed to plan the next round for ${server.name}. Will retry next loop.`, false, 'warning');
+                        }
                     } else if (await server.isPrepping()) { // Note servers already being prepped from a prior loop
                         prepping.push(server);
                     } else if (isWorkCapped() || xpOnly) { // Various conditions for which we'll postpone any additional work on servers
@@ -901,10 +984,8 @@ export async function main(ns) {
                 lowUtilizationIterations = utilizationPercent <= lowUtilizationThreshold ? lowUtilizationIterations + 1 : 0;
 
                 // If we've been at low utilization for longer than the max hack cycle out of all our targets, we can add a target.
-                // 
-                // TODO: Make better use of RAM by prepping more targets. Try not scheduling batches way in advance with a sleep, but instead
-                //       witholding batches until they're closer to when they need to be kicked off.
-                //       We can add logic to kill lower priority tasks using RAM (such as share, and scripts targetting low priority targets)
+                // (HC-1: batches are now queued and launched just in time by launchDueTasks, so utilization reflects scripts that are actually running.)
+                // TODO: We could kill lower priority tasks using RAM (such as share, and scripts targetting low priority targets)
                 //       if necessary to free up ram for new high-priority target batches.
                 let intervalsPerTargetCycle = targeting.length == 0 ? 120 :
                     Math.ceil((targeting.reduce((max, t) => Math.max(max, t.timeToWeaken()), 0) + cycleTimingDelay) / loopInterval);
@@ -981,6 +1062,8 @@ export async function main(ns) {
                         lastShareTime = Date.now();
                     }
                 } //else log(ns, `Not Sharing. workCapped: ${isWorkCapped()} utilizationPercent: ${utilizationPercent} maxShareUtilization: ${maxShareUtilization} cooldown: ${formatDuration(Date.now() - lastShareTime)} networkRam: ${network.totalMaxRam}`);
+
+                await launchDueTasks(ns); // HC-1: tasks planned this loop whose start is imminent (first W1 is due queueDelay + delayInterval from planning)
 
                 // Log some status updates
                 let keyUpdates = `Of ${allHostNames.length} total servers:\n > ${noMoney.length} were ignored (owned or no money)`;
@@ -1226,12 +1309,14 @@ export async function main(ns) {
                     }
             return count ? total : false;
         }
-        async isPrepping(useCache = true) {
-            this._isPrepping ??= await this.isSubjectOfRunningScript(process => process.args.length > 3 && process.args[3] == "prep", useCache);
+        async isPrepping(useCache = true) { // HC-1: queued (not yet launched) prep tasks count too
+            this._isPrepping ??= queuedTaskCount(this.name, "prep") > 0 ||
+                await this.isSubjectOfRunningScript(process => process.args.length > 3 && process.args[3] == "prep", useCache);
             return this._isPrepping;
         }
-        async isTargeting(useCache = true) {
-            this._isTargeting ??= await this.isSubjectOfRunningScript(process => process.args.length > 3 && process.args[3].startsWith('Batch'), useCache);
+        async isTargeting(useCache = true) { // HC-1: queued (not yet launched) batch tasks count too
+            this._isTargeting ??= queuedTaskCount(this.name, "Batch") > 0 ||
+                await this.isSubjectOfRunningScript(process => process.args.length > 3 && process.args[3].startsWith('Batch'), useCache);
             return this._isTargeting;
         }
         async isXpFarming(useCache = true) {
@@ -1480,17 +1565,19 @@ export async function main(ns) {
         return 0.00;
     }
 
-    /** @param {NS} ns **/
+    /** Plans one round of batches against a prepped target and queues every task for launchDueTasks (HC-1: nothing is exec'd here).
+     * @param {NS} ns
+     * @param {Server} currentTarget
+     * @returns {Promise<boolean|undefined>} true if a round was queued */
     async function performScheduling(ns, currentTarget, snapshot) {
         const start = Date.now();
         const scheduledTasks = [];
-        const maxCycles = Math.min(snapshot.optimalPacedCycles, snapshot.maxCompleteCycles);
         if (!snapshot) return;
+        const maxCycles = Math.min(snapshot.optimalPacedCycles, snapshot.maxCompleteCycles);
         if (maxCycles === 0)
             return log(ns, `WARNING: Attempt to schedule ${getTargetSummary(currentTarget)} returned 0 max cycles? ${JSON.stringify(snapshot)}`, false, 'warning');
         if (currentTarget.getHackThreadsNeeded() === 0)
             return log(ns, `WARNING: Attempted to schedule empty cycle ${maxCycles} x ${getTargetSummary(currentTarget)}? ${JSON.stringify(snapshot)}`, false, 'warning');
-        let lastBatch = 0, cyclesScheduled = 0;
         // Note: A guard used to live here to stop scheduling once a batch's last task would *start* after the first batch's hack *resolves*
         // (the server is then briefly not at min security). It was dead code (it compared against an undefined `newBatch.firstFire`, so it
         // only ever compared the first batch against itself) and it is not needed: our remote scripts start immediately and bundle their wait
@@ -1498,12 +1585,17 @@ export async function main(ns) {
         // security + additionalMsec, src/Netscript/NetscriptHelpers.tsx hack()), so a task's planned start time cannot change its duration.
         // Batch spacing (cycleTimingDelay = 4 x the gap between task resolutions, see getScheduleTiming) keeps resolution windows from
         // overlapping, and the number of batches is bounded by optimalPacedCycles (~ weaken time / cycle-timing-delay) and --max-batches.
+        // HC-1: continue the previous round's cadence when it is still in the future (so rounds chain with no gap), else start after queueDelay
+        const previousRound = roundState[currentTarget.name];
+        const firstBatchStart = nextRoundStart(Date.now(), queueDelay, previousRound?.lastBatchStart, cycleTimingDelay);
+        const batchNumberBase = previousRound?.nextBatchNumber ?? 0; // Keeps "Batch N-..." descriptions unique across overlapping rounds
+        let lastBatch = 0, cyclesScheduled = 0;
         while (cyclesScheduled < maxCycles) {
-            const newBatchStart = new Date((cyclesScheduled === 0) ? Date.now() + queueDelay : lastBatch.getTime() + cycleTimingDelay);
+            const newBatchStart = new Date((cyclesScheduled === 0) ? firstBatchStart : lastBatch.getTime() + cycleTimingDelay);
             lastBatch = new Date(newBatchStart.getTime());
             const batchTiming = getScheduleTiming(newBatchStart, currentTarget);
             if (verbose && runOnce) logSchedule(ns, batchTiming, currentTarget); // Special log for troubleshooting batches
-            scheduledTasks.push(getScheduleObject(ns, batchTiming, currentTarget, scheduledTasks.length));
+            scheduledTasks.push(getScheduleObject(ns, batchTiming, currentTarget, batchNumberBase + scheduledTasks.length));
             cyclesScheduled++;
         }
 
@@ -1515,17 +1607,19 @@ export async function main(ns) {
                 args.push(...getFlagsArgs(schedItem.toolShortName, currentTarget.name));
                 if (options.i && currentTerminalServer?.name == currentTarget.name && schedItem.toolShortName == "hack")
                     schedItem.toolShortName = "manualhack";
-                const result = await arbitraryExecution(ns, getTool(schedItem.toolShortName), schedItem.threadsNeeded, args,
-                    undefined, undefined, undefined, schedItem.threadsByCores ?? null); // grow/weaken items carry a cores-aware thread count
-                if (result == false) { // If execution fails, we have probably run out of ram.
-                    log(ns, `WARNING: Scheduling failed for ${getTargetSummary(currentTarget)} ${discriminationArg} of ${cyclesScheduled} Took: ${Date.now() - start}ms`, false, 'warning');
-                    currentTarget.previousCycle = `INCOMPLETE. Tried: ${cyclesScheduled} x ${getTargetSummary(currentTarget)}`;
-                    return false;
-                }
+                // HC-1: queue it; launchDueTasks execs it loopInterval before schedItem.start. grow/weaken items carry a cores-aware thread count
+                enqueueTask(currentTarget, schedItem.start.getTime(), schedItem.toolShortName, schedItem.threadsNeeded, args, schedItem.threadsByCores ?? null, null, discriminationArg);
             }
         }
+        const lastSched = scheduledTasks[scheduledTasks.length - 1];
+        roundState[currentTarget.name] = {
+            lastBatchStart: lastSched.batchStart.getTime(),
+            readyAt: Math.min(...lastSched.scheduleItems.map(i => i.start.getTime())), // When the last batch begins launching, the next round may be planned
+            nextBatchNumber: batchNumberBase + scheduledTasks.length,
+        };
         if (verbose)
-            log(ns, `Scheduled ${cyclesScheduled} x ${getTargetSummary(currentTarget)} Took: ${Date.now() - start}ms`);
+            log(ns, `Queued ${cyclesScheduled} x ${getTargetSummary(currentTarget)} starting ${formatDateTime(new Date(firstBatchStart))} ` +
+                `(${batchQueue.length} tasks now queued) Took: ${Date.now() - start}ms`);
         currentTarget.previousCycle = `${cyclesScheduled} x ${getTargetSummary(currentTarget)}`
         return true;
     }
