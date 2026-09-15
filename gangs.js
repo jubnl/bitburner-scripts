@@ -2,6 +2,7 @@ import {
     log, getConfiguration, instanceCount, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers,
     formatMoney, formatNumberShort, formatDuration
 } from './helpers.js'
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask } from './lib/gang-logic.js'
 
 // Global config
 const updateInterval = 200; // We can improve our timing by updating more often than gang stats do (which is every 2 seconds for stats, every 20 seconds for territory)
@@ -14,7 +15,7 @@ const gangCyclesPerBonusUpdate = 25;
 // 1..9 then gets processed at 10), so any "> 0" test is almost always true. The gang only processes 25 cycles/tick while storedCycles >= 25,
 // i.e. while getBonusTime() >= 5s (the game's own BonusTime.tsx uses the same 5s cut-off).
 const gangBonusTimeThreshold = gangCyclesPerBonusUpdate * 200;
-const offStatCostPenalty = 50; // Equipment that doesn't contribute to our main stats suffers a percieved cost penalty of this multiple
+const offStatCostPenalty = 50; // Equipment that adds nothing to the member's task (score 0, e.g. agility for Terrorism) suffers a perceived cost penalty of this multiple
 const defaultMaxSpendPerTickTransientEquipment = 0.002; // If the --equipment-budget is not specified, spend up to this percent of non-reserved cash on temporary upgrades (equipment)
 const defaultMaxSpendPerTickPermanentEquipment = 0.2; // If the --augmentation-budget is not specified, spend up to this percent of non-reserved cash on permanent member upgrades
 
@@ -53,7 +54,6 @@ let strWantedReduction;
 let requiredRep = 0;
 let myGangMembers = (/**@returns{string[]}*/() => [])();
 let equipments = (/**@returns{{name: string;type: string;cost: number;stats: EquipmentStats;}[]};*/() => [])();
-let importantStats = [];
 
 let options;
 const argsSchema = [
@@ -144,7 +144,6 @@ async function initialize(ns) {
         log(ns, `SUCCESS: Created gang ${myGangFaction} (At ${formatDuration(Date.now() - resetInfo.lastNodeReset)} into BitNode)`, true, 'success');
     isHackGang = myGangInfo.isHacking;
     strWantedReduction = isHackGang ? "Ethical Hacking" : "Vigilante Justice";
-    importantStats = isHackGang ? ["hack"] : ["str", "def", "dex", "agi"];
     territoryNextTick = lastTerritoryPower = lastOtherGangInfo = null;
     territoryTickDetected = isReadyForNextTerritoryTick = warfareFinished = false;
     territoryTickWaitPadding = updateInterval;
@@ -196,7 +195,7 @@ async function initialize(ns) {
     const dictMembers = await (/**@returns{Promise<{[gangMember: string]: GangMemberInfo;}>}*/() =>
         getGangInfoDict(ns, myGangMembers, 'getMemberInformation'))();
     for (const member of Object.values(dictMembers)) // Initialize the current activity of each member
-        assignedTasks[member.name] = (member.task && member.task !== "Unassigned") ? member.task : ("Train " + (isHackGang ? "Hacking" : "Combat"));
+        assignedTasks[member.name] = (member.task && member.task !== "Unassigned") ? member.task : pickTrainingTask(memberWeights(member.name));
     while (myGangMembers.length < 3) await doRecruitMember(ns); // We should be able to recruit our first three members immediately (for free)
     // Peform all updates / actions normally performed on territory tick (every 20 seconds) once before starting the main loop
     lastLoopTime = Date.now()
@@ -263,11 +262,12 @@ async function onTerritoryTick(ns, myGangInfo) {
     if (canRecruit)
         await doRecruitMember(ns) // Recruit new members if available
     const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
-    if (!options['no-auto-ascending']) await tryAscendMembers(ns, myGangInfo); // Ascend members if we deem it a good time
+    if (!options['no-auto-ascending']) await tryAscendMembers(ns, myGangInfo, dictMembers); // Ascend members if we deem it a good time
     await tryUpgradeMembers(ns, dictMembers, myGangInfo); // Upgrade members if possible
     await enableOrDisableWarfare(ns, myGangInfo); // Update whether we should be participating in gang warfare
-    // There's a chance we do training instead of work for this next tick. If training, we primarily train our main stat, with a small chance to train less-important stats
-    const task = Math.random() >= pctTraining ? null : "Train " + (Math.random() < 0.1 ? "Charisma" : Math.random() < (isHackGang ? 0.1 : 0.9) ? "Combat" : "Hacking")
+    // There's a chance we do training instead of work for this next tick. The stat trained follows the weights of the gang's reference crime
+    // (e.g. Terrorism: 60% combat, 20% hacking, 20% charisma), since those weights are what the respect/money formulas reward.
+    const task = Math.random() >= pctTraining ? null : pickTrainingTask(memberWeights(null), Math.random());
     await updateMemberActivities(ns, dictMembers, task); // Set everyone working on the next activity
     if (!task) await optimizeGangCrime(ns, await waitForGameUpdate(ns, myGangInfo));  // Finally, see if we can improve rep gain rates by micro-optimizing individual member crimes
 }
@@ -419,7 +419,7 @@ async function doRecruitMember(ns) {
     if (i < myGangMembers.length) newMemberName += " Understudy"; // Pay our respects to the deceased
     if (await getNsDataThroughFile(ns, `ns.gang.canRecruitMember() && ns.gang.recruitMember(ns.args[0])`, '/Temp/gang-recruit-member.txt', [newMemberName])) {
         myGangMembers.push(newMemberName);
-        assignedTasks[newMemberName] = "Train " + (isHackGang ? "Hacking" : "Combat");
+        assignedTasks[newMemberName] = pickTrainingTask(memberWeights(null));
         lastMemberReset[newMemberName] = Date.now();
         log(ns, `SUCCESS: Recruited a new gang member "${newMemberName}"!`, false, 'success');
     } else {
@@ -428,8 +428,10 @@ async function doRecruitMember(ns) {
 }
 
 /** @param {NS} ns
+ * @param {GangGenInfo} myGangInfo
+ * @param {{[gangMember: string]: GangMemberInfo;}} dictMembers
  * Check if any members are deemed worth ascending to increase a stat multiplier **/
-async function tryAscendMembers(ns, myGangInfo) {
+async function tryAscendMembers(ns, myGangInfo, dictMembers) {
     const dictAscensionResults = await getGangInfoDict(ns, myGangMembers, 'getAscensionResult');
     lastAscensionResults = dictAscensionResults;
     // Ascending deducts the member's earned respect from the gang (src/Gang/Gang.ts ascendMember: respect -= res.respect).
@@ -441,15 +443,20 @@ async function tryAscendMembers(ns, myGangInfo) {
     for (let i = 0; i < myGangMembers.length; i++) {
         const member = myGangMembers[i];
         const ascResult = dictAscensionResults[member];
-        if (!ascResult || !importantStats.some(stat => ascResult[stat] >= getAscendThreshold(i)))
-            continue;
+        if (!ascResult || !dictMembers[member]) continue;
+        // Weight each stat's ascension gain by its contribution to the member's task (src/Gang/formulas/formulas.ts statWeight), so an agility
+        // gain does not trigger an ascension for a Terrorism member, and a hack or charisma gain does count.
+        const weights = memberWeights(member);
+        const ascGain = weightedAscensionGain(ascResult, dictMembers[member], weights);
+        if (ascGain < getAscendThreshold(i)) continue;
         if (guardRecruits && projectedRespect - ascResult.respect < respectNeededForNextRecruit) {
             log(ns, `INFO: Not ascending member ${member} yet: it would cost ${formatNumberShort(ascResult.respect)} respect, leaving ` +
                 `${formatNumberShort(projectedRespect - ascResult.respect)} < ${formatNumberShort(respectNeededForNextRecruit)} needed to recruit member #${myGangMembers.length + 1}.`);
             continue;
         }
         if (undefined !== (await getNsDataThroughFile(ns, `ns.gang.ascendMember(ns.args[0])`, null, [member]))) {
-            log(ns, `SUCCESS: Ascended member ${member} to increase multis by ${importantStats.map(s => `${s} -> ${ascResult[s].toFixed(2)}x`).join(", ")}`, false, 'success');
+            log(ns, `SUCCESS: Ascended member ${member}: ${referenceTaskFor(member)} stat weight x${ascGain.toFixed(2)} ` +
+                `(${gangStatKeys.filter(s => weights[s] > 0).map(s => `${s} -> ${ascResult[s].toFixed(2)}x`).join(", ")})`, false, 'success');
             lastMemberReset[member] = Date.now();
             projectedRespect -= ascResult.respect;
             delete lastAscensionResults[member]; // No longer near ascension
@@ -467,15 +474,34 @@ function getAscendThreshold(memberIndex) {
 }
 
 /** @param {number} memberIndex
- * @returns {boolean} Whether this member is within --equipment-ascend-proximity of their ascension threshold on any important stat.
+ * @param {GangMemberInfo} memberInfo
+ * @returns {boolean} Whether this member is within --equipment-ascend-proximity of their ascension threshold (task-weighted, see tryAscendMembers).
  * Equipment (but not augmentations) is cleared on ascend (src/Gang/GangMember.ts ascend(): upgrades.length = 0), so buying it now would be a waste. */
-function isNearAscension(memberIndex) {
+function isNearAscension(memberIndex, memberInfo) {
     const proximity = options['equipment-ascend-proximity'];
     if (options['no-auto-ascending'] || !(proximity > 0)) return false;
     const ascResult = lastAscensionResults[myGangMembers[memberIndex]];
-    if (!ascResult) return false;
+    if (!ascResult || !memberInfo) return false;
     const gainNeeded = (getAscendThreshold(memberIndex) - 1) * (1 - proximity);
-    return importantStats.some(stat => (ascResult[stat] - 1) >= gainNeeded);
+    return (weightedAscensionGain(ascResult, memberInfo, memberWeights(myGangMembers[memberIndex])) - 1) >= gainNeeded;
+}
+
+/** @param {string|null} memberName
+ * @returns {string} The crime whose stat weights steer this member's equipment, ascension and training: its own assigned crime, else the gang's
+ * most common assigned crime, else the top task of this gang type (nobody is on crime yet, e.g. everyone is training). null = the gang as a whole. */
+function referenceTaskFor(memberName) {
+    if (memberName != null && crimes.includes(assignedTasks[memberName])) return assignedTasks[memberName];
+    const counts = {};
+    for (const m of myGangMembers)
+        if (crimes.includes(assignedTasks[m])) counts[assignedTasks[m]] = (counts[assignedTasks[m]] || 0) + 1;
+    const mostCommon = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    return mostCommon ? mostCommon[0] : (isHackGang ? "Cyberterrorism" : "Terrorism");
+}
+
+/** @param {string|null} memberName
+ * @returns {{[stat: string]: number}} The stat weights (src/Gang/data/tasks.ts, via ns.gang.getTaskStats) of the task steering this member */
+function memberWeights(memberName) {
+    return taskStatWeights(allTaskStats[referenceTaskFor(memberName)]);
 }
 
 /** @param {NS} ns
@@ -503,24 +529,29 @@ async function tryUpgradeMembers(ns, dictMembers, myGangInfo) {
         budget /= options['reduced-budget-divisor'];
         augBudget /= options['reduced-budget-divisor'];
     }
-    // Find out what outstanding equipment can be bought within our budget
-    const nearAscension = myGangMembers.map((_, i) => isNearAscension(i));
-    for (const equip of equipments) {
-        if (augBudget <= 0) break;
-        for (const member of Object.values(dictMembers)) { // Get this equip for each member before considering the next most expensive equip
-            if (augBudget <= 0) break;
-            // Bit of a hack: Inflate the "cost" of equipment that doesn't contribute to our main stats so that we don't purchase them unless we have ample cash
-            let percievedCost = equip.cost * (Object.keys(equip.stats).some(stat => importantStats.some(i => stat.includes(i))) ? 1 : offStatCostPenalty);
-            if (percievedCost > augBudget) continue;
-            if (equip.type != "Augmentation" && percievedCost > budget) continue;
+    // Score every outstanding piece of equipment for every member by how much it raises the stat weight of the member's task (respect/money scale
+    // with sum weight_s * stat_s, src/Gang/formulas/formulas.ts, and an upgrade multiplies exactly the stats it lists, GangMember.ts applyUpgrade),
+    // then buy best value (score per dollar) first within the budgets.
+    const nearAscension = myGangMembers.map((name, i) => isNearAscension(i, dictMembers[name]));
+    const candidates = [];
+    for (const member of Object.values(dictMembers)) {
+        const weights = memberWeights(member.name);
+        for (const equip of equipments) {
+            if (member.upgrades.includes(equip.name) || member.augmentations.includes(equip.name)) continue;
             // Non-augmentation equipment is lost on ascension, so don't buy it for members about to ascend
             if (equip.type != "Augmentation" && nearAscension[myGangMembers.indexOf(member.name)]) continue;
-            if (!member.upgrades.includes(equip.name) && !member.augmentations.includes(equip.name)) {
-                purchaseOrder.push({ member: member.name, type: equip.type, equipmentName: equip.name, cost: equip.cost });
-                budget -= equip.cost;
-                augBudget -= equip.cost;
-            }
+            candidates.push({ member: member.name, equip, cost: equip.cost, score: equipmentScore(equip.stats, weights) });
         }
+    }
+    for (const { member, equip, cost, score } of rankEquipment(candidates)) {
+        if (augBudget <= 0) break;
+        // Equipment that adds nothing to the member's task only helps territory power (GangMember.ts calculatePower sums all six stats), so inflate its cost
+        const percievedCost = cost * (score > 0 ? 1 : offStatCostPenalty);
+        if (percievedCost > augBudget) continue;
+        if (equip.type != "Augmentation" && percievedCost > budget) continue;
+        purchaseOrder.push({ member, type: equip.type, equipmentName: equip.name, cost });
+        budget -= cost;
+        augBudget -= cost;
     }
     await doUpgradePurchases(ns, purchaseOrder);
 }
