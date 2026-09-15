@@ -199,6 +199,33 @@ function charset(d) {
     return NUMERIC_CHARS;
 }
 
+// 2G_cellular's timing side channel (R14). effects.ts calculateAuthenticationTime adds
+// `sharedChars * 50 * threadsFactor` ms to the authenticate delay, with threadsFactor = 1 / (1 + 0.2 (t - 1))
+// and sharedChars = getSharedChars(server.password, attempt) (Darknet.ts:125), the leading-match count that
+// the heartbleed message also reports. The extra time is added after the intelligence bonus, so the step is
+// exactly this; the base delay is measured, never computed (it depends on charisma, backdoors, SF15, ...).
+export const TIMING_TOLERANCE = 0.25;   // of a step: further from an integer than this is ambiguous
+export function timingStep(threads) {
+    const t = Math.max(1, Math.floor(Number(threads) || 1));
+    return 50 / (1 + 0.2 * (t - 1));
+}
+/** The mismatch index an attempt's own duration implies, or null when it cannot be trusted: no timing,
+ * uncalibrated, between two integers (timer jitter), or below the already confirmed prefix (the base delay
+ * drifted -- a charisma level, a stasis link made or released -- and must be recalibrated from feedback). */
+export function indexFromTiming(elapsed, base, step, prefixLength) {
+    if (!Number.isFinite(elapsed) || !Number.isFinite(base) || !(step > 0)) return null;
+    const raw = (elapsed - base) / step;
+    const idx = Math.round(raw);
+    if (Math.abs(raw - idx) > TIMING_TOLERANCE) return null;
+    if (idx < prefixLength) return null;
+    return idx;
+}
+// "Found a mismatch while checking each character (i)" -> i, or null without such a message.
+function feedbackIndex(fb) {
+    const m = String(fb?.message ?? "").match(/\((\d+)\)/);
+    return m ? Number(m[1]) : null;
+}
+
 // Worst case of solveByExactCount: (charset - 1) multiset probes, at most L*(L-1)/2 positional
 // probes (all L symbols distinct) and one final attempt = charset + L*(L-1)/2.
 function exactCountBudget(d) {
@@ -459,18 +486,41 @@ export const SOLVERS = {
     // Prefix oracle: "Found a mismatch while checking each character (i)" -- i counts
     // leading matching characters, so extending the confirmed prefix by one correct
     // character always pushes the mismatch index strictly past the prefix's old length.
-    "2G_cellular": async (d, tryPw) => {
+    // The authenticate delay encodes the same i (timingStep / indexFromTiming, R14): after one
+    // calibrating heartbleed, an attempt's own duration REJECTS a wrong guess for free (i equals
+    // the prefix length, the common case); a longer, ambiguous or uncalibrated reading buys the
+    // heartbleed for that attempt (fetchFeedback, no second authenticate) and recalibrates.
+    "2G_cellular": async (d, tryPw, opts = {}) => {
         const L = d.passwordLength, cs = charset(d);
+        const step = timingStep(opts.threads);
+        let base = null;                        // measured delay at 0 shared characters; null until the first feedback
+        const mismatchIndex = async (guess, prefixLength) => {
+            let r = await tryPw(guess, base === null);
+            if (r.success) return { success: true, idx: L };
+            let idx = feedbackIndex(r.feedback);
+            if (idx === null) {
+                const timed = indexFromTiming(r.elapsed, base, step, prefixLength);
+                if (timed === prefixLength) return { success: false, idx: timed };
+                const fb = typeof r.fetchFeedback === "function" ? await r.fetchFeedback() : null;
+                idx = feedbackIndex(fb);
+                if (idx === null) {                 // no fetcher, or another pid's line came back: once more, with feedback
+                    r = await tryPw(guess, true);
+                    if (r.success) return { success: true, idx: L };
+                    idx = feedbackIndex(r.feedback);
+                    if (idx === null) return { success: false, idx: -1 };
+                }
+            }
+            if (Number.isFinite(r.elapsed)) base = r.elapsed - idx * step;   // every feedback recalibrates
+            return { success: false, idx };
+        };
         let prefix = "";
         while (prefix.length < L) {
             let found = false;
             for (const c of cs) {
                 const guess = (prefix + c).padEnd(L, cs[0]);
-                const r = await tryPw(guess);
+                const r = await mismatchIndex(guess, prefix.length);
                 if (r.success) return guess;
-                const m = r.feedback.message.match(/\((\d+)\)/);
-                const idx = m ? Number(m[1]) : -1;
-                if (idx > prefix.length) {
+                if (r.idx > prefix.length) {
                     prefix += c;
                     found = true;
                     break;
@@ -701,8 +751,10 @@ export function budgetFor(details) {
 }
 
 // details: getServerDetails shape (modelId, passwordHint, data, passwordLength,
-// passwordFormat, difficulty, hostname). attemptFn(password) resolves to
-// {success, feedback:{code, message, data}|null}. opts: { clues, budgetScale, log }.
+// passwordFormat, difficulty, hostname). attemptFn(password, needFeedback = true) resolves to
+// {success, feedback:{code, message, data}|null, elapsed?, fetchFeedback?}: `elapsed` is the
+// authenticate duration in ms and `fetchFeedback()` fetches the feedback of that attempt later
+// (both optional; only the 2G_cellular solver reads them). opts: { clues, budgetScale, log, threads }.
 export async function solve(details, attemptFn, opts = {}) {
     const clues = opts.clues ?? [];
     const budgetScale = opts.budgetScale ?? 1;
@@ -710,10 +762,10 @@ export async function solve(details, attemptFn, opts = {}) {
     const budget = Math.floor(budgetFor(details) * budgetScale);
     let count = 0;
 
-    const tryPw = async (pw) => {
+    const tryPw = async (pw, needFeedback = true) => {
         if (count >= budget) throw new BudgetExceeded();
         count += 1;
-        const result = await attemptFn(pw);
+        const result = await attemptFn(pw, needFeedback);
         log(`#${count} "${pw}" -> ${result.success}`);
         return result;
     };
@@ -726,7 +778,7 @@ export async function solve(details, attemptFn, opts = {}) {
         const solverFn = SOLVERS[details.modelId];
         if (!solverFn) return { password: null, attempts: count, reason: "unsupported" };
 
-        const password = await solverFn(details, tryPw);
+        const password = await solverFn(details, tryPw, opts);
         if (password != null) return { password, attempts: count, reason: "solved" };
         return { password: null, attempts: count, reason: "inconsistent" };
     } catch (err) {

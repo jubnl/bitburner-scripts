@@ -32,29 +32,38 @@ export async function main(ns) {
     // Only the oracle solvers read feedback; every other model is solved by authenticate alone, which has no
     // charisma gate, so a heartbleed there would only add 1.5x the auth delay per miss or abort with 451 (R4).
     const wantsFeedback = FEEDBACK_MODELS.has(details.modelId);
+    // Heartbleed feedback for the attempt just made, or null when the newest log line is not ours (another
+    // pid's attempt landed after it). Called right after a miss, or later by the 2G_cellular solver when the
+    // attempt's own duration did not settle the question (R14).
+    const fetchFeedback = async (password) => {
+        const hb = await ns.dnet.heartbleed(target, { peek: true, logsToCapture: 1 });
+        if (!hb.success) { if (hb.code === 451) throw new Error("charisma"); throw new Error("heartbleed:" + hb.code); }
+        const fb = safeParse(hb.logs[0] ?? "", null);
+        return logMatchesAttempt(details.modelId, fb, password) ? fb : null;
+    };
     const attemptFn = async (password, needFeedback = true) => {
         if (Date.now() - claimedAt >= CLAIM_REFRESH) renewClaim();
         let incremented = false;
         for (let tries = 0; tries < 5; tries++) {
+            const startedAt = Date.now();
             const r = await ns.dnet.authenticate(target, password);
+            const elapsed = Date.now() - startedAt;             // encodes 2G_cellular's shared-prefix length (R14)
             if (r.success) {
                 if (!incremented) attempts++;
-                return { success: true, feedback: { code: 200, message: r.message, data: r.data } };
+                return { success: true, feedback: { code: 200, message: r.message, data: r.data }, elapsed };
             }
             if (r.code === 408) continue;                       // timeout: independent of correctness, retry
             if (!incremented) { attempts++; incremented = true; }
             if (r.code === 351 || r.code === 503) throw new Error("unreachable");
-            if (!wantsFeedback || !needFeedback) return { success: false, feedback: null };
-            const hb = await ns.dnet.heartbleed(target, { peek: true, logsToCapture: 1 });
-            if (!hb.success) { if (hb.code === 451) throw new Error("charisma"); throw new Error("heartbleed:" + hb.code); }
-            const fb = safeParse(hb.logs[0] ?? "", null);
-            if (!logMatchesAttempt(details.modelId, fb, password)) continue;  // not our line (race with another PID); retry
-            return { success: false, feedback: fb };
+            if (!wantsFeedback || !needFeedback) return { success: false, feedback: null, elapsed, fetchFeedback: wantsFeedback ? () => fetchFeedback(password) : null };
+            const fb = await fetchFeedback(password);
+            if (fb === null) continue;                          // not our line (race with another PID); retry
+            return { success: false, feedback: fb, elapsed };
         }
         throw new Error("timeouts");
     };
     let result;
-    try { result = await solve(details, attemptFn, { clues, log: m => ns.print(m) }); }
+    try { result = await solve(details, attemptFn, { clues, log: m => ns.print(m), threads: ns.self().threads }); }
     catch (e) { return send({ host: target, modelId: details.modelId, difficulty: details.difficulty, success: false, attempts, reason: String(e.message || e), chaReq: details.requiredCharismaSkill }); }
     if (result.password !== null) {
         known[target] = result.password; ns.write(FILES.passwords, JSON.stringify(known), "w");   // persist first

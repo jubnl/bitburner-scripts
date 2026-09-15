@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeServer, feedback } from "./darknet-mock.js";
-import { solve, BUDGETS, budgetFor } from "../darknet/solvers.js";
+import { solve, BUDGETS, budgetFor, timingStep, indexFromTiming } from "../darknet/solvers.js";
 import { logMatchesAttempt, FEEDBACK_MODELS } from "../darknet/lib.js";
 
 function detailsOf(s) {
@@ -111,4 +111,75 @@ test("logMatchesAttempt reproduces the BufferOverflow buffer rewrite and stays e
 test("every oracle solver is in FEEDBACK_MODELS and no direct solver is", () => {
     for (const modelId of ORACLE) assert.ok(FEEDBACK_MODELS.has(modelId), modelId);
     for (const modelId of [...DIRECT, "Pr0verFl0"]) assert.ok(!FEEDBACK_MODELS.has(modelId), modelId);
+});
+
+// R14: the authenticate delay itself encodes 2G_cellular's answer. effects.ts calculateAuthenticationTime adds
+// `sharedChars * 50 * threadsFactor` ms (threadsFactor = 1 / (1 + 0.2 (t - 1))) and Darknet.ts passes
+// getSharedChars(server.password, attempt) -- the same leading-match count the heartbleed message reports as
+// "(i)". So the delay may REJECT a guess for free (i == prefix length); anything else buys the heartbleed.
+test("timingStep and indexFromTiming mirror effects.ts sharedCharsExtraTime", () => {
+    assert.equal(timingStep(1), 50);
+    assert.equal(timingStep(6), 25);
+    assert.equal(timingStep(undefined), 50, "unknown thread count: the single-thread step");
+    assert.equal(indexFromTiming(4075, 4000, 25, 3), 3, "3 shared characters: wrong at index 3");
+    assert.equal(indexFromTiming(4100, 4000, 25, 3), 4, "one more: the prefix grew");
+    assert.equal(indexFromTiming(4081, 4000, 25, 3), 3, "6 ms of timer overshoot is within tolerance");
+    assert.equal(indexFromTiming(4088, 4000, 25, 3), null, "half a step off: ambiguous");
+    assert.equal(indexFromTiming(4050, 4000, 25, 3), null, "below the confirmed prefix: the base drifted");
+    assert.equal(indexFromTiming(undefined, 4000, 25, 3), null, "no timing at all");
+    assert.equal(indexFromTiming(4075, null, 25, 3), null, "uncalibrated");
+});
+
+/** An attemptFn that behaves like crack.js in the game: the mock's feedback, a delay of base + sharedChars * step
+ * (+ jitter) measured around authenticate, feedback only on request, and a lazy fetchFeedback for the attempt
+ * just made. `hb` counts the heartbleeds. */
+function timedAttempt(s, hb, { threads = 6, base = 4000, jitter = () => 0 } = {}) {
+    const step = timingStep(threads);
+    return async (pw, needFeedback = true) => {
+        const shared = [...s.password].findIndex((ch, i) => ch !== pw[i]);   // getSharedChars
+        const elapsed = base() + (shared === -1 ? s.password.length : shared) * step + jitter();
+        const f = feedback(s, pw);
+        if (f.success) return { success: true, feedback: f, elapsed };
+        if (!needFeedback) return { success: false, feedback: null, elapsed, fetchFeedback: async () => { hb.count++; return f; } };
+        hb.count++;
+        return { success: false, feedback: f, elapsed };
+    };
+}
+
+test("2G_cellular rejects wrong guesses by the authenticate delay and heartbleeds once per prefix character", async () => {
+    for (const seed of [1, 2, 3, 4, 5]) for (const difficulty of [2, 9, 17, 26]) {
+        const s = makeServer("2G_cellular", difficulty, makeRng(seed));
+        const hb = { count: 0 };
+        let attempts = 0;
+        const timed = timedAttempt(s, hb, { base: () => 4000 });
+        const r = await solve(detailsOf(s), async (pw, need) => { attempts++; return timed(pw, need); }, { threads: 6 });
+        assert.equal(r.password, s.password, `seed ${seed} d${difficulty}`);
+        assert.ok(attempts <= budgetFor(detailsOf(s)), `seed ${seed} d${difficulty} used ${attempts}`);
+        // One calibrating heartbleed on the first attempt, then one to confirm each prefix extension; the final
+        // character is the success itself and needs none.
+        assert.ok(hb.count <= s.password.length, `seed ${seed} d${difficulty}: ${hb.count} heartbleeds for L=${s.password.length}`);
+        assert.ok(hb.count < attempts, "most attempts are settled by their own duration");
+    }
+});
+
+test("2G_cellular survives timer jitter and a drifting base without a wrong prefix or an extra attempt", async () => {
+    for (const seed of [1, 2, 3]) {
+        const s = makeServer("2G_cellular", 17, makeRng(seed));
+        const plain = { count: 0 };
+        let plainAttempts = 0;
+        const quiet = timedAttempt(s, plain, { base: () => 4000 });
+        await solve(detailsOf(s), async (pw, need) => { plainAttempts++; return quiet(pw, need); }, { threads: 6 });
+
+        let calls = 0;
+        const hb = { count: 0 };
+        let attempts = 0;
+        const noisy = timedAttempt(s, hb, {
+            base: () => (calls > 20 ? 3740 : 4000),                     // a stasis link released: 7 % less delay
+            jitter: () => (++calls % 7 === 0 ? 600 : (calls % 3 === 0 ? 9 : 0)),   // a throttled timer, then small overshoot
+        });
+        const r = await solve(detailsOf(s), async (pw, need) => { attempts++; return noisy(pw, need); }, { threads: 6 });
+        assert.equal(r.password, s.password, `seed ${seed}`);
+        assert.equal(attempts, plainAttempts, "ambiguity is resolved by fetching feedback, never by re-authenticating");
+        assert.ok(hb.count < attempts, `seed ${seed}: ${hb.count} heartbleeds for ${attempts} attempts`);
+    }
 });

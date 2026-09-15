@@ -145,3 +145,11 @@ test("agent.js sizes promote with fillerPlan and a cap, and clears the resize fl
     assert.match(agent, /ns\.write\(FILES\.promoteResize, "1", "w"\)/);
     assert.match(agent, /ns\.write\(FILES\.promoteResize, "0", "w"\)/);
 });
+
+test("crack.js times each authenticate, exposes a lazy heartbleed and hands the solver its thread count", () => {
+    const crack = src("darknet/crack.js");
+    assert.match(crack, /const startedAt = Date\.now\(\);\s*\n\s*const r = await ns\.dnet\.authenticate\(target, password\);\s*\n\s*const elapsed = Date\.now\(\) - startedAt;/);
+    assert.match(crack, /threads: ns\.self\(\)\.threads/);
+    assert.match(crack, /fetchFeedback: wantsFeedback \? \(\) => fetchFeedback\(password\) : null/);
+    assert.match(crack, /const fb = await fetchFeedback\(password\);\s*\n\s*if \(fb === null\) continue;/);
+});
