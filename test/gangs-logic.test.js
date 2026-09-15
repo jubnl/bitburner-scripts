@@ -1,7 +1,7 @@
 // Pure decision helpers of gangs.js (lib/gang-logic.js) checked against the task weights and formulas of src/Gang.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick } from "../lib/gang-logic.js";
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick, retrainTargetFor, needsRetraining } from "../lib/gang-logic.js";
 
 // src/Gang/data/tasks.ts:317-332 and :295-311 (no agiWeight on either)
 const terrorism = { hackWeight: 20, strWeight: 20, defWeight: 20, dexWeight: 20, chaWeight: 20, difficulty: 36 };
@@ -108,4 +108,28 @@ test("GG-3: updates that resolved while no nextUpdate() was pending are estimate
     assert.equal(missedGangCycles(2100, 10), 10);
     assert.equal(missedGangCycles(4500, 10), 20);
     assert.equal(missedGangCycles(0, 10), 0);
+});
+
+// GG-4: ascension zeroes exp and clears equipment (GangMember.ts ascend), so the member restarts at skill ~= its ascension multiplier. Train until
+// the task-weighted, equipment-stripped stat is back to a fraction of its pre-ascension value instead of a blind 200 s.
+test("GG-4: retraining lasts until the equipment-stripped weighted stat recovers the configured fraction", () => {
+    const w = taskStatWeights(terrorism);
+    const before = { hack: 50, str: 1000, def: 1000, dex: 1000, agi: 1000, cha: 50, hack_mult: 1, str_mult: 2, def_mult: 2, dex_mult: 2, agi_mult: 2, cha_mult: 1 };
+    const target = retrainTargetFor(weightedStat(before, w, true), 0.9); // 0.9 * 0.2 * (50 + 3 * 500 + 50) = 288
+    assert.ok(Math.abs(target - 288) < 1e-9);
+    const noMults = { hack_mult: 1, str_mult: 1, def_mult: 1, dex_mult: 1, agi_mult: 1, cha_mult: 1 };
+    const justAscended = { hack: 7, str: 7, def: 7, dex: 7, agi: 7, cha: 7, ...noMults };
+    assert.equal(needsRetraining(weightedStat(justAscended, w, true), target), true);
+    const nearlyThere = { hack: 7, str: 470, def: 470, dex: 470, agi: 470, cha: 7, ...noMults }; // 0.2 * (7 + 1410 + 7) = 284.8
+    assert.equal(needsRetraining(weightedStat(nearlyThere, w, true), target), true);
+    const recovered = { hack: 7, str: 480, def: 480, dex: 480, agi: 480, cha: 7, ...noMults };  // 0.2 * (7 + 1440 + 7) = 290.8
+    assert.equal(needsRetraining(weightedStat(recovered, w, true), target), false);
+});
+
+test("GG-4: no target means no gate; a zero fraction disables it", () => {
+    assert.equal(retrainTargetFor(0, 0.9), null);
+    assert.equal(retrainTargetFor(620, 0), null);
+    assert.equal(needsRetraining(5, null), false);
+    assert.equal(needsRetraining(5, 4), false);
+    assert.equal(needsRetraining(3, 4), true);
 });

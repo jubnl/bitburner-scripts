@@ -2,7 +2,7 @@ import {
     log, getConfiguration, instanceCount, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers,
     formatMoney, formatNumberShort, formatDuration
 } from './helpers.js'
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick } from './lib/gang-logic.js'
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick, retrainTargetFor, needsRetraining } from './lib/gang-logic.js'
 
 // Global config
 const territoryTickTime = 20000; // Milliseconds between territory ticks in normal play (100 cycles x 200 ms, src/Gang/data/Constants.ts CyclesPerTerritoryAndPowerUpdate)
@@ -38,7 +38,7 @@ let multGangSoftcap = 0.0;
 let allTaskNames = (/**@returns{string[]}*/() => undefined)();
 let allTaskStats = (/**@returns{{[taskName: string]: GangTaskStats;}}*/() => undefined)();
 let assignedTasks = (/**@returns{{[gangMemberName: string]: string;}}*/() => ({}))(); // Each member will independently attempt to scale up the crime they perform until they are ineffective or we start generating wanted levels
-let lastMemberReset = {}; // Tracks when each member last ascended
+let retrainTarget = {}; // Member -> task-weighted, equipment-stripped stat to train back up to after an ascension / recruit (null = no gate), see needsRetraining
 let lastAscensionResults = {}; // Most recent ns.gang.getAscensionResult() per member (used to avoid buying soon-to-be-lost equipment)
 
 // Global state
@@ -55,12 +55,12 @@ let equipments = (/**@returns{{name: string;type: string;cost: number;stats: Equ
 let options;
 const argsSchema = [
     ['training-percentage', 0.05], // Spend this percent of time randomly training gang members versus doing crime
-    ['no-training', false], // Don't train unless all other tasks generate no gains or the member ascended recently (--min-training-ticks)
+    ['no-training', false], // Don't train unless all other tasks generate no gains or the member is rebuilding after an ascension / recruit (--retrain-recovery-fraction)
     ['no-auto-ascending', false], // Don't ascend members
     ['ascend-multi-threshold', 1.05], // Ascend member #12 if a primary stat multi would increase by more than this amount
     ['ascend-multi-threshold-spacing', 0.05], // Members will space their acention multis by this amount to ensure they are ascending at different rates
     // Note: given the above two defaults, members would ascend at multis [1.6, 1.55, 1.50, ..., 1.1, 1.05] once you have 12 members.
-    ['min-training-ticks', 10], // Require this many ticks of training after ascending or recruiting to rebuild stats
+    ['retrain-recovery-fraction', 0.9], // After ascending, keep a member training until its task-weighted stats (equipment excluded) recover this fraction of their pre-ascension value; recruits train until they reach this fraction of the weakest existing member. Members still retraining are not ascended again. 0 to disable.
     ['reserve', null], // Reserve this much cash before determining spending budgets (defaults to contents of reserve.txt if not specified)
     ['augmentations-budget', null], // Percentage of non-reserved cash to spend per tick on permanent member upgrades (If not specified, uses defaultMaxSpendPerTickPermanentEquipment)
     ['equipment-budget', null], // Percentage of non-reserved cash to spend per tick on permanent member upgrades (If not specified, uses defaultMaxSpendPerTickTransientEquipment)
@@ -192,7 +192,7 @@ async function initialize(ns) {
         getGangInfoDict(ns, myGangMembers, 'getMemberInformation'))();
     for (const member of Object.values(dictMembers)) // Initialize the current activity of each member
         assignedTasks[member.name] = (member.task && member.task !== "Unassigned") ? member.task : pickTrainingTask(memberWeights(member.name));
-    while (myGangMembers.length < 3) await doRecruitMember(ns); // We should be able to recruit our first three members immediately (for free)
+    while (myGangMembers.length < 3) await doRecruitMember(ns, dictMembers); // We should be able to recruit our first three members immediately (for free)
     // Peform all updates / actions normally performed on territory tick (every 20 seconds) once before starting the main loop
     await onTerritoryTick(ns);
 }
@@ -265,7 +265,7 @@ async function onTerritoryTick(ns) {
     }
     const canRecruit = await getNsDataThroughFile(ns, 'ns.gang.canRecruitMember()');
     if (canRecruit) {
-        await doRecruitMember(ns); // Recruit new members if available
+        await doRecruitMember(ns, dictMembers); // Recruit new members if available
         dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
     }
     if (!options['no-auto-ascending']) await tryAscendMembers(ns, myGangInfo, dictMembers); // Ascend members if we deem it a good time
@@ -307,6 +307,12 @@ async function updateMemberActivities(ns, dictMemberInfo = null, forceTask = nul
  * Logic to assign tasks that maximize rep gain rate without wanted gain getting out of control **/
 async function optimizeGangCrime(ns, myGangInfo) {
     const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
+    // Members that have recovered their pre-ascension stats (task-weighted, equipment excluded) may leave training
+    for (const member of myGangMembers)
+        if (retrainTarget[member] != null && !needsRetraining(weightedStat(dictMembers[member], memberWeights(member), true), retrainTarget[member])) {
+            log(ns, `INFO: ${member} has recovered its pre-ascension stats (task-weighted ${retrainTarget[member].toFixed(0)}). Returning to crime.`);
+            delete retrainTarget[member];
+        }
     // Tolerate our wanted level increasing, as long as reputation increases several orders of magnitude faster and we do not currently have a penalty worse than --wanted-penalty-threshold
     let currentWantedPenalty = getWantedPenalty(myGangInfo) - 1;
     // The game (src/Gang/Gang.ts processGains) applies wanted = (old + gain * cycles) * (1 - 0.001 * justice) per update, where "justice" is the
@@ -358,9 +364,10 @@ async function optimizeGangCrime(ns, myGangInfo) {
             const taskRates = memberTaskRates[member];
             // "Greedy" optimize one member at a time, but as we near the end of the list, we can no longer expect future members to make for wanted increases
             const sustainableTasks = (index < myGangMembers.length - 2) ? taskRates : taskRates.filter(c => (totalWanted + c.wanted) <= wantedGainTolerance);
-            // Find the crime with the best gain (If we can't generate value for any tasks, then we should only be training)
-            const bestTask = taskRates[0][optStat] == 0 || (Date.now() - (lastMemberReset[member] || 0) < options['min-training-ticks'] * territoryTickTime) ?
-                taskRates.find(t => t.name === ("Train " + (isHackGang ? "Hacking" : "Combat"))) :
+            // Find the crime with the best gain (If we can't generate value for any tasks, or the member is still rebuilding stats after an
+            // ascension / recruit (retrainTarget), then we should only be training the stats its task weights most)
+            const bestTask = taskRates[0][optStat] == 0 || retrainTarget[member] != null ?
+                taskRates.find(t => t.name === pickTrainingTask(memberWeights(member))) :
                 (totalWanted > wantedGainTolerance || sustainableTasks.length == 0) ? taskRates.find(t => t.name === strWantedReduction) : sustainableTasks[0];
             [proposedTasks[member], totalWanted, totalGain] = [bestTask, totalWanted + bestTask.wanted, totalGain + bestTask[optStat]];
         });
@@ -418,16 +425,19 @@ async function fixWantedGainRate(ns, myGangInfo, wantedGainTolerance = 0) {
 }
 
 /** @param {NS} ns
+ * @param {{[gangMember: string]: GangMemberInfo;}|null} dictMembers Current members (used to size the recruit's training target)
  * Recruit new members if available **/
-async function doRecruitMember(ns) {
+async function doRecruitMember(ns, dictMembers = null) {
     let i = 0, newMemberName;
     do { newMemberName = `Thug ${++i}`; } while (myGangMembers.includes(newMemberName) || myGangMembers.includes(newMemberName + " Understudy"));
     if (i < myGangMembers.length) newMemberName += " Understudy"; // Pay our respects to the deceased
     if (await getNsDataThroughFile(ns, `ns.gang.canRecruitMember() && ns.gang.recruitMember(ns.args[0])`, '/Temp/gang-recruit-member.txt', [newMemberName])) {
         myGangMembers.push(newMemberName);
         assignedTasks[newMemberName] = pickTrainingTask(memberWeights(null));
-        lastMemberReset[newMemberName] = Date.now();
-        log(ns, `SUCCESS: Recruited a new gang member "${newMemberName}"!`, false, 'success');
+        // Train the recruit until it catches up with the weakest existing member (task-weighted, equipment excluded)
+        const weakest = Math.min(...Object.values(dictMembers ?? {}).map(m => weightedStat(m, memberWeights(m.name), true)));
+        retrainTarget[newMemberName] = Number.isFinite(weakest) ? retrainTargetFor(weakest, options['retrain-recovery-fraction']) : null;
+        log(ns, `SUCCESS: Recruited a new gang member "${newMemberName}"!` + (retrainTarget[newMemberName] ? ` Training until task-weighted stats reach ${retrainTarget[newMemberName].toFixed(0)}.` : ''), false, 'success');
     } else {
         log(ns, `ERROR: Failed to recruit a new gang member "${newMemberName}"!`, false, 'error');
     }
@@ -453,6 +463,8 @@ async function tryAscendMembers(ns, myGangInfo, dictMembers) {
         // Weight each stat's ascension gain by its contribution to the member's task (src/Gang/formulas/formulas.ts statWeight), so an agility
         // gain does not trigger an ascension for a Terrorism member, and a hack or charisma gain does count.
         const weights = memberWeights(member);
+        // Still rebuilding from the last ascension / recruit: ascending again now would compound the exp loss (GangMember.ts ascend zeroes all exp)
+        if (needsRetraining(weightedStat(dictMembers[member], weights, true), retrainTarget[member])) continue;
         const ascGain = weightedAscensionGain(ascResult, dictMembers[member], weights);
         if (ascGain < getAscendThreshold(i)) continue;
         if (guardRecruits && projectedRespect - ascResult.respect < respectNeededForNextRecruit) {
@@ -463,7 +475,7 @@ async function tryAscendMembers(ns, myGangInfo, dictMembers) {
         if (undefined !== (await getNsDataThroughFile(ns, `ns.gang.ascendMember(ns.args[0])`, null, [member]))) {
             log(ns, `SUCCESS: Ascended member ${member}: ${referenceTaskFor(member)} stat weight x${ascGain.toFixed(2)} ` +
                 `(${gangStatKeys.filter(s => weights[s] > 0).map(s => `${s} -> ${ascResult[s].toFixed(2)}x`).join(", ")})`, false, 'success');
-            lastMemberReset[member] = Date.now();
+            retrainTarget[member] = retrainTargetFor(weightedStat(dictMembers[member], weights, true), options['retrain-recovery-fraction']); // Pre-ascension value (dictMembers predates the ascend)
             projectedRespect -= ascResult.respect;
             delete lastAscensionResults[member]; // No longer near ascension
         }
