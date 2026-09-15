@@ -1,7 +1,7 @@
 // Pure decision helpers of gangs.js (lib/gang-logic.js) checked against the task weights and formulas of src/Gang.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask } from "../lib/gang-logic.js";
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick } from "../lib/gang-logic.js";
 
 // src/Gang/data/tasks.ts:317-332 and :295-311 (no agiWeight on either)
 const terrorism = { hackWeight: 20, strWeight: 20, defWeight: 20, dexWeight: 20, chaWeight: 20, difficulty: 36 };
@@ -90,4 +90,22 @@ test("GG-1: referenceTask picks the member's own crime if it is one, else the ga
     // Path 4 (bootstrap fallback): nobody in the pool is on a crime yet (everyone training or Unassigned).
     const noCrimes = { Thug1: "Train Combat", Thug2: "Unassigned", Thug3: "Train Hacking" };
     assert.equal(referenceTask(noCrimes, ["Thug1", "Thug2", "Thug3"], crimes, "Terrorism"), "Terrorism");
+});
+
+// GG-3: territory/power are processed once every 100 gang cycles (Constants.ts CyclesPerTerritoryAndPowerUpdate), i.e. during every 10th
+// normal update (10 cycles each) or every 4th bonus-time update (25 cycles each). ns.gang.nextUpdate() resolves with cycles * 200 ms.
+test("GG-3: the update after 90 counted cycles carries the territory tick", () => {
+    assert.equal(nextUpdateHasTerritoryTick(80, 10), false);
+    assert.equal(nextUpdateHasTerritoryTick(90, 10), true);
+    assert.equal(nextUpdateHasTerritoryTick(95, 10), true);
+    assert.equal(nextUpdateHasTerritoryTick(null, 10), false);
+    assert.equal(nextUpdateHasTerritoryTick(75, 25), true); // bonus time: 4 updates of 25 cycles
+    assert.equal(nextUpdateHasTerritoryTick(50, 25), false);
+});
+
+test("GG-3: updates that resolved while no nextUpdate() was pending are estimated from the wall clock (one per 2 s)", () => {
+    assert.equal(missedGangCycles(1900, 10), 0);
+    assert.equal(missedGangCycles(2100, 10), 10);
+    assert.equal(missedGangCycles(4500, 10), 20);
+    assert.equal(missedGangCycles(0, 10), 0);
 });

@@ -2,10 +2,10 @@ import {
     log, getConfiguration, instanceCount, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers,
     formatMoney, formatNumberShort, formatDuration
 } from './helpers.js'
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask, referenceTask } from './lib/gang-logic.js'
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask, referenceTask, missedGangCycles, nextUpdateHasTerritoryTick } from './lib/gang-logic.js'
 
 // Global config
-const updateInterval = 200; // We can improve our timing by updating more often than gang stats do (which is every 2 seconds for stats, every 20 seconds for territory)
+const territoryTickTime = 20000; // Milliseconds between territory ticks in normal play (100 cycles x 200 ms, src/Gang/data/Constants.ts CyclesPerTerritoryAndPowerUpdate)
 let wantedPenaltyThreshold = 0.01; // Don't let the wanted penalty get worse than this (overridden by --wanted-penalty-threshold)
 // Game (src/Gang/Gang.ts process / src/Gang/data/Constants.ts): gang gains are processed once storedCycles >= minCyclesToProcess (10 cycles = 2s),
 // and at most maxCyclesToProcess (25 cycles = 5s) per 200ms engine tick. So the game runs 1 cycle/tick normally, 25 cycles/tick in bonus time.
@@ -22,16 +22,12 @@ const defaultMaxSpendPerTickPermanentEquipment = 0.2; // If the --augmentation-b
 // Territory-related variables
 const gangsByPower = ["Speakers for the Dead", "The Dark Army", "The Syndicate", "Tetrads", "Slum Snakes", /* Hack gangs don't scale as far */ "The Black Hand", /* "NiteSec" Been there, not fun. */]
 const territoryEngageThreshold = 0.60; // Minimum average win chance (of gangs with territory) before we engage other clans
-let territoryTickDetected = false;
-let territoryTickTime = 20000; // Est. milliseconds until territory *ticks*. Can vary if processing offline time
-let territoryTickWaitPadding = 200; // Start waiting this many milliseconds before we think territory will tick, in case it ticks early (increases automatically after misfires)
-let consecutiveTerritoryDetections = 0; // Used to reduce padding if things get back on track.
-let territoryNextTick = null; // The next time territory will tick
-let isReadyForNextTerritoryTick = false;
+const territoryCyclesPerTick = 100; // src/Gang/data/Constants.ts CyclesPerTerritoryAndPowerUpdate: territory/power are processed once every 100 gang cycles (every 10th normal update)
+let cyclesSinceTerritoryTick = null; // Gang cycles processed since the last observed territory tick (null until the first one is observed)
+let lastUpdateResolvedAt = 0; // Date.now() when ns.gang.nextUpdate() last resolved, to estimate updates that passed while we were busy (no resolver pending)
+let isReadyForNextTerritoryTick = false; // True while members have been moved to Territory Warfare for the coming tick
 let warfareFinished = false;
-let lastTerritoryPower = 0;
 let lastOtherGangInfo = null;
-let lastLoopTime = null;
 
 // Crime activity-related variables
 const crimes = ["Mug People", "Deal Drugs", "Strongarm Civilians", "Run a Con", "Armed Robbery", "Traffick Illegal Arms", "Threaten & Blackmail", "Human Trafficking", "Terrorism",
@@ -76,7 +72,6 @@ const argsSchema = [
     ['full-budget-min-cash', 1e9], // Use the full equipment/augmentation budgets once we have this much cash (else they are divided by --reduced-budget-divisor)
     ['full-budget-min-gang-income', 1e6], // ...or once gang income exceeds this much per second
     ['reduced-budget-divisor', 100], // Budgets are divided by this until one of the above conditions (or 4S data ownership) is met
-    ['disable-next-update', false], // Set to true to poll for gang updates (legacy) rather than awaiting ns.gang.nextUpdate()
 ];
 
 export function autocomplete(data, _) {
@@ -101,8 +96,8 @@ export async function main(ns) {
         catch (err) {
             log(ns, `WARNING: gangs.js Caught (and suppressed) an unexpected error in the main loop:\n` +
                 (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false, 'warning');
+            await ns.sleep(1000);
         }
-        await ns.sleep(updateInterval);
     }
 }
 
@@ -144,9 +139,9 @@ async function initialize(ns) {
         log(ns, `SUCCESS: Created gang ${myGangFaction} (At ${formatDuration(Date.now() - resetInfo.lastNodeReset)} into BitNode)`, true, 'success');
     isHackGang = myGangInfo.isHacking;
     strWantedReduction = isHackGang ? "Ethical Hacking" : "Vigilante Justice";
-    territoryNextTick = lastTerritoryPower = lastOtherGangInfo = null;
-    territoryTickDetected = isReadyForNextTerritoryTick = warfareFinished = false;
-    territoryTickWaitPadding = updateInterval;
+    cyclesSinceTerritoryTick = lastOtherGangInfo = null;
+    lastUpdateResolvedAt = 0;
+    isReadyForNextTerritoryTick = warfareFinished = false;
 
     // If possible, determine how much rep we would need to get the most expensive unowned augmentation
     const sf4Level = ownedSourceFiles[4] || 0;
@@ -198,70 +193,66 @@ async function initialize(ns) {
         assignedTasks[member.name] = (member.task && member.task !== "Unassigned") ? member.task : pickTrainingTask(memberWeights(member.name));
     while (myGangMembers.length < 3) await doRecruitMember(ns); // We should be able to recruit our first three members immediately (for free)
     // Peform all updates / actions normally performed on territory tick (every 20 seconds) once before starting the main loop
-    lastLoopTime = Date.now()
-    await onTerritoryTick(ns, myGangInfo);
-    lastTerritoryPower = myGangInfo.power;
+    await onTerritoryTick(ns);
 }
 
 /** @param {NS} ns
- * Executed every `interval` **/
+ * Executed once per gang update (every 2 s in normal play, every 200 ms in bonus time) **/
 async function mainLoop(ns) {
-    // Update gang information (specifically monitoring gang power to see when territory ticks)
-    const myGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
-    const thisLoopStart = Date.now();
-    if (!territoryTickDetected) { // Detect the first territory tick by watching for other gang's territory power to update.
-        const otherGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getAllGangInformation()'); // Returns dict of { [gangName]: { "power": Number, "territory": Number } }
-        if (lastOtherGangInfo != null && JSON.stringify(otherGangInfo) != JSON.stringify(lastOtherGangInfo)) {
-            territoryNextTick = lastLoopTime + territoryTickTime;
-            territoryTickDetected = true;
-            log(ns, `INFO: Others gangs power updated (sometime in the past ${formatDuration(thisLoopStart - lastLoopTime)}. ` +
-                `Will start waiting for next tick in: ${formatDuration(territoryNextTick - thisLoopStart - territoryTickWaitPadding)}`, false);
-        } else if (lastOtherGangInfo == null)
-            log(ns, `INFO: Waiting to detect territory to tick. (Waiting for other gangs' power to update.) Will check every ${formatDuration(updateInterval)}...`);
-        lastOtherGangInfo = otherGangInfo;
-    }
-    // If territory is close to ticking, quick - set everyone to do "territory warfare"! Once we hit 100% territory, there's no need to keep swapping members to warfare
-    if (!warfareFinished && !isReadyForNextTerritoryTick && (thisLoopStart + updateInterval + territoryTickWaitPadding >= territoryNextTick)) { // Start 1 second early to be safe
+    const processedCycles = await awaitGangUpdate(ns); // 0 GB; resolves right after the game processes gang gains (src/Gang/Gang.ts process)
+    // Every territory tick gives every NPC gang a power gain (src/Gang/Gang.ts processTerritoryAndPowerGains), so a change in their info marks a tick
+    const otherGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getAllGangInformation()'); // Returns dict of { [gangName]: { "power": Number, "territory": Number } }
+    const tickObserved = lastOtherGangInfo != null && JSON.stringify(otherGangInfo) != JSON.stringify(lastOtherGangInfo);
+    lastOtherGangInfo = otherGangInfo;
+    if (tickObserved) {
+        if (cyclesSinceTerritoryTick == null)
+            log(ns, `INFO: Observed a territory tick. Members will be moved to Territory Warfare for the one update that carries each tick (every ${territoryCyclesPerTick} cycles).`);
+        else if (Math.abs(cyclesSinceTerritoryTick - territoryCyclesPerTick) > processedCycles)
+            log(ns, `INFO: Territory ticked after ${cyclesSinceTerritoryTick} counted cycles (expected ${territoryCyclesPerTick}). Resynchronizing.`);
+        cyclesSinceTerritoryTick = 0;
+        await onTerritoryTick(ns); // Do most things only once per territory tick (restores crime tasks first)
+    } else if (!warfareFinished && !isReadyForNextTerritoryTick && nextUpdateHasTerritoryTick(cyclesSinceTerritoryTick, getGangCyclesPerUpdate(ns), territoryCyclesPerTick)) {
+        // The next update carries the territory tick, and power is computed from whoever is on Territory Warfare at that moment (Gang.ts calculatePower)
         isReadyForNextTerritoryTick = true;
-        await updateMemberActivities(ns, null, "Territory Warfare", myGangInfo);
+        await updateMemberActivities(ns, null, "Territory Warfare", await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()'));
     }
-    // Detect if territory power has been updated in the last tick (or if we have no power, assume it has ticked and we just haven't generated power yet)
-    if ((isReadyForNextTerritoryTick && myGangInfo.power != lastTerritoryPower) || (thisLoopStart > territoryNextTick + 5000 /* Wait up to 5 additional seconds in case time was wonkey */)) {
-        await onTerritoryTick(ns, myGangInfo); //Do most things only once per territory tick
-        isReadyForNextTerritoryTick = false;
-        lastTerritoryPower = myGangInfo.power;
-    } else if (isReadyForNextTerritoryTick)
-        log(ns, `INFO: Waiting for territory to tick. (Waiting for gang power to change from ${formatNumberShort(lastTerritoryPower)}. ETA: ${formatDuration(territoryNextTick - thisLoopStart)}`);
-    lastLoopTime = thisLoopStart; // Due to periodic lag, we must track the last time we checked, can't assume it was `updateInterval` ago.
+}
+
+/** Await the next gang update (ns.gang.nextUpdate(), 0 GB) and keep the territory cycle counter up to date.
+ * @param {NS} ns
+ * @returns {Promise<number>} The number of gang cycles the update processed **/
+async function awaitGangUpdate(ns) {
+    // Updates that happen while no nextUpdate() promise is pending are not reported (Gang.ts: the resolver is created on demand), so estimate those
+    // from the wall clock: one update per 2 s in normal play. The counter is not used in bonus time (see mainLoop), so no estimate is needed there.
+    if (cyclesSinceTerritoryTick != null && lastUpdateResolvedAt > 0 && getGangCyclesPerUpdate(ns) == gangCyclesPerNormalUpdate)
+        cyclesSinceTerritoryTick += missedGangCycles(Date.now() - lastUpdateResolvedAt, gangCyclesPerNormalUpdate);
+    const processedMs = await ns.gang.nextUpdate(); // Resolves with cycles * 200 ms (src/Gang/Gang.ts process: GangPromise.resolve(cycles * MilliPerCycle))
+    lastUpdateResolvedAt = Date.now();
+    const processedCycles = Math.round(processedMs / 200);
+    if (cyclesSinceTerritoryTick != null) cyclesSinceTerritoryTick += processedCycles;
+    return processedCycles;
 }
 
 /** @param {NS} ns
  * Do some things only once per territory tick **/
-async function onTerritoryTick(ns, myGangInfo) {
-    // Reset the time the next tick will occur. In bonus time, the game processes 25 cycles per 200ms engine tick instead of 1
-    // (src/Gang/Gang.ts process(): Math.min(storedCycles, maxCyclesToProcess=25)), so territory ticks 25x faster.
-    territoryNextTick = lastLoopTime + territoryTickTime / (ns.gang.getBonusTime() >= gangBonusTimeThreshold ? gangCyclesPerBonusUpdate : 1);
-    if (lastTerritoryPower != myGangInfo.power || lastTerritoryPower == null) {
-        log(ns, `Territory power updated from ${formatNumberShort(lastTerritoryPower)} to ${formatNumberShort(myGangInfo.power)}.`)
-        consecutiveTerritoryDetections++;
-        if (consecutiveTerritoryDetections > 5 && territoryTickWaitPadding > updateInterval)
-            territoryTickWaitPadding = Math.max(updateInterval, territoryTickWaitPadding - updateInterval);
-    } else if (!warfareFinished) {
-        log(ns, `WARNING: Power stats weren't updated, assuming we've lost track of territory tick`, false,
-            consecutiveTerritoryDetections == 0 ? 'warning' : null); // Only pop-up a warning if this happens two territory ticks in a row (or more)
-        consecutiveTerritoryDetections = 0;
-        territoryTickWaitPadding = Math.min(2000, territoryTickWaitPadding + updateInterval); // Start waiting earlier to account for observed lag.
-        territoryNextTick -= updateInterval; // Prep for the next tick a little earlier, in case we just lagged behind the tick by a bit.
-        territoryTickDetected = false;
-        lastOtherGangInfo = null;
-    }
-
+async function onTerritoryTick(ns) {
+    const myGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
+    log(ns, `Territory tick: power ${formatNumberShort(myGangInfo.power)}, territory ${(100 * myGangInfo.territory).toFixed(2)}%`);
     // Update gang members in case someone died in a clash
     myGangMembers = await getNsDataThroughFile(ns, 'ns.gang.getMemberNames()');
+    let dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
+    // First thing: members moved to Territory Warfare for the tick go back to their crimes. Every update spent on warfare forfeits that update's
+    // respect/money for the whole gang (Gang.ts processGains reads member.getTask() at each update), so this must not wait for the housekeeping below.
+    if (isReadyForNextTerritoryTick) {
+        await updateMemberActivities(ns, dictMembers);
+        Object.values(dictMembers).forEach(m => m.task = assignedTasks[m.name] ?? m.task); // Keep our copy in step so the call below doesn't re-issue the same orders
+        isReadyForNextTerritoryTick = false;
+    }
     const canRecruit = await getNsDataThroughFile(ns, 'ns.gang.canRecruitMember()');
-    if (canRecruit)
-        await doRecruitMember(ns) // Recruit new members if available
-    const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
+    if (canRecruit) {
+        await doRecruitMember(ns); // Recruit new members if available
+        dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
+    }
     if (!options['no-auto-ascending']) await tryAscendMembers(ns, myGangInfo, dictMembers); // Ascend members if we deem it a good time
     await tryUpgradeMembers(ns, dictMembers, myGangInfo); // Upgrade members if possible
     await enableOrDisableWarfare(ns, myGangInfo); // Update whether we should be participating in gang warfare
@@ -581,31 +572,15 @@ let sequentialMisfires = 0;
 async function waitForGameUpdate(ns, oldGangInfo) {
     if (!myGangMembers.some(member => !assignedTasks[member].includes("Train")))
         return oldGangInfo; // Ganginfo will never change if all members are training, so don't wait for an update
-    const maxWaitTime = 2500;
-    const waitInterval = 100;
-    const start = Date.now()
-    var latestGangInfo;
-    if (!options['disable-next-update']) {
-        // ns.gang.nextUpdate() (0 GB, src/Netscript/RamCostGenerator.ts CycleTiming) resolves right after the game next processes gang gains
-        // (src/Gang/Gang.ts process()), so this is both faster and more precise than polling. It resolves within 2s (much less in bonus time).
-        await ns.gang.nextUpdate();
-        latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
-        if (JSON.stringify(latestGangInfo) != JSON.stringify(oldGangInfo)) {
-            sequentialMisfires = 0;
-            return latestGangInfo;
-        }
-    } else while (Date.now() < start + maxWaitTime) {
-        latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
-        if (JSON.stringify(latestGangInfo) != JSON.stringify(oldGangInfo)) {
-            sequentialMisfires = 0;
-            return latestGangInfo;
-        }
-        await ns.sleep(Math.min(waitInterval, start + maxWaitTime - Date.now()));
+    await awaitGangUpdate(ns); // Resolves right after the game next processes gang gains (within 2 s, much less in bonus time), keeping the tick counter in step
+    const latestGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
+    if (JSON.stringify(latestGangInfo) != JSON.stringify(oldGangInfo)) {
+        sequentialMisfires = 0;
+        return latestGangInfo;
     }
     sequentialMisfires++;
-    log(ns, `WARNING: Max wait time ${maxWaitTime} exceeded while waiting for old gang info to update.\n${JSON.stringify(oldGangInfo)}\n===\n${JSON.stringify(latestGangInfo)}`,
+    log(ns, `WARNING: Gang info did not change across a gang update.\n${JSON.stringify(oldGangInfo)}\n===\n${JSON.stringify(latestGangInfo)}`,
         false, sequentialMisfires < 2 ? null : 'warning'); // Only pop-up an alert if this happens twice in a row (or more)
-    territoryTickDetected = false;
     return latestGangInfo;
 }
 
