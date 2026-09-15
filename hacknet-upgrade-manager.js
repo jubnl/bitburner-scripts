@@ -38,8 +38,9 @@ export async function main(ns) {
         (maxSpend == Number.MAX_VALUE ? 'no spending limit' : `a spend limit of ${formatMoney(maxSpend)}`) +
         `. Current fleet: ${ns.hacknet.numNodes()} nodes...`);
     do {
+        let moneySpent = 0;
         try {
-            const moneySpent = upgradeHacknet(ns, maxSpend, maxPayoffTime, options);
+            moneySpent = upgradeHacknet(ns, maxSpend, maxPayoffTime, options);
             // Using this method, we cannot know for sure that we don't have hacknet servers until we have purchased one
             if (haveHacknetServers && ns.hacknet.numNodes() > 0 && ns.hacknet.hashCapacity() == 0)
                 haveHacknetServers = false;
@@ -53,13 +54,21 @@ export async function main(ns) {
             setStatus(ns, `WARNING: hacknet-upgrade-manager.js Caught (and suppressed) an unexpected error in the main loop:\n` +
                 (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false, 'warning');
         }
-        if (continuous) await ns.sleep(interval);
+        if (continuous) await ns.sleep(nextLoopDelay(interval, moneySpent));
     } while (continuous);
 }
 
 let lastUpgradeLog = "";
 function setStatus(ns, logMessage) {
     if (logMessage != lastUpgradeLog) ns.print(lastUpgradeLog = logMessage);
+}
+
+const minIdleInterval = 200; // HN-2: ms between loops when nothing was bought (e.g. daemon's --interval 0 kick-start waiting for money) instead of ns.sleep(0) spinning ~5 API calls per node per frame
+
+/** HN-2: delay before the next continuous-mode loop: --interval after a successful purchase, at least minIdleInterval otherwise.
+ * @param {number} interval @param {number|false} moneySpent upgradeHacknet's return value @param {number} idleInterval */
+export function nextLoopDelay(interval, moneySpent, idleInterval = minIdleInterval) {
+    return moneySpent > 0 ? interval : Math.max(interval, idleInterval);
 }
 
 // HN-1: upgrade cost constants from src/Hacknet/data/Constants.ts (HacknetNodeConstants / HacknetServerConstants)
