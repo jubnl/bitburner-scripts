@@ -28,7 +28,7 @@ let inversionAgreementThreshold = 6; // If this many stocks are detected as bein
 const expectedTickTime = 6000;
 const catchUpTickTime = 4000;
 let lastTick = 0;
-let sleepInterval = 1000;
+let sleepInterval = 1000; // Only used while waiting for TIX API access. SM-2: the trading loop waits on ns.stock.nextUpdate() (0 GB) instead of polling
 let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information about the current bitnode
 let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)();
 
@@ -170,7 +170,7 @@ export async function main(ns) {
             else if (hudElement) hudElement.innerText = "$0.000 ";
             if (pre4s && allStocks[0].priceHistory.length < minTickHistory) {
                 log(ns, `Building a history of stock prices (${allStocks[0].priceHistory.length}/${minTickHistory})...`);
-                await ns.sleep(sleepInterval);
+                await ns.stock.nextUpdate();
                 continue;
             }
 
@@ -237,7 +237,9 @@ export async function main(ns) {
             log(ns, `WARNING: stockmaster.js Caught (and suppressed) an unexpected error in the main loop:\n` +
                 (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false, 'warning');
         }
-        await ns.sleep(sleepInterval);
+        // SM-2: prices, forecasts, volatility and positions only change on a market tick (src/StockMarket/StockMarket.ts processStockPrices,
+        // every 6 s or 4 s when catching up) or through our own trades (which `continue` above), so wait for the next tick (0 GB).
+        await ns.stock.nextUpdate();
     }
 }
 
@@ -275,6 +277,22 @@ async function getStockInfoDict(ns, stockFunction) {
         `/Temp/stock-${stockFunction}.txt`, allStockSymbols);
 };
 
+/** SM-2: collect ask price, bid price, (with 4S) volatility and forecast, and (unless mocking) our position for every symbol with a
+ * single temporary script, instead of one temp script per stock function. The temp script differs pre/post 4S and in mock mode, so
+ * each variant gets its own file name (helpers.js warns whenever a temp script is overwritten with different contents).
+ * Temp script RAM: 4S variant 2+2+2.5+2.5+2 + 1.6 base = 12.6 GB, pre-4S 7.6 GB (src/Netscript/RamCostGenerator.ts GetStock/BuySellStock).
+ * @param {NS} ns @param {boolean} has4s
+ * @returns {Promise<{[sym: string]: [number, number, number|null, number|null, [number, number, number, number]|null]}>} */
+async function getStockRefreshDict(ns, has4s) {
+    allStockSymbols ??= await getStockSymbols(ns);
+    if (allStockSymbols == null) throw new Error(`No WSE API Access yet, this call to refresh stock info is premature.`);
+    const perSymbol = `[ns.stock.getAskPrice(sym), ns.stock.getBidPrice(sym), ` +
+        (has4s ? `ns.stock.getVolatility(sym), ns.stock.getForecast(sym)` : `null, null`) + `, ` +
+        (mock ? `null` : `ns.stock.getPosition(sym)`) + `]`;
+    return await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(sym => [sym, ${perSymbol}]))`,
+        `/Temp/stock-refresh${has4s ? '-4s' : '-pre4s'}${mock ? '-mock' : ''}.txt`, allStockSymbols);
+}
+
 /** @param {NS} ns **/
 async function initAllStocks(ns) {
     let dictMaxShares = await getStockInfoDict(ns, 'getMaxShares'); // Only need to get this once, it never changes
@@ -310,12 +328,9 @@ async function initAllStocks(ns) {
 async function refresh(ns, has4s, allStocks, myStocks) {
     let holdings = 0;
 
-    // Dodge hefty RAM requirements by spawning a sequence of temporary scripts to collect info for us one function at a time
-    const dictAskPrices = await getStockInfoDict(ns, 'getAskPrice');
-    const dictBidPrices = await getStockInfoDict(ns, 'getBidPrice');
-    const dictVolatilities = !has4s ? null : await getStockInfoDict(ns, 'getVolatility');
-    const dictForecasts = !has4s ? null : await getStockInfoDict(ns, 'getForecast');
-    const dictPositions = mock ? null : await getStockInfoDict(ns, 'getPosition');
+    // SM-2: dodge the hefty RAM requirements of the stock functions with ONE temporary script that collects every value for every symbol
+    const dictStockInfo = await getStockRefreshDict(ns, has4s);
+    const dictAskPrices = Object.fromEntries(allStocks.map(stk => [stk.sym, dictStockInfo[stk.sym][0]]));
     const ticked = allStocks.some(stk => stk.ask_price != dictAskPrices[stk.sym]); // If any price has changed since our last update, the stock market has "ticked"
 
     if (ticked) {
@@ -334,17 +349,18 @@ async function refresh(ns, has4s, allStocks, myStocks) {
     myStocks.length = 0;
     for (const stk of allStocks) {
         const sym = stk.sym;
-        stk.ask_price = dictAskPrices[sym]; // The amount we would pay if we bought the stock (higher than 'price')
-        stk.bid_price = dictBidPrices[sym]; // The amount we would recieve if we sold the stock (lower than 'price')
+        const [askPrice, bidPrice, volatility, forecastProb, position] = dictStockInfo[sym];
+        stk.ask_price = askPrice; // The amount we would pay if we bought the stock (higher than 'price')
+        stk.bid_price = bidPrice; // The amount we would recieve if we sold the stock (lower than 'price')
         stk.spread = stk.ask_price - stk.bid_price;
         stk.spread_pct = stk.spread / stk.ask_price; // The percentage of value we lose just by buying the stock
         stk.price = (stk.ask_price + stk.bid_price) / 2; // = ns.stock.getPrice(sym);
-        stk.vol = has4s ? dictVolatilities[sym] : stk.vol;
-        stk.prob = has4s ? dictForecasts[sym] : stk.prob;
+        stk.vol = has4s ? volatility : stk.vol;
+        stk.prob = has4s ? forecastProb : stk.prob;
         stk.probStdDev = has4s ? 0 : stk.probStdDev; // Standard deviation around the est. probability
         // Update our current portfolio of owned stock
         let [priorLong, priorShort] = [stk.sharesLong, stk.sharesShort];
-        stk.position = mock ? null : dictPositions[sym];
+        stk.position = mock ? null : position;
         stk.sharesLong = mock ? (stk.sharesLong || 0) : stk.position[0];
         stk.boughtPrice = mock ? (stk.boughtPrice || 0) : stk.position[1];
         stk.sharesShort = mock ? (stk.shares_short || 0) : stk.position[2];
@@ -577,13 +593,16 @@ async function tryGet4SApi(ns, playerStats, budget) {
         cannotBuy4S = true;
         return false;
     }
-    if (await checkAccess(ns, 'has4SDataTixApi')) return false; // Only return true if we just bought it
+    // SM-2: the caller has just confirmed we lack the 4S TIX API (pre4s), so it is not re-checked here, and the has4SData check (a temp
+    // script) only runs once the cheapest possible purchase (the API alone) fits the budget.
     const cost4sData = 1E9 * bitNodeMults.FourSigmaMarketDataCost;
     const cost4sApi = 25E9 * bitNodeMults.FourSigmaMarketDataApiCost;
+    if (cost4sApi > budget) /* Need to reserve some money to invest */
+        return false;
     const has4S = await checkAccess(ns, 'has4SData');
     const totalCost = (has4S ? 0 : cost4sData) + cost4sApi;
     // Liquidate shares if it would allow us to afford 4S API data
-    if (totalCost > budget) /* Need to reserve some money to invest */
+    if (totalCost > budget)
         return false;
     if (playerStats.money < totalCost)
         await liquidate(ns);
