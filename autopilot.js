@@ -916,7 +916,10 @@ export async function main(ns) {
             (pendingNfCount > 0 ? ` + ${pendingNfCount} levels of NeuroFlux.` : '.') +
             (pendingAugCount > 0 ? `\n    Augs: [\"${augsToInstall.join("\", \"")}\"]` : '');
         let resetStatus = `Reserving ${formatMoney(totalCost)} to install ${augSummary}`
-        let shouldReset = options['install-for-augs'].some(a => facman.affordable_augs.includes(a)) ||
+        // An --install-for-augs aug triggers the install whether we can buy it now or it is already queued: the darknet labyrinth *queues* its
+        // reward (src/DarkNet/effects/cacheFiles.ts getLabReward -> Player.queueAugmentation), and while The Red Pill sits in the queue every
+        // other aug costs 1.9x (src/Augmentation/AugmentationHelpers.ts). shouldDelayInstall still applies (grafting, 4S, BN8 rules).
+        let shouldReset = options['install-for-augs'].some(a => facman.affordable_augs.includes(a) || facman.awaiting_install_augs.includes(a)) ||
             pendingAugCount >= augsNeeded || pendingAugInclNfCount >= augsNeededInclNf;
 
         // If we are in Daedalus, and we do not yet have enough favour to unlock rep donations with Daedalus,
