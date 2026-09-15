@@ -28,6 +28,7 @@ let lastUpdateResolvedAt = 0; // Date.now() when ns.gang.nextUpdate() last resol
 let isReadyForNextTerritoryTick = false; // True while members have been moved to Territory Warfare for the coming tick
 let warfareFinished = false;
 let lastOtherGangInfo = null;
+let lastHousekeepingTime = 0; // Date.now() of the last onTerritoryTick run (bonus time runs it on a wall-clock timer instead of per tick)
 
 // Crime activity-related variables
 const crimes = ["Mug People", "Deal Drugs", "Strongarm Civilians", "Run a Con", "Armed Robbery", "Traffick Illegal Arms", "Threaten & Blackmail", "Human Trafficking", "Terrorism",
@@ -200,6 +201,19 @@ async function initialize(ns) {
  * Executed once per gang update (every 2 s in normal play, every 200 ms in bonus time) **/
 async function mainLoop(ns) {
     const processedCycles = await awaitGangUpdate(ns); // 0 GB; resolves right after the game processes gang gains (src/Gang/Gang.ts process)
+    if (getGangCyclesPerUpdate(ns) == gangCyclesPerBonusUpdate) {
+        // Bonus time (after being offline): 25 cycles per 200 ms update, a territory tick every 800 ms. The pre-tick swap cannot keep up (the
+        // housekeeping alone takes seconds, during which the whole gang would sit on Territory Warfare earning nothing, Gang.ts processGains),
+        // so leave everyone on their crimes and run the housekeeping on a wall-clock timer. The tick phase is re-observed once bonus time ends.
+        if (isReadyForNextTerritoryTick) {
+            await updateMemberActivities(ns);
+            isReadyForNextTerritoryTick = false;
+        }
+        if (Date.now() - lastHousekeepingTime >= territoryTickTime) await onTerritoryTick(ns);
+        cyclesSinceTerritoryTick = null;
+        lastOtherGangInfo = null;
+        return;
+    }
     // Every territory tick gives every NPC gang a power gain (src/Gang/Gang.ts processTerritoryAndPowerGains), so a change in their info marks a tick
     const otherGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getAllGangInformation()'); // Returns dict of { [gangName]: { "power": Number, "territory": Number } }
     const tickObserved = lastOtherGangInfo != null && JSON.stringify(otherGangInfo) != JSON.stringify(lastOtherGangInfo);
@@ -236,6 +250,7 @@ async function awaitGangUpdate(ns) {
 /** @param {NS} ns
  * Do some things only once per territory tick **/
 async function onTerritoryTick(ns) {
+    lastHousekeepingTime = Date.now();
     const myGangInfo = await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()');
     log(ns, `Territory tick: power ${formatNumberShort(myGangInfo.power)}, territory ${(100 * myGangInfo.territory).toFixed(2)}%`);
     // Update gang members in case someone died in a clash
