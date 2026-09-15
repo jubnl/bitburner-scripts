@@ -94,10 +94,16 @@ export async function main(ns) {
     }
 
 
+    // Some spendHashes failures are permanent for the current game state (src/Hacknet/HacknetHelpers.tsx purchaseHashUpgrade: no corporation,
+    // not in Bladeburner, target is not a foreign server / a company) and the hashes are refunded, so retrying forever only lets hashes pile
+    // up to capacity and the capacity-upgrade branch below spend real money chasing them. Count failures that happen while we still hold
+    // enough hashes for the purchase (a race with another script would have left us short) and drop the action after a few in a row.
+    const hardFailures = {}, disabledActions = new Set(), maxHardFailures = 3;
+    const isEnabled = (spendAction) => !disabledActions.has(spendAction);
     let lastHashBalance = -1; // Balance of hashes last time we woke up. If unchanged, we go back to sleep quickly (game hasn't ticked)
     let notifiedMaxCapacity = false; // Flag indicating we've maxed our hash capacity, to avoid repeatedly logging this fact.
     // Function determines the current cheapest upgrade of all the upgrades we wish to keep purchasing
-    const getMinCost = spendActions => Math.min(...spendActions.map(p => ns.hacknet.hashCost(p)));
+    const getMinCost = spendActions => Math.min(...spendActions.filter(isEnabled).map(p => ns.hacknet.hashCost(p)));
     // Helper to format hashes in log message
     const formatHashes = (hashes) => formatNumberShort(hashes, 6, 3);
     while (true) {
@@ -131,7 +137,7 @@ export async function main(ns) {
                 // When we're implicitly preferring contracts over money and are about to waste hashes anyway (overflow budget > 0), allow dipping
                 // into the saved-up hashes for a single contract rather than converting the overflow to money (the overflow alone is rarely >= 25 hashes)
                 const contractBudget = () => (spendAllHashes || maxHashSpend() > 0) ? ns.hacknet.numHashes() : 0;
-                const activePurchases = () => purchases.filter(isWorthBuying);
+                const activePurchases = () => purchases.filter(p => isWorthBuying(p) && isEnabled(p));
                 let lastPurchaseSucceeded = true; // Additional mechanism to break out of the while loop if any purchase fails
                 // Make purchases in a loop until we hit our purchase-per-loop limit, or we've spent enough to avoid hashes being wasted next tick
                 while (lastPurchaseSucceeded && purchasesThisLoop < maxPurchasesPerLoop && getMinCost(activePurchases()) <= maxHashSpend()) {
@@ -147,8 +153,19 @@ export async function main(ns) {
                         if (!lastPurchaseSucceeded) { // Note: Even if we had enough hashes, we may fail if another script spends them first
                             log(ns, `WARN: Failed to spend hashes on ${quantity}x '${spendAction}'. Cost was: ${formatHashes(totalCost)} of ${formatHashes(budget)} ` +
                                 `budgeted hashes. Have: ${formatHashes(ns.hacknet.numHashes())} of ${formatHashes(capacity)} (capacity) hashes.`);
+                            if (ns.hacknet.numHashes() >= totalCost) { // We still hold the hashes: the game refused the purchase, nobody raced us
+                                hardFailures[spendAction] = (hardFailures[spendAction] || 0) + 1;
+                                if (hardFailures[spendAction] >= maxHardFailures) {
+                                    disabledActions.add(spendAction);
+                                    log(ns, `ERROR: spend-hacknet-hashes.js: '${spendAction}' failed ${hardFailures[spendAction]} times in a row despite having ` +
+                                        `${formatHashes(totalCost)} hashes. The game is refusing it (e.g. not in Bladeburner, no corporation, ` +
+                                        `--spend-on-server is not a foreign server, or --spend-on-company is not a company). Giving up on it - ` +
+                                        `see this script's log for the game's reason.`, true, 'error');
+                                }
+                            }
                             break; // Break out of for-loop (should also break out of the while since lastPurchaseSucceeded == false)
                         }
+                        hardFailures[spendAction] = 0;
                         purchasesThisLoop++;
                         if (purchasesThisLoop < 10) { // If we purchase more than 10 things, don't even bother logging each one, it'll slow us down
                             log(ns, `SUCCESS: ${purchasesThisLoop == 1 ? '' : `(${purchasesThisLoop}) `}Spent ${formatHashes(totalCost)} hashes on ` +
@@ -167,6 +184,8 @@ export async function main(ns) {
             // Spend hashes normally on any/all user-specified purchases (plus implicit contract generation, if enabled)
             await fnSpendHashes(primaryPurchases, liquidate);
             currentHashes = lastHashBalance = ns.hacknet.numHashes();
+            if (toBuy.every(p => !isEnabled(p))) // Nothing we were asked to buy can be bought: don't buy capacity to save up for it
+                return log(ns, `ERROR: spend-hacknet-hashes.js: every requested purchase (${toBuy.join(", ")}) is being refused by the game. Shutting down.`, true, 'error');
 
             // Determine if we should try to upgrade our hacknet capacity
             const remaining = capacity - currentHashes;
