@@ -15,3 +15,11 @@ test("a core is bought when it fits the leftover budget and is under the cash fr
     assert.equal(coreWithinBudget(56.25e9, 1e12, 100e9, 0.05), false); // 5.6% of cash
     assert.equal(coreWithinBudget(56.25e9, 1.2e12, 100e9, 0.05), true); // 4.7% of cash
 });
+
+test("a core at the exact boundary (cost == fraction of cash) is bought (function uses <=)", () => {
+    assert.equal(coreWithinBudget(56.25e9, 1.125e12, 100e9, 0.05), true); // exactly 5.0% of cash
+});
+
+test("a maxCashFraction of 0 disables all core purchases", () => {
+    assert.equal(coreWithinBudget(7.5e9, 100e9, 10e9, 0), false);
+});
