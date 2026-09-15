@@ -116,3 +116,18 @@ test("crack.js only marks a crack claim renewed once the port write succeeds", (
     assert.match(crack, /if \(ns\.tryWritePort\(options\.port, line\)\) claimedAt = Date\.now\(\);/);
     assert.doesNotMatch(crack, /claimedAt = Date\.now\(\);\s*\n\s*const line = encodeMsg\("worker"/);
 });
+
+test("fillerPlan honours a thread cap", () => {
+    assert.deepEqual(fillerPlan({ free: 40, reserve: 0, unitRam: unit, running: false, launched: 0, cap: 7 }), { launch: 7, resize: false });
+    assert.deepEqual(fillerPlan({ free: 40, reserve: 0, unitRam: unit, running: true, launched: 7, cap: 7 }), { launch: 0, resize: false }, "at the cap: spare RAM is not a reason to grow");
+    assert.deepEqual(fillerPlan({ free: 1, reserve: 0, unitRam: unit, running: true, launched: 7, cap: 3 }), { launch: 0, resize: true }, "the cap dropped below what runs");
+    assert.deepEqual(fillerPlan({ free: 40, reserve: 0, unitRam: unit, running: false, launched: 0, cap: 0 }), { launch: 0, resize: false });
+});
+
+test("agent.js launches phish up to its cap before sharing, and promote has no RAM floor", () => {
+    const agent = src("darknet/agent.js");
+    assert.match(agent, /cap: cmd\.threads\.phish/);
+    assert.doesNotMatch(agent, /getServerMaxRam\(me\) >= 64/);
+    assert.ok(agent.indexOf('ns.exec("darknet/phish.js"') < agent.indexOf('ns.exec("Remote/share.js"'), "phish is sized before share takes the rest");
+    assert.doesNotMatch(src("darknet/phish.js"), /cmd\["share"\]/, "phish.js keeps running while the daemon shares");
+});

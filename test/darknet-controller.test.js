@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { parseCmd, emptyState, encodeMsg, WORKER_RAM, LABS, LAB_AUGMENTATIONS, labFromAugmentations, labFromDifficulty } from "../darknet/lib.js";
 import {
     applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
-    loadState, planLabyrinth, planLoot, planPromotions, pushFiles, recomputeCompleted, saveState,
+    loadState, planFillers, planLabyrinth, planLoot, planPromotions, pushFiles, recomputeCompleted, saveState,
 } from "../darknet.js";
 
 /* Node-only tests for darknet.js's planning and state machine.
@@ -101,7 +101,7 @@ test("buildCmd fills every field parseCmd defaults, for a normal host", () => {
     assert.deepEqual(cmd.claimed, []);
     assert.equal(cmd.threads.crack, 6);
     assert.equal(cmd.threads.realloc, 50);
-    assert.equal(cmd.threads.phish, 1, "a normal host phishes with its spare RAM");
+    assert.equal(cmd.threads.phish, 14, "alone on the network, alpha gets the whole phish budget");
     assert.equal(cmd.threads.migrate, 0);
     assert.equal(cmd.migrateTarget, null);
     assert.equal(cmd.walk, null);
@@ -135,13 +135,43 @@ test("buildCmd zeroes phish, promote and share on a walk host", () => {
     assert.equal(other.walk, null);
 });
 
-test("buildCmd only hands out promote threads above the RAM floor", () => {
-    const ns = makeNs({});
-    const state = makeState({ big: { maxRam: 128 }, small: { maxRam: 32 } });
+// R9: phishing's cache stream is bound by a 3-minute global cooldown and its money is pennies (phishing.ts), so a
+// dozen threads on the deepest hosts (money factor 0.1 + 0.05 x depth) saturate it network-wide; promote out-yields
+// it in charisma XP and ~22 threads/symbol reach ~3x volatility on a held stock (effects.ts:197-201), but was
+// capped at 4 threads and only on >= 64 GB hosts (no host below difficulty 12).
+test("planFillers puts phish on the deepest hosts up to 14 threads and promote on the biggest, no RAM floor", () => {
+    // ECP's prob is 0.8, not the brief's 0.7: Math.abs(0.7 - 0.5) rounds to 0.19999999999999996, a hair under
+    // FSIG's Math.abs(0.3 - 0.5) === 0.2, so planPromotions' unrelated, pre-existing sort would tip FSIG first
+    // on IEEE754 rounding alone. 0.8 keeps ECP's edge unambiguously larger and the "strongest forecast first"
+    // order the brief specifies (R9's own change is planFillers, not planPromotions' sort).
+    const ns = makeNs({ files: { "/Temp/stock-probabilities.txt": JSON.stringify({ ECP: { prob: 0.8, sharesLong: 10 }, FSIG: { prob: 0.3, sharesShort: 10 } }) } });
+    const state = makeState({
+        deep: { depth: 6, maxRam: 32 },                  // floor((32 - 4.5) / 3.65) = 7 threads of room
+        mid: { depth: 4, maxRam: 45, blockedRam: 5 },    // floor((45 - 5 - 4.5) / 3.65) = 9
+        big: { depth: 1, maxRam: 128 },                  // floor((128 - 4.5) / 3.65) = 33
+        tiny: { depth: 9, maxRam: 16, blockedRam: 10 },  // no room at all
+    });
     const plan = planLoot(ns, state, baseOptions, 10);
-    plan.promoteSymbols = ["ECP", "FSIG"];
-    assert.equal(buildCmd(state, plan, "big").threads.promote, 4);
-    assert.equal(buildCmd(state, plan, "small").threads.promote, 0);
+    assert.deepEqual(plan.promoteSymbols, ["ECP", "FSIG"]);
+    assert.deepEqual(plan.phishByHost, { deep: 7, mid: 7 }, "14 threads, deepest first, tiny has no room");
+    assert.deepEqual(plan.promoteByHost, { big: 33, mid: 2 }, "48 threads for two symbols, biggest host first, after phish took its share of mid");
+    assert.equal(buildCmd(state, plan, "deep").threads.phish, 7);
+    assert.equal(buildCmd(state, plan, "deep").threads.promote, 0);
+    assert.equal(buildCmd(state, plan, "big").threads.promote, 33, "a 128 GB host is no longer capped at 4");
+    assert.equal(buildCmd(state, plan, "mid").threads.promote, 2, "a 45 GB host promotes too: the 64 GB floor is gone");
+    assert.equal(buildCmd(state, plan, "tiny").threads.phish, 0);
+});
+
+test("phish threads survive while the daemon shares; a walk host still gets none", () => {
+    const ns = makeNs({ files: { "/Temp/share-active.txt": "true" } });
+    const state = makeState({ deep: { depth: 6, maxRam: 64, neighbours: [LAB] }, other: { depth: 2, maxRam: 64 } });
+    const plan = planLoot(ns, state, baseOptions, 10);
+    assert.equal(plan.shareActive, true);
+    assert.equal(buildCmd(state, plan, "deep").threads.phish, 14, "sharing no longer zeroes the cache stream");
+    assert.equal(buildCmd(state, plan, "deep")["share"], true, "the remainder still shares");
+    plan.walkHosts = ["deep"]; plan.walkLab = LAB; plan.walkThreadsByHost = { deep: 4 };
+    assert.equal(buildCmd(state, plan, "deep").threads.phish, 0);
+    assert.equal(buildCmd(state, plan, "other").threads.phish, 0, "the budget went to deep; other only shares");
 });
 
 // ------------------------------------------------------------------ planPromotions

@@ -120,7 +120,7 @@ export async function main(ns) {
             const migrateThreads = Math.min(cmd.threads.migrate, Math.floor(freeRam(ns, me) / WORKER_RAM.migrate));
             if (migrateThreads >= 1) ns.exec("darknet/migrate.js", me, { threads: migrateThreads, preventDuplicates: true }, hostArg(cmd.migrateTarget), "--port", port);
         }
-        if (cmd.promoteSymbols.length && ns.getServerMaxRam(me) >= 64 && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
+        if (cmd.promoteSymbols.length && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
             const promoteThreads = Math.min(cmd.threads.promote, Math.floor((freeRam(ns, me) - reserve) / WORKER_RAM.promote));
             if (promoteThreads >= 1) ns.exec("darknet/promote.js", me, { threads: promoteThreads, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port);
         }
@@ -147,26 +147,25 @@ export async function main(ns) {
                 if (ns.exec("darknet/stasis.js", me, { threads: 1, preventDuplicates: true }, "--unlink", "--port", port)) ns.write(FILES.stasisMark, "0", "w");
             }
         }
-        const spare = Math.floor((freeRam(ns, me) - reserve) / (cmd["share"] ? WORKER_RAM["share"] : WORKER_RAM.phish));
+        // Phish first, capped at the controller's count (R9: a dozen threads network-wide saturate the
+        // cache stream), then share takes whatever is left when the daemon shares. Both are gated on the
+        // command file; a walk host gets threads.phish = 0 and share = false and spawns neither.
         const phishRunning = ns.isRunning("darknet/phish.js", me, "--port", port);
         if (!phishRunning) phishThreads = 0;
-        // Both branches are explicitly gated on the command file: share only when the
-        // controller says to share, phish only when it actually allotted phish threads. A walk
-        // host gets threads.phish = 0 and share = false, so it spawns neither and its spare RAM
-        // stays free for the walker.
-        if (cmd["share"]) {
-            if (spare > 0 && !ns.isRunning("Remote/share.js", me)) ns.exec("Remote/share.js", me, { threads: spare, preventDuplicates: true });
-        } else if ((cmd.threads.phish || 0) > 0) {
-            // share.js exits on its own every 10 s, so the reserve alone re-sizes it; phish.js
-            // runs until told to stop, so the agent asks it to exit whenever it is the wrong size.
-            const sizing = fillerPlan({ free: freeRam(ns, me), reserve, unitRam: WORKER_RAM.phish, running: phishRunning, launched: phishThreads });
+        if ((cmd.threads.phish || 0) > 0) {
+            // phish.js runs until told to stop, so the agent asks it to exit whenever it is the wrong size.
+            const sizing = fillerPlan({ free: freeRam(ns, me), reserve, unitRam: WORKER_RAM.phish, running: phishRunning, launched: phishThreads, cap: cmd.threads.phish });
             if (sizing.resize) ns.write(FILES.phishResize, "1", "w");
             else if (!phishRunning && sizing.launch > 0) {
                 ns.write(FILES.phishResize, "0", "w");
                 if (ns.exec("darknet/phish.js", me, { threads: sizing.launch, preventDuplicates: true }, "--port", port)) phishThreads = sizing.launch;
             }
+        } else if (phishRunning) ns.write(FILES.phishResize, "1", "w");   // no longer budgeted here: let it exit
+        if (cmd["share"]) {
+            // share.js exits on its own every 10 s, so the reserve alone re-sizes it.
+            const spare = Math.floor((freeRam(ns, me) - reserve) / WORKER_RAM["share"]);
+            if (spare > 0 && !ns.isRunning("Remote/share.js", me)) ns.exec("Remote/share.js", me, { threads: spare, preventDuplicates: true });
         }
-        // NOTE: no ns.scriptKill here; phish.js exits on its own once cmd["share"] becomes true.
         // 5. caches and clues
         if (hasCache && !ns.isRunning("darknet/cache.js", me, "--port", port) && freeRam(ns, me) >= WORKER_RAM.cache) ns.exec("darknet/cache.js", me, { threads: 1, preventDuplicates: true }, "--port", port);
         for (const f of [...ns.ls(me, ".data.txt"), ...ns.ls(me, ".lit")]) {

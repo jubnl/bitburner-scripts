@@ -45,8 +45,8 @@ const STALE_FRONTIER = 3600000;     // no new server for an hour => the frontier
 const STORM_COOLDOWN = 1800000;     // the game's global STORM_SEED cooldown is 30 minutes
 const KILL_GRACE = 6000;            // ms to let agents notice the stop flag before killing them
 const MIGRATE_THREADS = 10;
-const PROMOTE_THREADS = 4;          // threads buildCmd hands a qualifying host for promote.js
-const MIN_PROMOTE_RAM = 64;         // buildCmd never hands out promote threads below this known maxRam
+const PHISH_THREADS_TOTAL = 14;         // phish threads network-wide, deepest hosts first: the cache stream is cooldown-bound (R9)
+const PROMOTE_THREADS_PER_SYMBOL = 24;  // promote threads network-wide per held symbol, biggest hosts first (R9)
 const MAX_PROMOTE_SYMBOLS = 3;
 const LAB_DEPTH_SLACK = 6;          // balanced mode flips to labyrinth within this many rows of the lab
 const MIGRATION_CHARGE_TTL = 600000; // a migration charge counts as "in flight" for 10 minutes
@@ -110,6 +110,8 @@ export async function main(ns) {
             state.plan.promoteSymbols = plan.promoteSymbols;
             state.plan.charismaGoal = plan.charismaGoal;
             state.plan.shareActive = plan.shareActive;
+            state.plan.phishByHost = plan.phishByHost;
+            state.plan.promoteByHost = plan.promoteByHost;
 
             state.labs.current = plan.lab ? plan.lab.host : null;
             // Before buildCmd: planning a walker only writes `walk`/`walkThreads` into the
@@ -478,6 +480,38 @@ function commandable(state) {
     return out;
 }
 
+/** Hand out the filler budgets: phish to the deepest hosts (the money factor is 0.1 + 0.05 x depth and the
+ * cache chance is capped by a global 3-minute cooldown, so ~14 threads saturate it network-wide), then promote
+ * to the biggest hosts, 24 threads per held symbol. Whatever is left over shares when the daemon shares. */
+export function planFillers(state, plan) {
+    const hosts = commandable(state).map(name => [name, state.servers[name]]);
+    const room = {};
+    for (const [name, entry] of hosts) {
+        room[name] = Math.max(0, Math.floor(((Number(entry.maxRam) || 0) - (Number(entry.blockedRam) || 0) - WORKER_RAM.agent) / WORKER_RAM.phish));
+    }
+    const give = (ordered, budget, out) => {
+        let left = budget;
+        for (const [name] of ordered) {
+            if (left <= 0) break;
+            const take = Math.min(left, room[name]);
+            if (take <= 0) continue;
+            out[name] = take;
+            room[name] -= take;
+            left -= take;
+        }
+    };
+    plan.phishByHost = {};
+    plan.promoteByHost = {};
+    const byDepth = [...hosts].sort((a, b) => ((Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
+        || ((Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0)));
+    give(byDepth, PHISH_THREADS_TOTAL, plan.phishByHost);
+    if (plan.promoteSymbols.length) {
+        const byRam = [...hosts].sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0));
+        give(byRam, PROMOTE_THREADS_PER_SYMBOL * plan.promoteSymbols.length, plan.promoteByHost);
+    }
+    return plan;
+}
+
 /** Up to 3 held stock symbols to promote, strongest forecast first. Empty when nothing is held. */
 export function planPromotions(ns, options) {
     if (options["no-promote"]) return [];
@@ -543,6 +577,8 @@ function basePlan(ns, state, options, charisma) {
         stasisTargets: [],
         stasisRelease: [],          // hosts holding a link this plan no longer wants (stasis: false)
         migrationTargets: {},
+        phishByHost: {},            // host -> phish.js threads (planFillers)
+        promoteByHost: {},          // host -> promote.js threads (planFillers)
         promoteSymbols: planPromotions(ns, options),
         charismaGoal: 0,
         shareActive: String(ns.read(FILES.shareActive) ?? "").trim() === "true",
@@ -598,6 +634,7 @@ export function planLoot(ns, state, options, charisma = 0) {
     // The charisma goal is "the lowest charisma that unlocks the next blocked action" (spec
     // section 7), so the lab gate counts even while we are looting.
     plan.charismaGoal = planCharismaGoal(state, charisma, currentLab(ns, state));
+    planFillers(state, plan);
     return plan;
 }
 
@@ -683,6 +720,7 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     plan.lab = lab;
     if (!lab) {
         plan.charismaGoal = planCharismaGoal(state, charisma, null);
+        planFillers(state, plan);
         return plan;
     }
 
@@ -730,6 +768,7 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     // ignores priority and RAM is not yet scarce enough for the controller to withhold claims. YAGNI.
 
     plan.charismaGoal = planCharismaGoal(state, charisma, lab);
+    planFillers(state, plan);
     return plan;
 }
 
@@ -792,7 +831,6 @@ export function buildCmd(state, plan, host) {
         if (chargers.includes(host)) { migrateTarget = name; break; }
     }
     const walking = (plan.walkHosts ?? []).includes(host);
-    const hostMaxRam = Number(state.servers[host]?.maxRam) || 0;
     return {
         mode: plan.mode,
         claimed,
@@ -802,9 +840,10 @@ export function buildCmd(state, plan, host) {
             realloc: plan.reallocThreads,
             // A walk host gives its spare RAM to the walker: phish/promote/share are told to
             // stop (and exit on their own -- see darknet/agent.js) so the walker can claim it.
-            phish: walking ? 0 : (plan.shareActive ? 0 : 1),
+            // Otherwise phish/promote are the counts planFillers budgeted for this host (R9).
+            phish: walking ? 0 : (plan.phishByHost?.[host] ?? 0),
             migrate: migrateTarget ? MIGRATE_THREADS : 0,
-            promote: walking ? 0 : ((plan.promoteSymbols.length && hostMaxRam >= MIN_PROMOTE_RAM) ? PROMOTE_THREADS : 0),
+            promote: walking ? 0 : (plan.promoteByHost?.[host] ?? 0),
         },
         migrateTarget,
         promoteSymbols: plan.promoteSymbols,
@@ -1078,7 +1117,7 @@ export function printStatus(ns, state, options) {
         `session failures: ${Object.entries(state.stats.sessionFailures ?? {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => `${name}x${count}`).join(" ") || "(none)"}`,
         `last failures: ${names.filter(name => state.servers[name].lastReason).slice(0, 5).map(name => `${name}:${state.servers[name].lastReason}`).join("  ") || "(none)"}`,
         `migration targets: ${Object.entries(state.plan.migrationTargets ?? {}).map(([name, chargers]) => `${name}<-${chargers.length}`).join(" ") || "(none)"}`,
-        `promote symbols: ${state.plan.promoteSymbols.join(", ") || "(none)"}  |  share active: ${state.plan.shareActive}`,
+        `promote symbols: ${state.plan.promoteSymbols.join(", ") || "(none)"}  |  share active: ${state.plan.shareActive}  |  phish threads planned: ${Object.values(state.plan.phishByHost ?? {}).reduce((a, b) => a + b, 0)}  |  promote threads planned: ${Object.values(state.plan.promoteByHost ?? {}).reduce((a, b) => a + b, 0)}`,
         `charisma goal: ${state.plan.charismaGoal || "(none)"}`,
     ];
     log(ns, lines.join("\n"), true);

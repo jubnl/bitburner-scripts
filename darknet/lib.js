@@ -262,20 +262,24 @@ export function logMatchesAttempt(modelId, fb, pw) {
     return logged === (pw + "ˍ".repeat(logged.length)).slice(0, logged.length);
 }
 
-/** Sizing rule for a filler worker (phish.js) that takes all spare RAM and never resizes
- * itself. `free` is the host's free RAM right now (the running filler counted as used),
- * `reserve` the RAM higher-priority work needs next tick (pending cracks, walkers, caches,
- * stasis), `launched` the thread count the agent last exec'd (0 when unknown).
+/** Sizing rule for a filler worker (phish.js) that takes all spare RAM (up to `cap` threads)
+ * and never resizes itself. `free` is the host's free RAM right now (the running filler
+ * counted as used), `reserve` the RAM higher-priority work needs next tick (pending cracks,
+ * walkers, caches, stasis), `launched` the thread count the agent last exec'd (0 when
+ * unknown). `cap` (threads) bounds the launch size; a running filler above the cap is asked
+ * to exit too.
  * Returns the threads to launch when nothing runs, or whether the running filler must exit so
  * it can be re-launched at the right size: it yields when the reserved work no longer fits,
  * and steps aside when a whole extra thread would fit (RAM freed by a finished worker). */
-export function fillerPlan({ free, reserve, unitRam, running, launched }) {
+export function fillerPlan({ free, reserve, unitRam, running, launched, cap = Infinity }) {
+    const limit = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : Infinity;
     const held = running ? (Number(launched) || 0) * unitRam : 0;
-    const want = Math.max(0, Math.floor((free + held - reserve) / unitRam));
+    const want = Math.min(limit, Math.max(0, Math.floor((free + held - reserve) / unitRam)));
     if (!running) return { launch: want, resize: false };
     const starved = free < reserve;
     const canGrow = (Number(launched) || 0) > 0 && want > launched;
-    return { launch: 0, resize: starved || canGrow };
+    const oversized = (Number(launched) || 0) > limit;
+    return { launch: 0, resize: starved || canGrow || oversized };
 }
 
 // The models whose solver reads heartbleed feedback (the "oracle" solvers in darknet/solvers.js). Every other

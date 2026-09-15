@@ -12,7 +12,7 @@ export async function main(ns) {
     let calls = 0, successes = 0;
     while (true) {
         const cmd = parseCmd(ns.read(FILES.cmd));
-        if (cmd.stop || cmd.threads.phish === 0 || cmd["share"]) break;
+        if (cmd.stop || (cmd.threads.phish || 0) === 0) break;
         if (ns.read(FILES.phishResize) === "1") break;   // the agent wants to re-size us
         const result = await ns.dnet.phishingAttack();
         if (result.success) successes++;
