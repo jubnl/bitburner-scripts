@@ -179,6 +179,9 @@ export function parseCmd(text) {
     const base = {
         mode: "loot",
         claimed: [],
+        // The player's charisma at planning time (null = an older controller that never wrote it). The agent
+        // skips oracle-model hosts whose requiredCharismaSkill exceeds it: heartbleed would answer 451.
+        charisma: null,
         threads: { crack: 6, realloc: 0, phish: 0, migrate: 0, promote: 0 },
         migrateTarget: null,
         promoteSymbols: [],
@@ -273,4 +276,33 @@ export function fillerPlan({ free, reserve, unitRam, running, launched }) {
     const starved = free < reserve;
     const canGrow = (Number(launched) || 0) > 0 && want > launched;
     return { launch: 0, resize: starved || canGrow };
+}
+
+// The models whose solver reads heartbleed feedback (the "oracle" solvers in darknet/solvers.js). Every other
+// model is decoded from the hint or a dictionary and is solved by authenticate alone, which has no charisma gate.
+export const FEEDBACK_MODELS = new Set([
+    "NIL", "2G_cellular", "AccountsManager_4.2", "BellaCuore", "BigMo%od", "Factori-Os", "DeepGreen",
+    "RateMyPix.Auth", "PHP 5.4", "KingOfTheHill", "OpenWebAccessPoint",
+]);
+
+/** The uncracked neighbours worth starting a crack on this tick, best first. An oracle-model host whose
+ * requiredCharismaSkill exceeds the player's charisma is dropped: heartbleed refuses it (451) and authenticate
+ * alone cannot solve it. Hosts at or below the bar (calculateAuthenticationTime's underleveled factor applies at
+ * charisma <= required) come last, cheapest requirement first. `charisma` null = unknown, drop nothing. */
+export function crackOrder(hosts, detailsByHost, charisma) {
+    const known = charisma !== null && charisma !== undefined && Number.isFinite(Number(charisma));
+    const rows = [];
+    for (const host of hosts) {
+        const d = detailsByHost?.[host] ?? {};
+        const req = Number(d.requiredCharismaSkill) || 0;
+        const isOracle = FEEDBACK_MODELS.has(d.modelId);
+        if (known && isOracle && req > Number(charisma)) continue;
+        // Known charisma: penalise anything at or above the bar (the 2.5x underleveled auth factor), regardless
+        // of model. Unknown charisma: we cannot evaluate the bar at all, so only an oracle model (whose
+        // heartbleed *could* 451) is treated as risky; a feedback-free model never carries that risk.
+        const penalised = known ? (req >= Number(charisma) ? 1 : 0) : (isOracle ? 1 : 0);
+        rows.push({ host, penalised, req });
+    }
+    rows.sort((a, b) => a.penalised - b.penalised || a.req - b.req);
+    return rows.map(row => row.host);
 }

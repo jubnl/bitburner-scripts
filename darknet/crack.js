@@ -1,6 +1,6 @@
 import { getConfiguration } from "../helpers.js";
 import { solve } from "./solvers.js";
-import { encodeMsg, PORT_DEFAULT, FILES, parsePasswords, parseClueText, safeParse, hostFromArg, logMatchesAttempt } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, FILES, FEEDBACK_MODELS, parsePasswords, parseClueText, safeParse, hostFromArg, logMatchesAttempt } from "./lib.js";
 
 const argsSchema = [["port", PORT_DEFAULT], ["clues", ""]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
@@ -19,7 +19,10 @@ export async function main(ns) {
     if (known[target]) clues.push(known[target]);
     for (const f of ns.ls(me, ".data.txt")) { const c = parseClueText(ns.read(f), [target]); if (c.passwords[target]) clues.push(c.passwords[target]); for (const p of (c.passwords.unknown || [])) clues.push(p); }
     let attempts = 0;
-    const attemptFn = async (password) => {
+    // Only the oracle solvers read feedback; every other model is solved by authenticate alone, which has no
+    // charisma gate, so a heartbleed there would only add 1.5x the auth delay per miss or abort with 451 (R4).
+    const wantsFeedback = FEEDBACK_MODELS.has(details.modelId);
+    const attemptFn = async (password, needFeedback = true) => {
         let incremented = false;
         for (let tries = 0; tries < 5; tries++) {
             const r = await ns.dnet.authenticate(target, password);
@@ -30,6 +33,7 @@ export async function main(ns) {
             if (r.code === 408) continue;                       // timeout: independent of correctness, retry
             if (!incremented) { attempts++; incremented = true; }
             if (r.code === 351 || r.code === 503) throw new Error("unreachable");
+            if (!wantsFeedback || !needFeedback) return { success: false, feedback: null };
             const hb = await ns.dnet.heartbleed(target, { peek: true, logsToCapture: 1 });
             if (!hb.success) { if (hb.code === 451) throw new Error("charisma"); throw new Error("heartbleed:" + hb.code); }
             const fb = safeParse(hb.logs[0] ?? "", null);

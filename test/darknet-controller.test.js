@@ -97,6 +97,7 @@ test("buildCmd fills every field parseCmd defaults, for a normal host", () => {
     assert.deepEqual(Object.keys(cmd).sort(), Object.keys(parseCmd("")).sort(),
         "a missing field would silently keep the agent's parseCmd default instead of the plan's value");
     assert.equal(cmd.mode, "loot");
+    assert.equal(cmd.charisma, 10, "the agent needs the player's charisma to skip oracle hosts it cannot heartbleed");
     assert.deepEqual(cmd.claimed, []);
     assert.equal(cmd.threads.crack, 6);
     assert.equal(cmd.threads.realloc, 50);

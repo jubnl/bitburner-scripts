@@ -792,6 +792,7 @@ export function buildCmd(state, plan, host) {
     return {
         mode: plan.mode,
         claimed,
+        charisma: Number(plan.charisma) || 0,
         threads: {
             crack: plan.crackThreads,
             realloc: plan.reallocThreads,
@@ -1093,7 +1094,7 @@ async function stopEverything(ns, state) {
     // 2. Push the stop flag to every reachable known server, same as before, and give agents a
     // few seconds to notice it and exit on their own.
     const stopCmd = {
-        mode: "loot", claimed: [],
+        mode: "loot", claimed: [], charisma: null,
         threads: { crack: 0, realloc: 0, phish: 0, migrate: 0, promote: 0 },
         migrateTarget: null, promoteSymbols: [], stasis: false, "share": false, storm: false,
         walk: null, walkThreads: 0, stop: true,

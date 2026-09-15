@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeServer, feedback } from "./darknet-mock.js";
 import { solve, BUDGETS, budgetFor } from "../darknet/solvers.js";
-import { logMatchesAttempt } from "../darknet/lib.js";
+import { logMatchesAttempt, FEEDBACK_MODELS } from "../darknet/lib.js";
 
 function detailsOf(s) {
     return { hostname: s.hostname, modelId: s.modelId, passwordHint: s.staticPasswordHint, data: s.passwordHintData,
@@ -106,4 +106,9 @@ test("logMatchesAttempt reproduces the BufferOverflow buffer rewrite and stays e
     assert.equal(logMatchesAttempt("Pr0verFl0", {}, "abc"), false, "noise line without passwordAttempted");
     assert.equal(logMatchesAttempt("TopPass", { passwordAttempted: "hunter2" }, "hunter2"), true);
     assert.equal(logMatchesAttempt("TopPass", { passwordAttempted: "hunte" }, "hunter2"), false, "other models log the attempt verbatim");
+});
+
+test("every oracle solver is in FEEDBACK_MODELS and no direct solver is", () => {
+    for (const modelId of ORACLE) assert.ok(FEEDBACK_MODELS.has(modelId), modelId);
+    for (const modelId of [...DIRECT, "Pr0verFl0"]) assert.ok(!FEEDBACK_MODELS.has(modelId), modelId);
 });

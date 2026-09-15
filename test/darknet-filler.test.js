@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { fillerPlan, selfReportKey, WORKER_RAM, FILES, STASIS_HOST_MIN_RAM } from "../darknet/lib.js";
+import { fillerPlan, selfReportKey, WORKER_RAM, FILES, STASIS_HOST_MIN_RAM, FEEDBACK_MODELS, crackOrder } from "../darknet/lib.js";
 
 const unit = WORKER_RAM.phish;
 const src = (f) => readFileSync(new URL(`../${f}`, import.meta.url), "utf8");
@@ -61,4 +61,34 @@ test("selfReportKey ignores the order probe() returns the neighbours in", () => 
 
 test("agent.js keys its own server report with selfReportKey", () => {
     assert.match(src("darknet/agent.js"), /selfReportKey\(mine, neighbours\)/);
+});
+
+// R4: authenticate has no charisma gate (Darknet.ts:93-177), only heartbleed does (:248-258). 13 of 24 models are
+// solved by authenticate alone, so on those a host above the charisma bar is crackable, and a heartbleed after
+// each miss only adds 1.5x the auth delay. The underleveled auth penalty (>= 2.5x) applies at charisma <= chaReq.
+test("crackOrder skips oracle-model hosts above the charisma bar and puts penalised hosts last", () => {
+    const details = {
+        free: { modelId: "TopPass", requiredCharismaSkill: 900 },              // feedback-free: crackable at any charisma
+        easy: { modelId: "NIL", requiredCharismaSkill: 100 },                  // oracle, well under the bar
+        equal: { modelId: "DeepGreen", requiredCharismaSkill: 300 },           // passes heartbleed, pays the 2.5x penalty
+        locked: { modelId: "KingOfTheHill", requiredCharismaSkill: 301 },      // heartbleed answers 451: skip it
+        cheap: { modelId: "ZeroLogon", requiredCharismaSkill: 50 },
+    };
+    assert.deepEqual(crackOrder(["locked", "equal", "free", "easy", "cheap"], details, 300), ["cheap", "easy", "equal", "free"]);
+    assert.deepEqual(crackOrder(["locked", "free"], details, null), ["free", "locked"], "unknown charisma (old controller): skip nothing");
+    assert.deepEqual(crackOrder(["ghost"], {}, 300), ["ghost"], "no details yet: try it");
+});
+
+test("FEEDBACK_MODELS lists exactly the solvers that read heartbleed feedback", () => {
+    assert.deepEqual([...FEEDBACK_MODELS].sort(), ["2G_cellular", "AccountsManager_4.2", "BellaCuore", "BigMo%od",
+        "DeepGreen", "Factori-Os", "KingOfTheHill", "NIL", "OpenWebAccessPoint", "PHP 5.4", "RateMyPix.Auth"]);
+});
+
+test("crack.js only heartbleeds for feedback models and agent.js orders cracks with crackOrder", () => {
+    const crack = src("darknet/crack.js");
+    assert.match(crack, /FEEDBACK_MODELS\.has\(details\.modelId\)/);
+    assert.match(crack, /if \(!wantsFeedback \|\| !needFeedback\) return \{ success: false, feedback: null/);
+    const agent = src("darknet/agent.js");
+    assert.match(agent, /crackOrder\(/);
+    assert.match(agent, /cmd\.charisma/);
 });

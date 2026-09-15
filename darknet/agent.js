@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg, fillerPlan, selfReportKey } from "./lib.js";
+import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg, fillerPlan, selfReportKey, crackOrder } from "./lib.js";
 
 /* The darknet agent. One per cracked, online darknet server. It never plans: it executes the
  * command file the controller pushes, reports what it sees, and spreads itself to neighbours.
@@ -60,18 +60,19 @@ export async function main(ns) {
         }
         // Cracking always outranks spare-RAM work (promote/phish/share): reserve enough RAM for
         // up to 4 crack.js threads whenever a live, non-lab, unclaimed neighbour still needs one.
-        let needsCrack = false;
-        for (const h of neighbours) {
+        // crackOrder drops oracle-model hosts above the charisma bar (heartbleed would refuse them, R4)
+        // and puts hosts that would pay the underleveled auth penalty last.
+        const pending = crackOrder(neighbours.filter(h => {
             const d = detailsByHost[h];
-            if (d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)
-                && !ns.isRunning("darknet/crack.js", me, hostArg(h), "--port", port)) { needsCrack = true; break; }
-        }
+            return d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)
+                && !ns.isRunning("darknet/crack.js", me, hostArg(h), "--port", port);
+        }), detailsByHost, cmd.charisma);
         // NOTE: `reserve` is deliberately only subtracted from promote/phish/share below.
         // realloc and migrate outrank the crack reservation on purpose: that is the spending
         // order the spec gives (section 6 -- realloc, migrate, promote, share, phish), realloc
         // is what *creates* the RAM a crack worker needs, and a migration charge is lost work
         // if it stalls. Promote/phish/share are pure filler and always yield to a pending crack.
-        let reserve = needsCrack ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
+        let reserve = pending.length ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
         // A commanded labyrinth walker outranks spare-RAM work too: hold its RAM back from
         // promote/phish/share so it has somewhere to land once buildCmd's threads.phish = 0 /
         // threads.promote = 0 / share = false empty the host out (may take a loop or two).
@@ -84,11 +85,8 @@ export async function main(ns) {
         const stasisMark = ns.read(FILES.stasisMark);
         const stasisPending = (cmd.stasis && stasisMark !== "1") || (!cmd.stasis && stasisMark === "1");
         if (stasisPending && !ns.isRunning("darknet/stasis.js", me, "--port", port) && !ns.isRunning("darknet/stasis.js", me, "--unlink", "--port", port)) reserve += WORKER_RAM.stasis;
-        // 2. crack unknown neighbours
-        for (const h of neighbours) {
-            const d = detailsByHost[h];
-            if (!d.isOnline || passwords[h] !== undefined || cmd.claimed.includes(h) || isLabHost(h)) continue;
-            if (ns.isRunning("darknet/crack.js", me, hostArg(h), "--port", port)) continue;
+        // 2. crack unknown neighbours, in crackOrder's order
+        for (const h of pending) {
             const threads = Math.min(cmd.threads.crack || 6, Math.floor(freeRam(ns, me) / WORKER_RAM.crack));
             if (threads >= 1) { const pid = ns.exec("darknet/crack.js", me, { threads, preventDuplicates: true }, hostArg(h), "--port", port); dispatch("worker", { kind: "crack", host: h, threads, workerPid: pid }); }
         }
