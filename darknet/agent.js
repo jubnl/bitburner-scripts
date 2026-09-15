@@ -14,7 +14,7 @@ export async function main(ns) {
     const lastSeen = {};                      // host -> last details JSON string, to report only changes
     const notifiedFiles = new Set();
     const myDetails = ns.dnet.getServerDetails(me);
-    dispatch("hello", { host: me, maxRam: ns.getServerMaxRam(me), freeRam: ns.getServerMaxRam(me) - ns.getServerUsedRam(me), depth: myDetails.depth, difficulty: myDetails.difficulty });
+    dispatch("hello", { host: me, maxRam: ns.getServerMaxRam(me), freeRam: ns.getServerMaxRam(me) - ns.getServerUsedRam(me), depth: myDetails.depth, difficulty: myDetails.difficulty, exes: ns.ls(me, ".exe") });
     while (true) {
         while (queued.length && ns.tryWritePort(port, queued[0])) queued.shift();
         const cmd = parseCmd(ns.read(FILES.cmd));
