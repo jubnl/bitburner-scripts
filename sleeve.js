@@ -1,4 +1,5 @@
 import { log, getConfiguration, instanceCount, disableLogs, getActiveSourceFiles, getNsDataThroughFile, runCommand, formatMoney, formatDuration, getErrorInfo } from './helpers.js'
+import { canAffordTraining } from './lib/sleeve-logic.js'
 
 const argsSchema = [
     ['min-shock-recovery', 97], // Minimum shock recovery before attempting to train or do crime (Set to 100 to disable, 0 to recover fully)
@@ -19,14 +20,14 @@ const argsSchema = [
     ['study-to-hacking', 25], // Sleeves will go to university until they reach this much Hak
     ['study-to-charisma', 25], // Sleeves will go to university until they reach this much Cha
     ['training-reserve', null], // Defaults to global reserve.txt. Can be set to a negative number to allow debt. Sleeves will not train if money is below this amount.
-    ['training-cap-seconds', 2 * 60 * 60 /* 2 hours */], // Time since the start of the bitnode after which we will no longer attempt to train sleeves to their target "train-to" settings
+    ['training-cap-seconds', 0], // Time since the start of the bitnode after which we will no longer train sleeves to their "train-to" targets (0 = no cap: sleeves keep exp across augmentation installs, so a cap only ever cuts training short)
     ['disable-spending-hashes-for-gym-upgrades', false], // Set to true to disable spending hashes on gym upgrades when training up sleeves.
     ['disable-spending-hashes-for-study-upgrades', false], // Set to true to disable spending hashes on study upgrades when smarting up sleeves.
     ['enable-bladeburner-team-building', false], // Set to true to have one sleeve support the main sleeve, and another do recruitment. Otherwise, they will just do more "Infiltrate Synthoids"
     ['disable-bladeburner', false], // Set to true to disable having sleeves workout at the gym (costs money)
     ['failed-bladeburner-contract-cooldown', 30 * 60 * 1000], // Default 30 minutes: time to wait after failing a bladeburner contract before we try again
     ['sync-first', false], // Set to true to always synchronize sleeves to 100% before doing anything else (legacy behaviour). By default we only sync when the sleeve's next job is crime for karma.
-    ['train-max-shock', 10], // Only train (gym/university) sleeves whose shock is at or below this. Class exp is multiplied by (100 - shock)% but the cost is not.
+    ['train-max-cost-per-exp', 2500], // Only train (gym/university) sleeves while a point of exp costs at most this much. Class exp is multiplied by (100 - shock)% but the fee is not, so 2500 admits shock <= 90 (lib/sleeve-logic.js trainingCostPerExp)
     ['train-with-pending-augs', false], // Set to true to train sleeves even when they still have purchasable augmentations (installing an aug resets all sleeve exp)
     ['max-faction-sleeves', 8], // Up to this many sleeves may work for (distinct) joined factions that still have unowned augmentations we need rep for. 0 to disable.
     ['faction-work-max-shock', 25], // Extra faction-work sleeves (above) must have shock at or below this (rep earned is scaled by (100 - shock)%), else they recover shock first
@@ -206,8 +207,8 @@ async function mainLoop(ns) {
         await refreshFactionWorkCandidates(ns, playerInfo);
     factionsTakenThisLoop = []; // Each faction accepts only one sleeve at a time, so track which are spoken for this loop
     let canTrain = !options['disable-training'] && !sleeveExpDisabled &&
-        // To avoid training forever when mults are crippling, stop training if we've been in the bitnode a certain amount of time
-        (options['training-cap-seconds'] * 1000 > timeInBitnode) &&
+        // Optionally stop training after some time in the bitnode (--training-cap-seconds, 0 = no cap)
+        (options['training-cap-seconds'] <= 0 || options['training-cap-seconds'] * 1000 > timeInBitnode) &&
         // Don't train if we have no money (unless player has given permission to train into debt)
         (playerInfo.money - costByNextLoop) > (options['training-reserve'] ||
             (promptedForTrainingBudget ? ns.read(trainingReserveFile) : undefined) || globalReserve);
@@ -304,12 +305,13 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     }
     // Train if our sleeve's physical stats aren't where we want them.
     // Class exp is scaled by shockBonus() = (100 - shock)/100 (src/PersonObjects/Sleeve/Work/SleeveClassWork.ts calculateRates) but the class
-    // cost is not, so don't pay to train a heavily shocked sleeve (--train-max-shock). Also, installing any sleeve augmentation zeroes all of
-    // its exp (src/PersonObjects/Sleeve/Sleeve.ts installAugmentation), so don't train while augs remain to be bought (--train-with-pending-augs).
+    // fee is not, so only pay while a point of exp is cheap enough (--train-max-cost-per-exp, lib/sleeve-logic.js). Also, installing any sleeve
+    // augmentation zeroes all of its exp (src/PersonObjects/Sleeve/Sleeve.ts installAugmentation), so don't train while augs remain to be bought (--train-with-pending-augs).
+    const trainingAffordable = canTrain && canAffordTraining(sleeve.shock, options['train-max-cost-per-exp']);
     let augsPending = false;
-    if (canTrain && sleeve.shock <= options['train-max-shock'] && !options['train-with-pending-augs'] && !sleeveExpDisabled)
+    if (trainingAffordable && !options['train-with-pending-augs'] && !sleeveExpDisabled)
         augsPending = (await getAvailableAugs(ns, i)).length > 0;
-    if (canTrain && sleeve.shock <= options['train-max-shock'] && !augsPending) {
+    if (trainingAffordable && !augsPending) {
         const univClasses = {
             "hacking": ns.enums.UniversityClassType.algorithms,
             "charisma": ns.enums.UniversityClassType.leadership
@@ -437,7 +439,7 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     // unsynchronised sleeve (sync starts at max(memory, 1)%) would pay ZB Institute tuition for ~1% of the exp. Synchronising first is not
     // an option either: SleeveSynchroWork gains ~0.0002 sync per 200 ms cycle, i.e. a day per sleeve. So only sleeves that already
     // carry a meaningful sync (from purchased memory) take this job.
-    if (options['darknet-charisma'] && canTrain && sleeve.shock <= options['train-max-shock'] && sleeve.sync >= darknetCharismaMinSync) {
+    if (options['darknet-charisma'] && trainingAffordable && sleeve.sync >= darknetCharismaMinSync) {
         const charismaGoal = Number(ns.read("/Temp/darknet-charisma-goal.txt")) || 0;
         if (charismaGoal > playerInfo.skills.charisma) {
             if (sleeve.city != ns.enums.CityName.Volhaven) {
