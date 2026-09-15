@@ -18,7 +18,9 @@ let resetKey; // ns.getResetInfo().lastAugReset - the spend record only counts w
 // HC-2: running total of what this script paid for purchased servers this install. daemon.js reads it for host-manager's budget instead of
 // ns.getMoneySources().sinceInstall.servers, which the game also debits for home RAM/core upgrades (src/NetscriptFunctions/Singularity.ts
 // upgradeHomeRam / upgradeHomeCores: Player.loseMoney(cost, "servers"); src/utils/MoneySourceTracker.ts has a single `servers` bucket).
-const SPEND_RECORD_FILE = '/Temp/host-manager-spend.txt';
+// Stored at the home root (not under Temp/, same convention as reserve.txt) because cleanup.js and casino.js/ascend.js's
+// calls to it wipe everything under Temp/ without any augmentation install, which would silently zero this record mid-reset.
+const SPEND_RECORD_FILE = 'host-manager-spend.txt';
 
 /** Parses the spend record file. Returns the money spent on purchased servers while `resetKey` matches, else 0 (an install deletes purchased servers).
  * @param {string} text contents of SPEND_RECORD_FILE

@@ -590,12 +590,13 @@ export async function main(ns) {
     }
 
     /** Periodic scripts helper function: Get how much we're willing to spend on new servers (host-manager.js budget).
-     * HC-2: debited only by what host-manager.js itself paid for purchased servers this install (its /Temp/host-manager-spend.txt record).
+     * HC-2: debited only by what host-manager.js itself paid for purchased servers this install (its host-manager-spend.txt record, kept at the
+     * home root rather than under Temp/ so cleanup.js -- run by casino.js/ascend.js without any augmentation install -- cannot silently wipe it).
      * ns.getMoneySources().sinceInstall.servers is NOT used: the game books home RAM and core upgrades under that same "servers" source
      * (src/NetscriptFunctions/Singularity.ts upgradeHomeRam/upgradeHomeCores -> Player.loseMoney(cost, "servers")), so ram-manager.js's home
      * purchases (9-140x more expensive per GB than purchased servers) used to consume this budget and veto server purchases. */
     function getHostManagerBudget() {
-        const serverSpend = parseSpendRecord(ns.read('/Temp/host-manager-spend.txt'), lastAugReset); // ns.read is free
+        const serverSpend = parseSpendRecord(ns.read('host-manager-spend.txt'), lastAugReset); // ns.read is free
         return computeHostManagerBudget(options['max-purchased-server-spend'], moneySources?.sinceInstall?.hacking ?? 0, moneySources?.sinceInstall?.total ?? 0, serverSpend);
     }
 
