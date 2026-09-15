@@ -144,24 +144,51 @@ export async function main(ns) {
     }
 
     // Ram-dodging helpers (Allows the script to only require as much RAM as its most expensive function)
+    // GO-3: getBoardState / getValidMoves / getChains / getLiberties / getControlledEmptyNodes cost 4+8+16+16+16 = 60 GB of static RAM when
+    // referenced by name (src/Netscript/RamCostGenerator.ts), so by default each is fetched through a temp script (5 launches per move). Once
+    // our host has plenty of free RAM we grow this script's allocation with ns.ramOverride (0 GB) and call them directly through a string-keyed
+    // property lookup: the static RAM calculator only counts Identifier nodes (src/Script/RamCalculations.ts), and the dynamic check
+    // (src/Netscript/NetscriptHelpers.tsx updateDynamicRam) charges each function once against the enlarged allocation.
+    const directAnalysisRam = 60;
+    const directAnalysisMinFreeRam = 80; // Only switch with this much free on our host (leaves ~20 GB for other scripts' temp scripts)
+    let directAnalysis = false;
+    const goApi = () => ns.go, goAnalysis = () => ns.go.analysis;
+
+    /** Switch to direct Go analysis calls if our host has >= directAnalysisMinFreeRam GB free. Called once per game; cheap no-op once enabled.
+     * @param {NS} ns */
+    async function tryEnableDirectAnalysis(ns) {
+        if (directAnalysis) return;
+        const freeRam = await getNsDataThroughFile(ns, 'ns.getServerMaxRam(ns.getHostname()) - ns.getServerUsedRam(ns.getHostname())', '/Temp/go-host-free-ram.txt');
+        if (freeRam < directAnalysisMinFreeRam) return;
+        const currentRam = ns.ramOverride(); // No argument: returns the current allocation unchanged
+        const newRam = ns.ramOverride(currentRam + directAnalysisRam);
+        directAnalysis = newRam >= currentRam + directAnalysisRam;
+        log(ns, directAnalysis ? `INFO: go.js RAM allocation raised from ${currentRam} GB to ${newRam} GB: Go analysis functions are now called directly (no temp scripts).` :
+            `INFO: go.js could not raise its RAM allocation to ${currentRam + directAnalysisRam} GB (host has ${freeRam.toFixed(1)} GB free). Still ram-dodging Go analysis.`);
+    }
     /** @param {NS} ns @returns {Promise<string[]>} */
     async function go_getBoardState(ns) {
+        if (directAnalysis) return goApi()["getBoardState"]();
         return await getNsDataThroughFile(ns, `ns.go.getBoardState()`);
     }
     /** @param {NS} ns @returns {Promise<string[]>} */
     async function go_analysis_getControlledEmptyNodes(ns) {
+        if (directAnalysis) return goAnalysis()["getControlledEmptyNodes"]();
         return await getNsDataThroughFile(ns, `ns.go.analysis.getControlledEmptyNodes()`);
     }
     /** @param {NS} ns @returns {Promise<boolean[][]>} */
     async function go_analysis_getValidMoves(ns) {
+        if (directAnalysis) return goAnalysis()["getValidMoves"]();
         return await getNsDataThroughFile(ns, `ns.go.analysis.getValidMoves()`);
     }
     /** @param {NS} ns @returns {Promise<number[][]>} */
     async function go_analysis_getLiberties(ns) {
+        if (directAnalysis) return goAnalysis()["getLiberties"]();
         return await getNsDataThroughFile(ns, `ns.go.analysis.getLiberties()`);
     }
     /** @param {NS} ns @returns {Promise<number[][]>} */
     async function go_analysis_getChains(ns) {
+        if (directAnalysis) return goAnalysis()["getChains"]();
         return await getNsDataThroughFile(ns, `ns.go.analysis.getChains()`);
     }
     /** @param {NS} ns @returns {Promise<[number, number]>} The number of cheats already attempted this game, and the success chance of the next one */
@@ -187,6 +214,7 @@ export async function main(ns) {
 
     /** @param {NS} ns */
     async function playGo(ns) {
+        await tryEnableDirectAnalysis(ns); // GO-3
         const startBoard = await go_getBoardState(ns)
         let inProgress = false
         turn = 0
@@ -389,6 +417,7 @@ export async function main(ns) {
             await startNewGame(ns);
             turn = 0
             ns.clearLog()
+            await tryEnableDirectAnalysis(ns); // GO-3: re-check once per game, home RAM grows over the run
         }
     }
 
