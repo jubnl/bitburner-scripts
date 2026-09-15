@@ -8,11 +8,20 @@ const argsSchema = [
     // Set to true to skip buying home CPU cores. Cores boost grow/weaken/share scripts run on home by 1 + (cores - 1) / 16 (src/Server/ServerHelpers.ts getCoreBonus),
     // and daemon.js schedules those scripts on home preferentially. Cores are bought with whatever budget is left after RAM upgrades.
     ['no-cores', false],
+    // HC-9: only buy a core if it costs at most this fraction of current cash (cores cost 1e9 * 7.5^cores and only improve home-run grow/weaken/share by 6.25% each)
+    ['core-max-cash-fraction', 0.05],
 ];
 
 export function autocomplete(data, _) {
     data.flags(argsSchema);
     return [];
+}
+
+/** HC-9: whether a home core purchase is sensible: it must fit the budget left after RAM upgrades AND be at most `maxCashFraction` of current cash.
+ * A core (7.5 b, 56 b, 422 b, ...) buys 6.25% fewer grow/weaken/share threads on home only (src/Server/ServerHelpers.ts getCoreBonus = 1 + (cores - 1) / 16),
+ * while the same money buys orders of magnitude more purchased-server RAM (src/Server/ServerPurchases.ts). */
+export function coreWithinBudget(cost, cash, spendable, maxCashFraction) {
+    return cost <= spendable && cost <= cash * maxCashFraction;
 }
 
 /** @param {NS} ns **/
@@ -27,7 +36,7 @@ export async function main(ns) {
     // RAM first (it benefits every script), then spend whatever budget is left on cores
     spendable = await buyHomeRam(ns, spendable, money);
     if (!options['no-cores'] && spendable > 0)
-        await buyHomeCores(ns, spendable, money);
+        await buyHomeCores(ns, spendable, money, options['core-max-cash-fraction']);
 }
 
 /** Quickly buy as many home RAM upgrades as we can within the budget
@@ -68,7 +77,7 @@ async function buyHomeRam(ns, spendable, money) {
  * RAM as their RAM-upgrade counterparts (src/Netscript/RamCostGenerator.ts SingularityFn2), and are ram-dodged the same way.
  * @param {NS} ns
  * @returns {Promise<number>} The budget remaining after any purchases **/
-async function buyHomeCores(ns, spendable, money) {
+async function buyHomeCores(ns, spendable, money, maxCashFraction) {
     do {
         const cores = await getNsDataThroughFile(ns, `ns.getServer(ns.args[0]).cpuCores`, '/Temp/home-cpu-cores.txt', ["home"]);
         if (cores >= max_cores) {
@@ -78,8 +87,9 @@ async function buyHomeCores(ns, spendable, money) {
         // Game: cost = 1e9 * 7.5 ^ cores (src/PersonObjects/Player/PlayerObjectServerMethods.ts getUpgradeHomeCoresCost)
         const cost = await getNsDataThroughFile(ns, `ns.singularity.getUpgradeHomeCoresCost()`);
         const upgradeDesc = `home cores from ${cores} to ${cores + 1} (cost: ${formatMoney(cost)})`;
-        if (spendable < cost) {
-            log(ns, `Money we're allowed to spend (${formatMoney(spendable)}) is less than the cost (${formatMoney(cost)}) to upgrade ${upgradeDesc}`);
+        if (!coreWithinBudget(cost, money, spendable, maxCashFraction)) { // HC-9
+            log(ns, `Not upgrading ${upgradeDesc}: it must fit the remaining budget (${formatMoney(spendable)}) and be at most ` +
+                `${(maxCashFraction * 100).toFixed(1)}% of cash (${formatMoney(money * maxCashFraction)}) - set --core-max-cash-fraction to change this.`);
             return spendable;
         }
         if (!(await getNsDataThroughFile(ns, `ns.singularity.upgradeHomeCores()`))) {
