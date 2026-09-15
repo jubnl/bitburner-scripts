@@ -53,6 +53,7 @@ let sleeveExpDisabled = false; // bitNodeOptions.disableSleeveExpAndAugmentation
 let factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = []; // Factions other sleeves can work for (item 9)
 let factionBySleeve = {}; // Sleeve index -> faction it was last successfully set to work for (setToFactionWork throws if another sleeve still works there)
 const factionWorkRefreshInterval = 5 * 60 * 1000; // How often to recompute which factions still need rep
+const darknetCharismaMinSync = 50; // Minimum sleeve sync% for the --darknet-charisma study task to be worth its tuition (see pickSleeveTask)
 let options;
 // Sleeve -> bladeburner contract assignment (each contract type can only be performed by one sleeve at a time)
 const sleeveBbContractBySleeve = { 1: "Retirement", 2: "Bounty Hunter", 3: "Tracking" };
@@ -431,7 +432,12 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
         }
     }
     // If darknet.js is waiting on the player's charisma to unlock its next blocked action, put an otherwise-idle, healthy sleeve to studying Leadership too
-    if (options['darknet-charisma'] && canTrain && sleeve.shock <= options['train-max-shock']) {
+    // Only the player's charisma matters for that goal, and a sleeve's class exp reaches the player scaled by its sync%
+    // (src/PersonObjects/Sleeve/Work/Work.ts applySleeveGains: applyWorkStatsExp(Player, stats, mult * sleeve.syncBonus())), so an
+    // unsynchronised sleeve (sync starts at max(memory, 1)%) would pay ZB Institute tuition for ~1% of the exp. Synchronising first is not
+    // an option either: SleeveSynchroWork gains ~0.0002 sync per 200 ms cycle, i.e. a day per sleeve. So only sleeves that already
+    // carry a meaningful sync (from purchased memory) take this job.
+    if (options['darknet-charisma'] && canTrain && sleeve.shock <= options['train-max-shock'] && sleeve.sync >= darknetCharismaMinSync) {
         const charismaGoal = Number(ns.read("/Temp/darknet-charisma-goal.txt")) || 0;
         if (charismaGoal > playerInfo.skills.charisma) {
             if (sleeve.city != ns.enums.CityName.Volhaven) {
