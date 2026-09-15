@@ -17,9 +17,9 @@ export async function main(ns) {
     // lines break both cracks (R6). Same envelope as the agent's claim, so the controller re-stamps it.
     let claimedAt = Date.now();
     const renewClaim = () => {
-        claimedAt = Date.now();
         const line = encodeMsg("worker", me, pid, { kind: "crack", host: target, workerPid: pid, renewed: true });
-        if (!ns.tryWritePort(options.port, line)) ns.print(`WARN: port full, dropped claim renewal: ${line}`);
+        if (ns.tryWritePort(options.port, line)) claimedAt = Date.now();
+        else ns.print(`WARN: port full, dropped claim renewal: ${line}`);
     };
     const details = ns.dnet.getServerDetails(target);
     if (!details.isOnline || !details.isConnectedToCurrentServer) return send({ host: target, success: false, attempts: 0, reason: "unreachable" });

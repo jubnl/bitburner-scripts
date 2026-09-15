@@ -107,3 +107,12 @@ test("crack.js renews its claim from inside the attempt loop", () => {
     assert.match(crack, /kind: "crack", host: target, workerPid: pid, renewed: true/);
     assert.match(crack, /if \(Date\.now\(\) - claimedAt >= CLAIM_REFRESH\) renewClaim\(\);/);
 });
+
+// R6 fix round 1: claimedAt used to advance before the port write, so a full port silently
+// dropped the renewal yet still pushed the next retry a full CLAIM_REFRESH away, reopening the
+// duplicate-crack race. claimedAt must only advance once tryWritePort actually succeeds.
+test("crack.js only marks a crack claim renewed once the port write succeeds", () => {
+    const crack = src("darknet/crack.js");
+    assert.match(crack, /if \(ns\.tryWritePort\(options\.port, line\)\) claimedAt = Date\.now\(\);/);
+    assert.doesNotMatch(crack, /claimedAt = Date\.now\(\);\s*\n\s*const line = encodeMsg\("worker"/);
+});
