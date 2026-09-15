@@ -1,5 +1,5 @@
 import { log, disableLogs, getConfiguration, instanceCount, getNsDataThroughFile, runCommand, getFilePath, getActiveSourceFiles, formatNumberShort, formatDuration } from './helpers.js'
-import { chanceRangeVerdict } from './lib/bladeburner-logic.js'
+import { chanceRangeVerdict, fieldAnalysisEffect, rankPopulationActions, chaosDifficultyMult, diplomacyMinutesTo, shouldRunDiplomacy, planSkillUpgradeCount } from './lib/bladeburner-logic.js'
 
 const cityNames = ["Sector-12", "Aevum", "Volhaven", "Chongqing", "New Tokyo", "Ishima"];
 const antiChaosOperation = "Stealth Retirement Operation"; // Note: Faster and more effective than Diplomacy at reducing city chaos
@@ -31,7 +31,8 @@ const difficultyFacByAction = {
 };
 
 // Some bladeburner info gathered at startup and cached
-let skillNames, generalActionNames, contractNames, operationNames, remainingBlackOpsNames, blackOpsRanks;
+let skillNames, generalActionNames, contractNames, operationNames, remainingBlackOpsNames, blackOpsRanks; // blackOpsRanks is fetched once at startup (gatherBladeburnerInfo)
+let cachedMaxLevels = {}, maxLevelsRank = -1; // Action max levels only rise on a success (Bladeburner.ts completeAction), which also changes rank: refetched when rank changes
 let inFaction, haveSimulacrum, lastBlackOpComplete, lowStaminaTriggered, timesTrained, currentTaskEndTime, maxRankNeeded, lastAssignedTask;
 let ownedSourceFiles;
 let player = (/**@returns{Player}*/() => undefined)();
@@ -46,6 +47,7 @@ const argsSchema = [
     ['disable-action-leveling', false], // By default, contract/operation levels are set to the highest level whose estimated success chance meets --success-threshold
     ['chaos-recovery-threshold', 50], // Prefer to do "Stealth Retirement" operations to reduce chaos when it reaches this number
     ['max-chaos', 100], // If chaos exceeds this amount in every city, we will reluctantly resort to diplomacy to reduce it.
+    ['chaos-diplomacy-horizon-minutes', 60], // When every city is above --chaos-recovery-threshold and no Stealth Retirement is available, run Diplomacy if it pays for itself over this expected stay (lib/bladeburner-logic.js shouldRunDiplomacy)
     ['max-chaos-for-incite', 15], // Only "Incite Violence" (to generate more contracts/operations) while chaos in every city is below this
     ['toast-upgrades', false], // Set to true to toast each time a skill is upgraded
     ['toast-operations', false], // Set to true to toast each time we switch operations
@@ -93,6 +95,8 @@ export async function main(ns) {
         }
         const nextTaskComplete = currentTaskEndTime - Date.now();
         await ns.sleep(Math.min(options['update-interval'], nextTaskComplete > 0 ? nextTaskComplete : Number.MAX_VALUE));
+        // Re-read state right after the next bladeburner tick (1 s, faster in bonus time) rather than mid-tick. 0 GB (RamCostGenerator.ts CycleTiming).
+        try { await ns.bladeburner.nextUpdate(); } catch { /* Not in bladeburner (yet); mainLoop reports it */ }
     }
 }
 
@@ -111,6 +115,10 @@ const getBBDict = async (ns, strFunction, elements, ...args) => await getNsDataT
 // Helper for dual-parameter bladeburner functions e.g. getActionCountRemaining(actionType, action)
 const getBBDictByActionType = async (ns, strFunction, actionType, elements) =>
     await getBBDict(ns, `${strFunction}(ns.args[1], %)`, elements, actionType);
+
+/** @param {NS} ns
+ * Refresh the cached player object (used for Field Analysis effectiveness and Diplomacy rate, which depend on current skills) */
+async function refreshPlayer(ns) { return player = await getNsDataThroughFile(ns, 'ns.getPlayer()'); }
 
 /** @param {NS} ns
  * Gather all one-time bladeburner info using ram-dodging scripts. */
@@ -183,7 +191,10 @@ async function mainLoop(ns) {
     // Create some quick-reference collections of action names that are limited in count and/or reserved for special purpose
     const limitedActions = operationNames.concat(contractNames);
     if (nextBlackOp) limitedActions.unshift(nextBlackOp);
-    const populationActions = ["Undercover Operation", "Investigation", "Tracking"];
+    // Actions that improve the population estimate by a percentage (Bladeburner.ts: Undercover 0.8 %, Investigation 0.4 % per success). Tracking
+    // only moves it by 100-1000 people (improvePopulationEstimateByCount) on a ~1e9 population and is useless for this. Field Analysis is added
+    // in the uncertain branch below since it is a general action (never reserved, unlimited count).
+    const populationActions = ["Undercover Operation", "Investigation"];
     const reservedActions = ["Raid", "Stealth Retirement Operation"].concat(populationActions
         // Only reserve these actions if their count is below the configured reserve amount, scaled down as we approach our final rank (stop reserving at 99% of max rank)
         .filter(a => getCount(a) <= (options['reserved-action-count'] * (1 - rank / (0.99 * maxRankNeeded)))));
@@ -227,14 +238,14 @@ async function mainLoop(ns) {
     } // Also, if we have nothing to do (even no Stealth Retirement), but chaos is above 'max-chaos' in some city, switch to it to do Diplomacy
 
     // GENERAL CASE: GO TO HIGHEST-POPULATION CITY
+    // Cities with no chaos penalty (chaos above --chaos-recovery-threshold multiplies action difficulty by sqrt(1 + chaos - 50), Action.ts getChaosSuccessFactor)
+    const citiesWithinChaos = cityNames.filter(city => chaosByCity[city] <= options['chaos-recovery-threshold']);
     if (!goToCity) { // Otherwise, cities with higher populations give better operation chances
-        // Try to narrow down the cities we wish to work in to the ones with no chaos penalties
-        let acceptableCities = cityNames.filter(city => chaosByCity[city] <= options['chaos-recovery-threshold']);
         // Pick the city (within chaos thresholds) with the highest population to maximize success chance.
-        // If no city is within thresholds, the largest population city will be picked regardless of chaos
-        [goToCity, population] = getMaxKeyValue(populationByCity, acceptableCities.length > 0 ? acceptableCities : cityNames);
+        // If no city is within thresholds, the largest population city will be picked regardless of chaos (and Diplomacy considered below)
+        [goToCity, population] = getMaxKeyValue(populationByCity, citiesWithinChaos.length > 0 ? citiesWithinChaos : cityNames);
         travelReason = `Highest population (${formatNumberShort(population)}) city, with chaos ${chaosByCity[goToCity].toFixed(1)}` +
-            (acceptableCities.length == 0 ? ` (all cities above chaos threshold of ${options['chaos-recovery-threshold']})` : '');
+            (citiesWithinChaos.length == 0 ? ` (all cities above chaos threshold of ${options['chaos-recovery-threshold']})` : '');
     }
 
     let currentCity = await getBBInfo(ns, 'getCity()');
@@ -252,11 +263,16 @@ async function mainLoop(ns) {
     // (populationUncertain below): both Field Analysis and Investigation/Undercover move popEst toward pop, and lo == hi only when popEst == pop.
     const blackOpsChance = nextBlackOp === null || rank < blackOpsRanks[nextBlackOp] ? [0, 0] : // Insufficient rank for blackops means chance is zero
         (([lo, hi]) => [Math.min(lo, hi), Math.max(lo, hi)])((await getBBDictByActionType(ns, 'getActionEstimatedSuccessChance', "Black Operations", [nextBlackOp]))[nextBlackOp]);
-    // Gather current/max levels of levelable actions so we can tune them to meet our success threshold (4 GB each, ram-dodged)
+    // Gather current/max levels of levelable actions so we can tune them to meet our success threshold (4 GB each, ram-dodged).
+    // Max levels only change on a successful action (Bladeburner.ts completeAction), which also changes rank, so they are cached until rank moves.
     let currentLevels = {}, maxLevels = {};
     if (!options['disable-action-leveling']) {
         currentLevels = { ...await getBBDictByActionType(ns, 'getActionCurrentLevel', "Contracts", contractNames), ...await getBBDictByActionType(ns, 'getActionCurrentLevel', "Operations", operationNames) };
-        maxLevels = { ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Contracts", contractNames), ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Operations", operationNames) };
+        if (rank != maxLevelsRank) {
+            cachedMaxLevels = { ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Contracts", contractNames), ...await getBBDictByActionType(ns, 'getActionMaxLevel', "Operations", operationNames) };
+            maxLevelsRank = rank;
+        }
+        maxLevels = cachedMaxLevels;
     }
     const thresholdFor = actionName => actionName == nextBlackOp ? options['blackop-success-threshold'] : options['success-threshold'];
     // Define some helpers for determining min/max chance for each action
@@ -280,10 +296,18 @@ async function mainLoop(ns) {
     if (lowStaminaTriggered) {
         bestActionName = chaosByCity[currentCity] > options['max-chaos'] ? "Diplomacy" : "Field Analysis";
         reason = `Stamina is low: ${(100 * staminaPct).toFixed(1)}% < ${(100 * options['low-stamina-pct']).toFixed(1)}%`
-    } // If current city chaos is greater than our threshold, keep it low with "Stealth Retirement" if odds are good
-    else if (chaosByCity[currentCity] > options['chaos-recovery-threshold'] && getCount(antiChaosOperation) > 0 && minChance(antiChaosOperation) > 0.99) {
+    } // If current city chaos is greater than our threshold, keep it low with "Stealth Retirement" if odds are good. Above the threshold every
+    // action already runs at 1/sqrt(1 + chaos - 50) of its chance, so the normal --success-threshold is the right gate here, not 99%.
+    else if (chaosByCity[currentCity] > options['chaos-recovery-threshold'] && getCount(antiChaosOperation) > 0 && minChance(antiChaosOperation) > options['success-threshold']) {
         bestActionName = antiChaosOperation;
         reason = `Chaos is high: ${chaosByCity[currentCity].toFixed(2)} > ${options['chaos-recovery-threshold']} (--chaos-recovery-threshold) ${actionSummaryString(bestActionName)}`;
+    } // No Stealth Retirement to spend and no city under the threshold to move to: the penalty is a cliff at 50 (x1.41 at 51, x7 at 100), so spend
+    // Diplomacy time now if it pays for itself over the expected stay (lib/bladeburner-logic.js shouldRunDiplomacy)
+    else if (chaosByCity[currentCity] > options['chaos-recovery-threshold'] && citiesWithinChaos.length == 0 &&
+        shouldRunDiplomacy(chaosByCity[currentCity], options['chaos-recovery-threshold'], (await refreshPlayer(ns)).skills.charisma, options['chaos-diplomacy-horizon-minutes'])) {
+        bestActionName = "Diplomacy";
+        reason = `Chaos ${chaosByCity[currentCity].toFixed(2)} > ${options['chaos-recovery-threshold']} in every city (x${chaosDifficultyMult(chaosByCity[currentCity], options['chaos-recovery-threshold']).toFixed(2)} difficulty); ` +
+            `Diplomacy at charisma ${player.skills.charisma} needs ~${formatDuration(60000 * diplomacyMinutesTo(chaosByCity[currentCity], options['chaos-recovery-threshold'], player.skills.charisma))}`;
     } // If current city chaos is very high, we should be very wary of the snowballing effects, and try to reduce it.
     else if (chaosByCity[currentCity] > options['max-chaos']) {
         bestActionName = getCount(antiChaosOperation) > 0 && minChance(antiChaosOperation) > 0.8 ? antiChaosOperation : "Diplomacy";
@@ -297,11 +321,23 @@ async function mainLoop(ns) {
         let candidateActions = limitedActions;
         // We should deal with population uncertainty if it is causing some mission (including the next BlackOp, at its own threshold) to straddle its success threshold
         let populationUncertain = candidateActions.some(a => chanceRangeVerdict(getChance(a), thresholdFor(a)) == "uncertain");
-        // If current population uncertainty is such that some actions have a maxChance of ~100%, but not a minChance of ~100%,
-        //   focus on actions that improve the population estimate, otherwise, reserve these actions for later
-        // TODO: "Field Analysis" is the only population action that scales with player stats, so we should calculate and sort by
-        //       "effectiveness per second" of each and see which is the most worthwhile way of improving the population estimate.
-        candidateActions = populationUncertain ? populationActions : unreservedActions;
+        // If current population uncertainty is such that some actions have a maxChance above threshold, but not a minChance, focus on the action
+        // that improves the population estimate fastest (expected % per second, lib/bladeburner-logic.js rankPopulationActions); otherwise,
+        // reserve the population actions for later
+        if (populationUncertain) {
+            await refreshPlayer(ns); // Field Analysis effectiveness depends on current hacking / intelligence / charisma
+            const popActionTimes = await getNsDataThroughFile(ns,
+                'Object.fromEntries(JSON.parse(ns.args[0]).map(([t, n]) => [n, ns.bladeburner.getActionTime(t, n)]))',
+                '/Temp/bladeburner-population-action-times.txt',
+                [JSON.stringify([["Operations", "Undercover Operation"], ["Operations", "Investigation"], ["General", "Field Analysis"]])]);
+            const expectedChance = a => (minChance(a) + maxChance(a)) / 2;
+            candidateActions = rankPopulationActions([
+                { name: "Undercover Operation", pctPerSuccess: 0.8, chance: expectedChance("Undercover Operation"), timeMs: popActionTimes["Undercover Operation"], count: getCount("Undercover Operation") },
+                { name: "Investigation", pctPerSuccess: 0.4, chance: expectedChance("Investigation"), timeMs: popActionTimes["Investigation"], count: getCount("Investigation") },
+                { name: "Field Analysis", pctPerSuccess: fieldAnalysisEffect(player.skills.hacking, player.skills.intelligence, player.skills.charisma, player.mults.bladeburner_analysis), chance: 1, timeMs: popActionTimes["Field Analysis"], count: Number.POSITIVE_INFINITY },
+            ]);
+        } else
+            candidateActions = unreservedActions;
         // Filter out candidates with no contract counts remaining
         candidateActions = candidateActions.filter(a => getCount(a) > 0);
         //log(ns, `The following actions are available: ${candidateActions}`); // Debug log to see what candidate actions are
@@ -440,21 +476,26 @@ async function spendSkillPoints(ns) {
         if (unspent == 0) return;
         const skillLevels = await getBBDict(ns, 'getSkillLevel(%)', skillNames);
         const skillCosts = await getBBDict(ns, 'getSkillUpgradeCost(%)', skillNames);
-        // Find the next lowest skill cost
-        let skillToUpgrade, minPercievedCost = Number.MAX_SAFE_INTEGER;
-        for (const skillName of skillNames) {
-            // Workaround: Next v2.6.0 API is supposed to return 'Infinity' for skills that can't be upgraded but this comes back as null
-            let percievedCost = (skillCosts[skillName] ?? Number.POSITIVE_INFINITY) * (costAdjustments[skillName] || 1);
-            // Bitburner pre-2.6.0 workaround: Overclock is capped at lvl 90, but the cost makes it seem upgradable
-            if (skillName === "Overclock" && skillLevels[skillName] == 90) percievedCost = Number.POSITIVE_INFINITY;
-            if (percievedCost < minPercievedCost)
-                [skillToUpgrade, minPercievedCost] = [skillName, percievedCost];
-        }
+        // Perceived cost of the next level of each skill (costAdjustments tweak the priority). The API returns null/Infinity for a maxed skill.
+        const perceivedCostOf = skillName => (skillName === "Overclock" && skillLevels[skillName] >= 90) ? Number.POSITIVE_INFINITY :
+            (skillCosts[skillName] ?? Number.POSITIVE_INFINITY) * (costAdjustments[skillName] || 1);
+        const [skillToUpgrade, minPercievedCost] = getMinKeyValue(Object.fromEntries(skillNames.map(s => [s, perceivedCostOf(s)])));
         // If the percieved or actual cost of the next best upgrade is too high, save our remaining points for later
-        if (minPercievedCost > unspent || skillCosts[skillToUpgrade] > unspent) return;
-        // Otherwise, purchase the upgrade
-        if (await getBBInfo(ns, `upgradeSkill(ns.args[0])`, skillToUpgrade))
-            log(ns, `SUCCESS: Upgraded Bladeburner skill ${skillToUpgrade}`, false, options['toast-upgrades'] ? 'success' : undefined);
+        if (skillToUpgrade == null || minPercievedCost > unspent || skillCosts[skillToUpgrade] > unspent) return;
+        // Buy in bulk: getSkillUpgradeCost(name, count) / upgradeSkill(name, count) take a count (closed-form cost, src/Bladeburner/Skill.ts calculateCost).
+        // Keep buying levels of this skill while its perceived cost stays below the next best skill's, and we can afford them.
+        const costForTwo = await getBBInfo(ns, `getSkillUpgradeCost(ns.args[0], ns.args[1])`, skillToUpgrade, 2);
+        const nextBestPerceivedCost = Math.min(...skillNames.filter(s => s != skillToUpgrade).map(perceivedCostOf));
+        const maxCount = skillToUpgrade === "Overclock" ? 90 - skillLevels[skillToUpgrade] : Number.POSITIVE_INFINITY;
+        let count = planSkillUpgradeCount(skillCosts[skillToUpgrade], Number.isFinite(costForTwo) ? costForTwo : 2 * skillCosts[skillToUpgrade],
+            costAdjustments[skillToUpgrade] || 1, nextBestPerceivedCost, unspent, maxCount);
+        let success = count > 0 && await getBBInfo(ns, `upgradeSkill(ns.args[0], ns.args[1])`, skillToUpgrade, count);
+        if (!success && count > 1) { // The bulk cost estimate rounds; fall back to a single level, which we verified is affordable
+            count = 1;
+            success = await getBBInfo(ns, `upgradeSkill(ns.args[0], ns.args[1])`, skillToUpgrade, count);
+        }
+        if (success)
+            log(ns, `SUCCESS: Upgraded Bladeburner skill ${skillToUpgrade} by ${count} level${count == 1 ? '' : 's'} (${skillLevels[skillToUpgrade]} -> ${skillLevels[skillToUpgrade] + count})`, false, options['toast-upgrades'] ? 'success' : undefined);
         else
             log(ns, `WARNING: Something went wrong while trying to upgrade Bladeburner skill ${skillToUpgrade}. ` +
                 `Currently have ${unspent} SP, upgrade should cost ${skillCosts[skillToUpgrade]} SP.`, false, 'warning');
