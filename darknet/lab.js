@@ -239,9 +239,13 @@ export async function main(ns) {
  * @param {NS} ns */
 function deliverAgent(ns, labHost, port) {
     // One file at a time: ns.scp throws on a missing source and copies nothing, so a single
-    // gap in this host's payload would otherwise cost us the whole delivery. The command files
-    // are best-effort anyway (parseCmd falls back to safe defaults on an empty read).
-    for (const file of [...AGENT_FILES, FILES.passwords, FILES.cmd]) {
+    // gap in this host's payload would otherwise cost us the whole delivery. No command file is
+    // shipped on purpose: this host's cmd.txt is a walk host's, which normally carries
+    // stasis:true, and the lab agent would put a stasis link on the labyrinth with it -- a link
+    // that counts against the global limit and that no command can ever release. With no cmd
+    // file the lab agent runs on parseCmd's defaults (no stasis, no walk, no fillers) and only
+    // opens the cache.
+    for (const file of [...AGENT_FILES, FILES.passwords]) {
         try {
             ns.scp(file, labHost);
         } catch (err) {

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { parseCmd, emptyState, encodeMsg, WORKER_RAM } from "../darknet/lib.js";
 import {
     applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
@@ -287,6 +288,24 @@ test("assignStasis keeps wanted links, spends the whole limit, and lists the rel
     const plan2 = { stasisRelease: [] };
     assert.deepEqual(assignStasis(keeping, plan2, ["beta", "alpha", "gamma"]), ["alpha", "beta"]);
     assert.deepEqual(plan2.stasisRelease, []);
+});
+
+// DN-F5: setStasisLink only ever targets the calling script's own host (Darknet.ts) and
+// getStasisLinkServers() counts every darknet server, labyrinths included (effects.ts). A link a
+// lab agent put on the labyrinth occupies a global slot no command can take back, so it must
+// count against the limit instead of making the plan hand out a slot that does not exist.
+test("assignStasis counts a link held by a labyrinth against the limit", () => {
+    const ns = makeNs({ stasisLimit: 2, stasisLinked: [LAB] });
+    const plan = { stasisRelease: [] };
+    assert.deepEqual(assignStasis(ns, plan, ["alpha", "beta"]), ["alpha"], "only one free slot really exists");
+    assert.deepEqual(plan.stasisRelease, [LAB], "reported so the status line shows where the slot went");
+});
+
+test("lab.js does not ship the walk host's cmd.txt to the labyrinth", () => {
+    const lab = readFileSync(new URL("../darknet/lab.js", import.meta.url), "utf8");
+    const delivery = lab.match(/for \(const file of \[([^\]]*)\]\)/);
+    assert.ok(delivery, "deliverAgent's file loop");
+    assert.doesNotMatch(delivery[1], /FILES\.cmd/, "the walk host's cmd carries stasis:true, which the lab agent would act on");
 });
 
 test("a host holding a link the plan dropped is commanded to release it", () => {

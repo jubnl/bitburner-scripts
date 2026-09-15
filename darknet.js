@@ -518,12 +518,18 @@ function planCharismaGoal(state, charisma, lab) {
  * the plan down to whatever stale links happened to exist. */
 export function assignStasis(ns, plan, candidates) {
     const limit = ns.dnet.getStasisLinkLimit();
-    const linked = ns.dnet.getStasisLinkedServers().filter(name => !isLabHost(name));
+    const allLinked = ns.dnet.getStasisLinkedServers();
+    // A link sitting on a labyrinth counts toward the game's global limit (effects.ts
+    // getStasisLinkServers filters every darknet server) but no command can release it: labs are
+    // never commandable and setStasisLink only targets the calling script's own host. So the slot
+    // it holds is spent until the lab agent drops it by itself; never plan a host into it.
+    const labLinked = allLinked.filter(isLabHost);
+    const linked = allLinked.filter(name => !isLabHost(name));
     const kept = linked.filter(name => candidates.includes(name));
-    const budget = Math.max(0, limit - kept.length);
+    const budget = Math.max(0, limit - kept.length - labLinked.length);
     const rest = candidates.filter(name => !kept.includes(name));
     const targets = [...kept, ...rest.slice(0, budget)];
-    plan.stasisRelease = linked.filter(name => !targets.includes(name));
+    plan.stasisRelease = [...linked.filter(name => !targets.includes(name)), ...labLinked];
     return targets;
 }
 
