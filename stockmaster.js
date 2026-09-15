@@ -104,7 +104,7 @@ export async function main(ns) {
     longTermForecastWindowLength = options['pre-4s-forecast-window'] || (marketCycleLength + 1);
     showMarketSummary = options['show-pre-4s-forecast'] || options['show-market-summary'];
     // Other global values must be reset at start lest they be left in memory from a prior run
-    lastTick = 0, totalProfit = 0, lastLog = "", marketCycleDetected = false, detectedCycleTick = 0, inversionAgreementThreshold = 6;
+    lastTick = 0, totalProfit = 0, lastLog = "", marketCycleDetected = false, detectedCycleTick = 0, inversionAgreementThreshold = 6, cannotBuy4S = false;
     let myStocks = [], allStocks = [];
     let player = await getPlayerInfo(ns);
     resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
@@ -551,9 +551,19 @@ async function liquidate(ns) {
         `in ${totalStocks} stocks for ${formatMoney(totalRevenue, 3)}`, true, 'success');
 }
 
+let cannotBuy4S = false; // Latched once we know 4S can never be purchased in this BitNode, so we stop liquidating to try again
+
 /** @param {NS} ns **/
 /** @param {Player} playerStats **/
 async function tryGet4SApi(ns, playerStats, budget) {
+    if (cannotBuy4S) return false;
+    // src/NetscriptFunctions/StockMarket.ts purchase4SMarketData / purchase4SMarketDataTixApi return false unconditionally when the
+    // "Disable 4S Data" advanced BitNode option is set, so don't liquidate our portfolio every loop trying to afford them.
+    if (resetInfo.bitNodeOptions?.disable4SData) {
+        log(ns, 'INFO: 4S Market Data is disabled in this BitNode\'s advanced options. Will keep trading with pre-4S forecasts.', true);
+        cannotBuy4S = true;
+        return false;
+    }
     if (await checkAccess(ns, 'has4SDataTixApi')) return false; // Only return true if we just bought it
     const cost4sData = 1E9 * bitNodeMults.FourSigmaMarketDataCost;
     const cost4sApi = 25E9 * bitNodeMults.FourSigmaMarketDataApiCost;
@@ -577,6 +587,11 @@ async function tryGet4SApi(ns, playerStats, budget) {
         return true;
     } else {
         log(ns, 'ERROR attempting to purchase 4SMarketDataTixApi!', false, 'error');
+        // If we had the money (possibly after liquidating) and the game still refused, the purchase is impossible: never liquidate to retry
+        if ((await getPlayerInfo(ns)).money >= totalCost) {
+            log(ns, `WARNING: Could not purchase 4S data despite having ${formatMoney(totalCost)}. Giving up on 4S for this run.`, true, 'warning');
+            cannotBuy4S = true;
+        }
     }
     return false;
 }
