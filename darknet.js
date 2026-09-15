@@ -42,7 +42,8 @@ const STALE_FRONTIER = 3600000;     // no new server for an hour => the frontier
 const STORM_COOLDOWN = 1800000;     // the game's global STORM_SEED cooldown is 30 minutes
 const KILL_GRACE = 5000;            // ms to let agents notice the stop flag before killing them
 const MIGRATE_THREADS = 10;
-const PROMOTE_THREADS = 8;
+const PROMOTE_THREADS = 4;          // threads buildCmd hands a qualifying host for promote.js
+const MIN_PROMOTE_RAM = 64;         // buildCmd never hands out promote threads below this known maxRam
 const MAX_PROMOTE_SYMBOLS = 3;
 const LAB_DEPTH_SLACK = 6;          // balanced mode flips to labyrinth within this many rows of the lab
 const MIGRATION_CHARGE_TTL = 600000; // a migration charge counts as "in flight" for 10 minutes
@@ -64,11 +65,20 @@ export async function main(ns) {
     if (options.status) return printStatus(ns, state);
     if (options["kill"]) return await stopEverything(ns, state, options);
 
+    // getConfiguration always logs its settings dump, so only call it again once
+    // darknet.js.config.txt actually changes -- otherwise the log is flooded every loop.
+    const confName = `${ns.getScriptName()}.config.txt`;
+    let lastConfigText = ns.read(confName);
+
     log(ns, `INFO: darknet controller started on port ${options.port} (mode ${options.mode}).`, false, "info");
     while (true) {
         try {
-            const reloaded = getConfiguration(ns, argsSchema);
-            if (reloaded) options = reloaded;
+            const configText = ns.read(confName);
+            if (configText !== lastConfigText) {
+                lastConfigText = configText;
+                const reloaded = getConfiguration(ns, argsSchema);
+                if (reloaded) options = reloaded;
+            }
 
             drainPort(ns, options.port, state);
 
@@ -184,7 +194,7 @@ export function drainPort(ns, port, state) {
 function blankServer() {
     return {
         depth: 0, difficulty: 0, modelId: "", maxRam: 0, blockedRam: 0, chaReq: 0,
-        neighbours: [], online: true, lastSeen: 0, stasis: false,
+        neighbours: [], online: true, lastSeen: 0, stasis: false, isStationary: false,
     };
 }
 
@@ -232,6 +242,7 @@ function applyMessage(state, msg) {
             const entry = upsertServer(state, host, {
                 depth: details.depth, difficulty: details.difficulty, modelId: details.modelId,
                 blockedRam: details.blockedRam, chaReq: details.requiredCharismaSkill, online: true,
+                maxRam: msg.maxRam, isStationary: details.isStationary,
             }, ts);
             // Only the agent running ON a host reports that host's neighbours; reports about a
             // neighbour carry `neighbours: null`, so an untouched [] means "never scanned", not
@@ -513,8 +524,11 @@ export function planLoot(ns, state, options, charisma = 0) {
     plan.mode = "loot";
 
     const liveNow = Date.now();
+    // darkweb (the stationary root) and lab hosts are never valid stasis targets, and neither is
+    // any host the game itself reports as isStationary (fixed/story servers cannot be moved).
     const freed = Object.entries(state.servers)
-        .filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name) && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
+        .filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name) && name !== "darkweb"
+            && entry.isStationary !== true && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
     plan.stasisTargets = assignStasis(ns, freed);
@@ -616,12 +630,15 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     // starts because its command file said so, so pinning a host we cannot reach does nothing
     // except waste a slot in `assignStasis`'s budget.
     const reachable = commandable(state);
+    // darkweb and any isStationary host are never valid stasis targets (see planLoot); lab hosts
+    // are already excluded from `online` above.
     const adjacent = online
-        .filter(([name, entry]) => reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true
+            && reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
     const deepest = online
-        .filter(([name]) => reachable.includes(name))
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && reachable.includes(name))
         .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
         .map(([name]) => name);
     plan.stasisTargets = assignStasis(ns, adjacent.length ? adjacent : deepest);
@@ -696,6 +713,7 @@ export function buildCmd(state, plan, host) {
         if (chargers.includes(host)) { migrateTarget = name; break; }
     }
     const walking = (plan.walkHosts ?? []).includes(host);
+    const hostMaxRam = Number(state.servers[host]?.maxRam) || 0;
     return {
         mode: plan.mode,
         claimed,
@@ -704,7 +722,7 @@ export function buildCmd(state, plan, host) {
             realloc: plan.reallocThreads,
             phish: plan.shareActive ? 0 : 1,
             migrate: migrateTarget ? MIGRATE_THREADS : 0,
-            promote: plan.promoteSymbols.length ? PROMOTE_THREADS : 0,
+            promote: (plan.promoteSymbols.length && hostMaxRam >= MIN_PROMOTE_RAM) ? PROMOTE_THREADS : 0,
         },
         migrateTarget,
         promoteSymbols: plan.promoteSymbols,

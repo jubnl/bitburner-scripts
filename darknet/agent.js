@@ -36,9 +36,17 @@ export async function main(ns) {
         for (const h of neighbours) {
             const d = ns.dnet.getServerDetails(h); detailsByHost[h] = d;
             const key = JSON.stringify([d.isOnline, d.depth, d.difficulty, d.blockedRam, d.modelId, d.hasSession]);
-            if (lastSeen[h] !== key) { lastSeen[h] = key; dispatch("server", { host: h, details: d, neighbours: null }); }
+            if (lastSeen[h] !== key) { lastSeen[h] = key; dispatch("server", { host: h, details: d, neighbours: null, maxRam: ns.getServerMaxRam(h) }); }
         }
         dispatch("server", { host: me, details: ns.dnet.getServerDetails(me), neighbours });
+        // Cracking always outranks spare-RAM work (promote/phish/share): reserve enough RAM for
+        // up to 4 crack.js threads whenever a live, non-lab, unclaimed neighbour still needs one.
+        let needsCrack = false;
+        for (const h of neighbours) {
+            const d = detailsByHost[h];
+            if (d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)) { needsCrack = true; break; }
+        }
+        const reserve = needsCrack ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
         // 2. crack unknown neighbours
         for (const h of neighbours) {
             const d = detailsByHost[h];
@@ -65,8 +73,8 @@ export async function main(ns) {
             const migrateThreads = Math.min(cmd.threads.migrate, Math.floor(freeRam(ns, me) / WORKER_RAM.migrate));
             if (migrateThreads >= 1) ns.exec("darknet/migrate.js", me, { threads: migrateThreads, preventDuplicates: true }, cmd.migrateTarget, "--port", port);
         }
-        if (cmd.promoteSymbols.length && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
-            const promoteThreads = Math.min(cmd.threads.promote, Math.floor(freeRam(ns, me) / WORKER_RAM.promote));
+        if (cmd.promoteSymbols.length && ns.getServerMaxRam(me) >= 64 && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
+            const promoteThreads = Math.min(cmd.threads.promote, Math.floor((freeRam(ns, me) - reserve) / WORKER_RAM.promote));
             if (promoteThreads >= 1) ns.exec("darknet/promote.js", me, { threads: promoteThreads, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port);
         }
         // The labyrinth walker has to run on a host directly connected to the lab, and ns.exec
@@ -81,7 +89,7 @@ export async function main(ns) {
         }
         if (cmd.storm && ns.fileExists("STORM_SEED.exe", me)) { const r = ns.dnet.unleashStormSeed(); dispatch("worker", { kind: "storm", host: me, success: r.success, code: r.code }); }
         if (cmd.stasis && !ns.fileExists("darknet/stasis-done.txt", me) && freeRam(ns, me) >= WORKER_RAM.stasis) { ns.exec("darknet/stasis.js", me, 1, "--port", port); ns.write("darknet/stasis-done.txt", "1", "w"); }
-        const spare = Math.floor(freeRam(ns, me) / (cmd["share"] ? WORKER_RAM["share"] : WORKER_RAM.phish));
+        const spare = Math.floor((freeRam(ns, me) - reserve) / (cmd["share"] ? WORKER_RAM["share"] : WORKER_RAM.phish));
         if (cmd["share"]) { if (spare > 0 && !ns.isRunning("Remote/share.js", me)) ns.exec("Remote/share.js", me, { threads: spare, preventDuplicates: true }); }
         else if (spare > 0 && !ns.isRunning("darknet/phish.js", me, "--port", port)) ns.exec("darknet/phish.js", me, { threads: spare, preventDuplicates: true }, "--port", port);
         // NOTE: no ns.scriptKill here; phish.js exits on its own once cmd["share"] becomes true.
