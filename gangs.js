@@ -38,7 +38,9 @@ let multGangSoftcap = 0.0;
 let allTaskNames = (/**@returns{string[]}*/() => undefined)();
 let allTaskStats = (/**@returns{{[taskName: string]: GangTaskStats;}}*/() => undefined)();
 let assignedTasks = (/**@returns{{[gangMemberName: string]: string;}}*/() => ({}))(); // Each member will independently attempt to scale up the crime they perform until they are ineffective or we start generating wanted levels
-let retrainTarget = {}; // Member -> task-weighted, equipment-stripped stat to train back up to after an ascension / recruit (null = no gate), see needsRetraining
+let retrainTarget = {}; // Member -> {target, weights} to train back up to (task-weighted, equipment-stripped, using the weights recorded at
+// ascension / recruit time so a later drift of the gang's consensus task doesn't move the goalposts mid-retrain) after an ascension / recruit,
+// or null for no gate. See needsRetraining.
 let lastAscensionResults = {}; // Most recent ns.gang.getAscensionResult() per member (used to avoid buying soon-to-be-lost equipment)
 
 // Global state
@@ -307,10 +309,13 @@ async function updateMemberActivities(ns, dictMemberInfo = null, forceTask = nul
  * Logic to assign tasks that maximize rep gain rate without wanted gain getting out of control **/
 async function optimizeGangCrime(ns, myGangInfo) {
     const dictMembers = await getGangInfoDict(ns, myGangMembers, 'getMemberInformation');
-    // Members that have recovered their pre-ascension stats (task-weighted, equipment excluded) may leave training
+    // Members that have recovered their pre-ascension stats (task-weighted with the weights the target was recorded with, equipment excluded)
+    // may leave training. needsRetraining re-measures with retrainTarget[member].weights, not a fresh memberWeights(member) lookup, since the
+    // member's own task is a training task (not a crime) while it retrains, so a fresh lookup would fall back to the gang's consensus task
+    // and could drift mid-retrain.
     for (const member of myGangMembers)
-        if (retrainTarget[member] != null && !needsRetraining(weightedStat(dictMembers[member], memberWeights(member), true), retrainTarget[member])) {
-            log(ns, `INFO: ${member} has recovered its pre-ascension stats (task-weighted ${retrainTarget[member].toFixed(0)}). Returning to crime.`);
+        if (retrainTarget[member] != null && !needsRetraining(dictMembers[member], retrainTarget[member])) {
+            log(ns, `INFO: ${member} has recovered its pre-ascension stats (task-weighted ${retrainTarget[member].target.toFixed(0)}). Returning to crime.`);
             delete retrainTarget[member];
         }
     // Tolerate our wanted level increasing, as long as reputation increases several orders of magnitude faster and we do not currently have a penalty worse than --wanted-penalty-threshold
@@ -433,11 +438,14 @@ async function doRecruitMember(ns, dictMembers = null) {
     if (i < myGangMembers.length) newMemberName += " Understudy"; // Pay our respects to the deceased
     if (await getNsDataThroughFile(ns, `ns.gang.canRecruitMember() && ns.gang.recruitMember(ns.args[0])`, '/Temp/gang-recruit-member.txt', [newMemberName])) {
         myGangMembers.push(newMemberName);
-        assignedTasks[newMemberName] = pickTrainingTask(memberWeights(null));
-        // Train the recruit until it catches up with the weakest existing member (task-weighted, equipment excluded)
-        const weakest = Math.min(...Object.values(dictMembers ?? {}).map(m => weightedStat(m, memberWeights(m.name), true)));
-        retrainTarget[newMemberName] = Number.isFinite(weakest) ? retrainTargetFor(weakest, options['retrain-recovery-fraction']) : null;
-        log(ns, `SUCCESS: Recruited a new gang member "${newMemberName}"!` + (retrainTarget[newMemberName] ? ` Training until task-weighted stats reach ${retrainTarget[newMemberName].toFixed(0)}.` : ''), false, 'success');
+        // Not yet on a crime, so this is (for now) the gang's consensus task weights - pin them below so the target and its later yardstick
+        // (needsRetraining) always agree, even if the gang's consensus task drifts while this recruit is still training.
+        const weights = memberWeights(newMemberName);
+        assignedTasks[newMemberName] = pickTrainingTask(weights);
+        // Train the recruit until it catches up with the weakest existing member (task-weighted with the recruit's own pinned weights, equipment excluded)
+        const weakest = Math.min(...Object.values(dictMembers ?? {}).map(m => weightedStat(m, weights, true)));
+        retrainTarget[newMemberName] = Number.isFinite(weakest) ? retrainTargetFor(weakest, weights, options['retrain-recovery-fraction']) : null;
+        log(ns, `SUCCESS: Recruited a new gang member "${newMemberName}"!` + (retrainTarget[newMemberName] ? ` Training until task-weighted stats reach ${retrainTarget[newMemberName].target.toFixed(0)}.` : ''), false, 'success');
     } else {
         log(ns, `ERROR: Failed to recruit a new gang member "${newMemberName}"!`, false, 'error');
     }
@@ -463,8 +471,10 @@ async function tryAscendMembers(ns, myGangInfo, dictMembers) {
         // Weight each stat's ascension gain by its contribution to the member's task (src/Gang/formulas/formulas.ts statWeight), so an agility
         // gain does not trigger an ascension for a Terrorism member, and a hack or charisma gain does count.
         const weights = memberWeights(member);
-        // Still rebuilding from the last ascension / recruit: ascending again now would compound the exp loss (GangMember.ts ascend zeroes all exp)
-        if (needsRetraining(weightedStat(dictMembers[member], weights, true), retrainTarget[member])) continue;
+        // Still rebuilding from the last ascension / recruit: ascending again now would compound the exp loss (GangMember.ts ascend zeroes all
+        // exp). needsRetraining re-measures with the weights retrainTarget[member] was recorded with (not this freshly-looked-up `weights`,
+        // which - while the member is on a training task, not a crime - falls back to the gang's consensus task and can drift mid-retrain).
+        if (needsRetraining(dictMembers[member], retrainTarget[member])) continue;
         const ascGain = weightedAscensionGain(ascResult, dictMembers[member], weights);
         if (ascGain < getAscendThreshold(i)) continue;
         if (guardRecruits && projectedRespect - ascResult.respect < respectNeededForNextRecruit) {
@@ -475,7 +485,8 @@ async function tryAscendMembers(ns, myGangInfo, dictMembers) {
         if (undefined !== (await getNsDataThroughFile(ns, `ns.gang.ascendMember(ns.args[0])`, null, [member]))) {
             log(ns, `SUCCESS: Ascended member ${member}: ${referenceTaskFor(member)} stat weight x${ascGain.toFixed(2)} ` +
                 `(${gangStatKeys.filter(s => weights[s] > 0).map(s => `${s} -> ${ascResult[s].toFixed(2)}x`).join(", ")})`, false, 'success');
-            retrainTarget[member] = retrainTargetFor(weightedStat(dictMembers[member], weights, true), options['retrain-recovery-fraction']); // Pre-ascension value (dictMembers predates the ascend)
+            // Pre-ascension value (dictMembers predates the ascend), pinned to this member's current `weights` so later checks can't drift
+            retrainTarget[member] = retrainTargetFor(weightedStat(dictMembers[member], weights, true), weights, options['retrain-recovery-fraction']);
             projectedRespect -= ascResult.respect;
             delete lastAscensionResults[member]; // No longer near ascension
         }

@@ -111,25 +111,46 @@ test("GG-3: updates that resolved while no nextUpdate() was pending are estimate
 });
 
 // GG-4: ascension zeroes exp and clears equipment (GangMember.ts ascend), so the member restarts at skill ~= its ascension multiplier. Train until
-// the task-weighted, equipment-stripped stat is back to a fraction of its pre-ascension value instead of a blind 200 s.
+// the task-weighted, equipment-stripped stat is back to a fraction of its pre-ascension value instead of a blind 200 s. The weights used to
+// compute the target are pinned alongside it (retrainTargetFor returns {target, weights}) and needsRetraining always re-measures with those
+// stored weights, never a freshly recomputed one, because the member's own task is a training task (not a crime) while it retrains, so a fresh
+// memberWeights() lookup falls back to the gang's consensus task, which can drift mid-retrain (see the pinning test below).
 test("GG-4: retraining lasts until the equipment-stripped weighted stat recovers the configured fraction", () => {
     const w = taskStatWeights(terrorism);
     const before = { hack: 50, str: 1000, def: 1000, dex: 1000, agi: 1000, cha: 50, hack_mult: 1, str_mult: 2, def_mult: 2, dex_mult: 2, agi_mult: 2, cha_mult: 1 };
-    const target = retrainTargetFor(weightedStat(before, w, true), 0.9); // 0.9 * 0.2 * (50 + 3 * 500 + 50) = 288
-    assert.ok(Math.abs(target - 288) < 1e-9);
+    const retrainTarget = retrainTargetFor(weightedStat(before, w, true), w, 0.9); // 0.9 * 0.2 * (50 + 3 * 500 + 50) = 288
+    assert.ok(Math.abs(retrainTarget.target - 288) < 1e-9);
+    assert.equal(retrainTarget.weights, w);
     const noMults = { hack_mult: 1, str_mult: 1, def_mult: 1, dex_mult: 1, agi_mult: 1, cha_mult: 1 };
     const justAscended = { hack: 7, str: 7, def: 7, dex: 7, agi: 7, cha: 7, ...noMults };
-    assert.equal(needsRetraining(weightedStat(justAscended, w, true), target), true);
+    assert.equal(needsRetraining(justAscended, retrainTarget), true);
     const nearlyThere = { hack: 7, str: 470, def: 470, dex: 470, agi: 470, cha: 7, ...noMults }; // 0.2 * (7 + 1410 + 7) = 284.8
-    assert.equal(needsRetraining(weightedStat(nearlyThere, w, true), target), true);
+    assert.equal(needsRetraining(nearlyThere, retrainTarget), true);
     const recovered = { hack: 7, str: 480, def: 480, dex: 480, agi: 480, cha: 7, ...noMults };  // 0.2 * (7 + 1440 + 7) = 290.8
-    assert.equal(needsRetraining(weightedStat(recovered, w, true), target), false);
+    assert.equal(needsRetraining(recovered, retrainTarget), false);
 });
 
 test("GG-4: no target means no gate; a zero fraction disables it", () => {
-    assert.equal(retrainTargetFor(0, 0.9), null);
-    assert.equal(retrainTargetFor(620, 0), null);
-    assert.equal(needsRetraining(5, null), false);
-    assert.equal(needsRetraining(5, 4), false);
-    assert.equal(needsRetraining(3, 4), true);
+    const w = taskStatWeights(terrorism);
+    assert.equal(retrainTargetFor(0, w, 0.9), null);
+    assert.equal(retrainTargetFor(620, w, 0), null);
+    assert.equal(needsRetraining({ hack: 5 }, null), false);
+});
+
+test("GG-4: recovery is measured against the weights recorded with the target, not a fresh (possibly drifted) lookup", () => {
+    const w = taskStatWeights(terrorism); // pinned at ascension time
+    const before = { hack: 50, str: 1000, def: 1000, dex: 1000, agi: 1000, cha: 50 }; // agi carries no weight in Terrorism
+    // target = 0.9 * 0.2 * (50 + 1000 + 1000 + 1000 + 50) = 0.9 * 620 = 558
+    const retrainTarget = retrainTargetFor(weightedStat(before, w, true), w, 0.9);
+    assert.ok(Math.abs(retrainTarget.target - 558) < 1e-9);
+    // Mid-retrain, the gang's consensus task drifts to Human Trafficking (e.g. everyone else moved off Terrorism); a naive re-lookup of
+    // memberWeights() at check time would use this very different vector instead of the one the target was set against.
+    const trafficking = taskStatWeights({ hackWeight: 30, strWeight: 5, defWeight: 5, dexWeight: 30, chaWeight: 30, difficulty: 36 });
+    // Recovered under the pinned (terrorism) weights: 0.2 * (10 + 930 + 930 + 930 + 10) = 562 >= 558
+    const recoveredUnderTerrorism = { hack: 10, str: 930, def: 930, dex: 930, agi: 5000, cha: 10 };
+    assert.equal(needsRetraining(recoveredUnderTerrorism, retrainTarget), false); // stored (terrorism) weights say "done"
+    // Proof the drifted weights would have disagreed: the same stats measured with trafficking's weights (which barely weight str/def, ignore
+    // agi entirely, and weight dex heavily) are nowhere near 90% of the pre-ascension value under those weights, so a fresh (unpinned) lookup
+    // would have wrongly kept the member training.
+    assert.ok(weightedStat(recoveredUnderTerrorism, trafficking, true) < weightedStat(before, trafficking, true) * 0.9);
 });
