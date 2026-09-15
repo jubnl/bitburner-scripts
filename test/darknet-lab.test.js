@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeLab, labStep, labReport } from "./darknet-mock.js";
-import { nextMove, cellKey, stepTo, findExit, shouldRestart } from "../darknet/lab.js";
+import { nextMove, cellKey, stepTo, findExit, shouldRestart, parseMoveOutcome } from "../darknet/lab.js";
 
 /* Drives darknet/lab.js's navigation against the ported maze generator.
  *
@@ -40,36 +40,49 @@ function cellCount(lab) {
 
 /** Run one complete walk. `mode` is "corner" (no radar fix) or "exit" (radar has shown the X).
  * `swap` is an optional `{ at, to }` that replaces the maze after `at` steps and drops the
- * walker at the new maze's start, which is what a page reload does in game. */
-function walk(initial, mode, swap) {
+ * walker at the new maze's start, which is what a page reload does in game.
+ * `order` is the walker's direction preference (see walkerOrder in darknet/lab.js; Task 10).
+ * Mirrors darknet/lab.js's main loop: labreport is only called when the last move reply could not
+ * be parsed (never, with this mock) and the position and walls come from the reply otherwise (R5). */
+function walk(initial, mode, swap, order) {
     const visited = new Set();
     const stack = [];
     const limit = 4 * cellCount(initial) + (swap ? 4 * cellCount(swap.to) : 0) + 16;
     let lab = initial;
     let position = lab.start.slice();
+    let report = null;              // { coords, open } from the last reply, null = ask labreport
     let expected = null;
     let previous = null;
     let steps = 0;
     let stepsAfterSwap = 0;
     let restarts = 0;
+    let reports = 0;
     let swapped = false;
+    let stale = false;              // the walker's cached walls describe a maze that no longer exists
     while (steps < limit) {
         if (swap && !swapped && steps >= swap.at) {
             swapped = true;
+            stale = true;
             lab = swap.to;
             position = lab.start.slice();
         }
-        const report = labReport(lab, position);
-        if (shouldRestart(report.coords, expected, previous)) {
+        if (!report) {
+            const status = labReport(lab, position);
+            reports++;
+            report = { coords: status.coords, open: { north: status.north, east: status.east, south: status.south, west: status.west } };
+        }
+        const { coords, open } = report;
+        if (shouldRestart(coords, expected, previous)) {
             visited.clear();
             stack.length = 0;
             restarts++;
+            stale = false;
         }
-        previous = report.coords;
-        visited.add(cellKey(report.coords));
-        const walls = { north: report.north, east: report.east, south: report.south, west: report.west };
-        const move = nextMove(visited, stack, report.coords, walls, mode === "exit" ? lab.end : null);
-        if (!move.dir) return { solved: false, steps, stepsAfterSwap, restarts, why: "no move left" };
+        expected = null;
+        previous = coords;
+        visited.add(cellKey(coords));
+        const move = nextMove(visited, stack, coords, open, mode === "exit" ? lab.end : null, order);
+        if (!move.dir) return { solved: false, steps, stepsAfterSwap, restarts, reports, why: "no move left" };
         if (move.push) {
             stack.push(move.dir);
         } else {
@@ -77,17 +90,27 @@ function walk(initial, mode, swap) {
             stack.pop();
         }
         const outcome = labStep(lab, position, move.dir);
-        // labreport already told us which walls are open, so the walker must never waste an
-        // authentication (and its network delay) walking into one.
-        assert.ok(!/cannot go that way/i.test(outcome.message), `walked into a wall at ${report.coords} going ${move.dir}`);
-        assert.deepEqual(outcome.pos, stepTo(report.coords, move.dir), "stepTo must agree with the game's move");
+        expected = coords;
+        const parsed = parseMoveOutcome(outcome.message, outcome.data);
+        if (/cannot go that way/i.test(outcome.message)) {
+            // The reply told the walker which walls are open, so only a regenerated maze may surprise it.
+            assert.ok(stale, `walked into a wall at ${coords} going ${move.dir}`);
+            visited.add(cellKey(stepTo(coords, move.dir)));
+            if (move.push) stack.pop();
+            report = parsed;
+            continue;
+        }
+        if (outcome.code === 200) return { solved: true, steps: steps + 1, stepsAfterSwap, restarts, reports };
+        assert.ok(parsed, `a move reply carries the new position and the wall window: ${outcome.message}`);
+        if (!stale) assert.deepEqual(outcome.pos, stepTo(coords, move.dir), "stepTo must agree with the game's move");
+        assert.deepEqual(parsed.coords, outcome.pos, "the parsed position is where the game put us");
         position = outcome.pos;
-        expected = stepTo(report.coords, move.dir);
+        expected = stepTo(coords, move.dir);
+        report = parsed;
         steps++;
         if (swapped) stepsAfterSwap++;
-        if (outcome.code === 200) return { solved: true, steps, stepsAfterSwap, restarts };
     }
-    return { solved: false, steps, stepsAfterSwap, restarts, why: "step limit" };
+    return { solved: false, steps, stepsAfterSwap, restarts, reports, why: "step limit" };
 }
 
 for (const { width, height, offsets } of SIZES) {
@@ -100,6 +123,7 @@ for (const { width, height, offsets } of SIZES) {
                 assert.ok(result.solved, `${width}x${height} seed ${seed} (${mode}) did not finish: ${result.why} after ${result.steps} steps`);
                 assert.ok(result.steps < budget, `${width}x${height} seed ${seed} (${mode}) took ${result.steps} steps, budget ${budget}`);
                 assert.equal(result.restarts, 0, "an undisturbed walk must never think the maze changed");
+                assert.equal(result.reports, 1, "R5: one labreport at the start, every later position comes from the move reply");
             }
         });
     }
@@ -118,6 +142,7 @@ test("restarts and still finishes when the maze is regenerated mid-walk", () => 
         assert.ok(result.solved, `seed ${seed}: did not finish after the swap: ${result.why}`);
         assert.ok(result.stepsAfterSwap < budget,
             `seed ${seed}: took ${result.stepsAfterSwap} steps after the swap, budget ${budget}`);
+        assert.ok(result.reports <= 1 + result.restarts, `seed ${seed}: at most one extra labreport per restart, got ${result.reports}`);
     }
 });
 
@@ -174,4 +199,31 @@ test("findExit converts a radar window into absolute coordinates", () => {
     // '@' is at window column 3 / row 3, 'X' at column 4 / row 5: two rows south, one column east.
     assert.deepEqual(findExit(radar, [11, 7]), [12, 9]);
     assert.equal(findExit(radar.replace("X", " "), [11, 7]), null, "no X in the window means the exit is not in range");
+});
+
+test("parseMoveOutcome reads the same position and walls labreport would report, on every cell", () => {
+    for (const seed of SEEDS) {
+        const lab = makeLab(20, 14, makeRng(seed), false);
+        for (let y = 1; y < lab.maze.length - 1; y += 2) {
+            for (let x = 1; x < lab.maze[0].length - 1; x += 2) {
+                for (const dir of ["north", "east", "south", "west"]) {
+                    const outcome = labStep(lab, [x, y], dir);
+                    if (outcome.code === 200) continue;                     // the win carries the password, not a window
+                    const parsed = parseMoveOutcome(outcome.message, outcome.data);
+                    const truth = labReport(lab, outcome.pos);
+                    assert.deepEqual(parsed, {
+                        coords: truth.coords,
+                        open: { north: truth.north, east: truth.east, south: truth.south, west: truth.west },
+                    }, `seed ${seed} at ${x},${y} going ${dir}`);
+                }
+            }
+        }
+    }
+});
+
+test("parseMoveOutcome returns null for replies without a position", () => {
+    assert.equal(parseMoveOutcome("You have successfully navigated the labyrinth! Congratulations", "hunter2"), null);
+    assert.equal(parseMoveOutcome("You feel disconnected...", undefined), null);
+    assert.equal(parseMoveOutcome("You have moved to 3,5.", "██\n█"), null, "a truncated window is not trusted");
+    assert.equal(parseMoveOutcome(undefined, undefined), null);
 });

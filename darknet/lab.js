@@ -20,6 +20,8 @@ import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES, LABS, hostFromArg } from "
  *   - authenticate(lab, "north"|"east"|"south"|"west") moves one cell, so coordinates change
  *     by 2; failures come back as code 401 with "You have moved to X,Y." or "You cannot go
  *     that way. You are still at X,Y.".
+ *   - The move reply's `data` is the 3x3 window around the new cell, the same one labreport reads its
+ *     north/east/south/west from, so labreport is only needed once at the start and after a failure.
  *   - Reaching the exit returns success with `data` set to the lab's password, and grants
  *     admin rights plus a `the_great_work` cache. A script has to run ON the lab to open it,
  *     so the walker scp's the agent payload over and execs the agent there.
@@ -48,6 +50,7 @@ const HEARTBEAT = 60000;        // ms: report at least this often so the control
 const MAX_LOST = 12;            // give up after this many consecutive failed labreports
 const CHARISMA_PATTERN = /charismatic|charming|charisma|moxie/i;
 const BLOCKED_PATTERN = /cannot go that way/i;
+const POSITION_PATTERN = /(?:moved to|still at) (-?\d+),(-?\d+)\./;
 
 /** Cell coordinates as a set key. */
 export function cellKey(coords) {
@@ -131,6 +134,22 @@ export function findExit(radar, coords) {
     return [coords[0] + (exitColumn - centreColumn), coords[1] + (exitRow - centreRow)];
 }
 
+/** Position and open walls from an authenticate(lab, direction) reply, or null when the reply has neither.
+ * The game answers every move with "You have moved to X,Y." (or "...still at X,Y." for a wall) and puts the
+ * 3x3 window around the new cell in `data` (labyrinth.ts handleLabyrinthPassword). labreport's north/east/
+ * south/west are that same window's [0][1], [1][2], [2][1], [1][0] === " " (labyrinth.ts getLocationStatus),
+ * so reading them here saves the second lab authentication delay every step would otherwise cost (R5). */
+export function parseMoveOutcome(message, data) {
+    const found = String(message ?? "").match(POSITION_PATTERN);
+    if (!found) return null;
+    const rows = String(data ?? "").split("\n");
+    if (rows.length < 3 || rows[0].length < 2 || rows[1].length < 3 || rows[2].length < 2) return null;
+    return {
+        coords: [Number(found[1]), Number(found[2])],
+        open: { north: rows[0][1] === " ", east: rows[1][2] === " ", south: rows[2][1] === " ", west: rows[1][0] === " " },
+    };
+}
+
 /** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -157,21 +176,26 @@ export async function main(ns) {
     let previous = null;            // where we were before the last move
     let reportedAt = 0;
 
+    let report = null;              // { coords, open } from the last move reply; null = ask labreport
     while (true) {
-        const report = await ns.dnet.labreport();
-        if (!report.success) {
-            // "You feel lost..." (no lab) or "You feel disconnected..." (the host stopped
-            // neighbouring the lab, which happens when a darknet server migrates).
-            lost++;
-            send({ steps, done: false, reason: String(report.message ?? "no labreport") });
-            if (lost >= MAX_LOST) return ns.print("giving up: labreport keeps failing");
-            await ns.sleep(RETRY_DELAY);
-            continue;
+        if (!report) {
+            const status = await ns.dnet.labreport();
+            if (!status.success) {
+                // "You feel lost..." (no lab) or "You feel disconnected..." (the host stopped
+                // neighbouring the lab, which happens when a darknet server migrates).
+                lost++;
+                send({ steps, done: false, reason: String(status.message ?? "no labreport") });
+                if (lost >= MAX_LOST) return ns.print("giving up: labreport keeps failing");
+                await ns.sleep(RETRY_DELAY);
+                continue;
+            }
+            lost = 0;
+            report = { coords: status.coords, open: { north: status.north, east: status.east, south: status.south, west: status.west } };
         }
-        lost = 0;
         const coords = report.coords;
+        const open = report.open;
         if (shouldRestart(coords, expected, previous)) {
-            ns.print(`WARN: expected to be at ${cellKey(expected)} but labreport says ${cellKey(coords)}; the maze was regenerated, restarting the walk`);
+            ns.print(`WARN: expected to be at ${cellKey(expected)} but the lab says ${cellKey(coords)}; the maze was regenerated, restarting the walk`);
             send({ steps, done: false, reason: "restart" });
             visited.clear();
             stack.length = 0;
@@ -189,7 +213,6 @@ export async function main(ns) {
         }
         sinceRadar++;
 
-        const open = { north: report.north, east: report.east, south: report.south, west: report.west };
         const move = nextMove(visited, stack, coords, open, target);
         if (!move.dir) {
             send({ steps, done: false, reason: "exhausted" });
@@ -198,6 +221,7 @@ export async function main(ns) {
         if (move.push) stack.push(move.dir); else stack.pop();
 
         const outcome = await ns.dnet.authenticate(labHost, move.dir);
+        report = null;                  // anything unparseable below falls back to labreport
         expected = coords;              // unless the move landed, we are still where we were
         if (outcome.code === 408) {
             // A network timeout says nothing about the move; undo the bookkeeping and retry.
@@ -214,18 +238,23 @@ export async function main(ns) {
             send({ steps, done: false, reason: "charisma", chaReq });
             return ns.print(`giving up: charisma is too low for ${labHost}`);
         }
+        // The reply already carries the new position and the 3x3 wall window (R5): use it and skip
+        // next loop's labreport. A 351/503 or an unexpected message leaves `report` null instead.
+        const parsed = parseMoveOutcome(message, outcome.data);
         if (BLOCKED_PATTERN.test(message)) {
-            // labreport said that wall was open, so the maze was regenerated under us (a page
-            // reload does that). Treat the cell beyond it as a dead end and re-report.
+            // The walls we knew said that way was open, so the maze was regenerated under us (a page
+            // reload does that). Treat the cell beyond it as a dead end and re-read the position.
             visited.add(cellKey(stepTo(coords, move.dir)));
             // Undo a push, because we never entered the cell. A *backtrack* that is blocked
             // keeps its pop on purpose: the recorded path no longer exists, so unwinding
             // further is the only thing that makes progress (and the only thing that
             // terminates -- restoring the stack would retry the same blocked move forever).
             if (move.push) stack.pop();
+            report = parsed;
             continue;
         }
         expected = stepTo(coords, move.dir);
+        report = parsed;
         steps++;
         // Also report on a timer: the controller treats a walker that has been silent for five
         // minutes as dead, and 25 moves through a deep lab can take longer than that.
