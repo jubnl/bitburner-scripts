@@ -202,6 +202,18 @@ export function selfReportKey(d, neighbours) {
     return JSON.stringify([d.isOnline, d.depth, d.difficulty, d.blockedRam, d.modelId, d.hasSession, [...neighbours].sort()]);
 }
 
+/** Whether a heartbleed log line is the one our own `pw` attempt produced. Every model logs the
+ * attempt verbatim except Pr0verFl0 (BufferOverflow): src/DarkNet/models/packetSniffing.ts
+ * logPasswordAttempt rewrites `passwordAttempted` to the `receivedBuffer` from
+ * src/DarkNet/effects/authentication.ts, i.e. the attempt cut (or "ˍ"-padded) to the server's
+ * password length, so a clue of another length never matches verbatim. */
+export function logMatchesAttempt(modelId, fb, pw) {
+    const logged = fb?.passwordAttempted;
+    if (typeof logged !== "string") return false;
+    if (modelId !== "Pr0verFl0") return logged === pw;
+    return logged === (pw + "ˍ".repeat(logged.length)).slice(0, logged.length);
+}
+
 /** Sizing rule for a filler worker (phish.js) that takes all spare RAM and never resizes
  * itself. `free` is the host's free RAM right now (the running filler counted as used),
  * `reserve` the RAM higher-priority work needs next tick (pending cracks, walkers, caches,

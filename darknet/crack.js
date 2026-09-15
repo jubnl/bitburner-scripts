@@ -1,6 +1,6 @@
 import { getConfiguration } from "../helpers.js";
 import { solve } from "./solvers.js";
-import { encodeMsg, PORT_DEFAULT, FILES, parsePasswords, parseClueText, safeParse, hostFromArg } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, FILES, parsePasswords, parseClueText, safeParse, hostFromArg, logMatchesAttempt } from "./lib.js";
 
 const argsSchema = [["port", PORT_DEFAULT], ["clues", ""]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
@@ -33,7 +33,7 @@ export async function main(ns) {
             const hb = await ns.dnet.heartbleed(target, { peek: true, logsToCapture: 1 });
             if (!hb.success) { if (hb.code === 451) throw new Error("charisma"); throw new Error("heartbleed:" + hb.code); }
             const fb = safeParse(hb.logs[0] ?? "", null);
-            if (!fb || fb.passwordAttempted !== password) continue;  // not our line (race with another PID); retry
+            if (!logMatchesAttempt(details.modelId, fb, password)) continue;  // not our line (race with another PID); retry
             return { success: false, feedback: fb };
         }
         throw new Error("timeouts");

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeServer, feedback } from "./darknet-mock.js";
 import { solve, BUDGETS } from "../darknet/solvers.js";
+import { logMatchesAttempt } from "../darknet/lib.js";
 
 function detailsOf(s) {
     return { hostname: s.hostname, modelId: s.modelId, passwordHint: s.staticPasswordHint, data: s.passwordHintData,
@@ -63,4 +64,21 @@ test("clues are tried first", async () => {
     const attemptFn = async (pw) => { attempts++; const f = feedback(s, pw); return { success: f.success, feedback: f }; };
     const r = await solve(detailsOf(s), attemptFn, { clues: ["nope", s.password] });
     assert.equal(r.password, s.password); assert.equal(attempts, 2); assert.equal(r.reason, "clue");
+});
+
+// DN-F2: for Pr0verFl0 (BufferOverflow) the game's logPasswordAttempt rewrites the log's
+// passwordAttempted to `receivedBuffer` (src/DarkNet/models/packetSniffing.ts:99-119), which is
+// the first password.length characters of the attempt padded with "ˍ" from the buffer
+// (src/DarkNet/effects/authentication.ts:101-118). crack.js must recognise its own line anyway.
+test("logMatchesAttempt reproduces the BufferOverflow buffer rewrite and stays exact elsewhere", () => {
+    const L = 5; // server password length; the log line always carries exactly L characters
+    const received = (attempt) => { const buffer = "ˍ".repeat(L) + "■".repeat(L); return (attempt.slice(0, buffer.length) + buffer.slice(attempt.length)).slice(0, L); };
+    for (const attempt of ["hunter2", "abc", "abcde", "0000000000", "ab"]) {
+        assert.equal(logMatchesAttempt("Pr0verFl0", { passwordAttempted: received(attempt) }, attempt), true, attempt);
+    }
+    assert.equal(logMatchesAttempt("Pr0verFl0", { passwordAttempted: received("hunter2") }, "huntXr2"), false, "another PID's clue");
+    assert.equal(logMatchesAttempt("Pr0verFl0", { passwordAttempted: received("abc") }, "abd"), false);
+    assert.equal(logMatchesAttempt("Pr0verFl0", {}, "abc"), false, "noise line without passwordAttempted");
+    assert.equal(logMatchesAttempt("TopPass", { passwordAttempted: "hunter2" }, "hunter2"), true);
+    assert.equal(logMatchesAttempt("TopPass", { passwordAttempted: "hunte" }, "hunter2"), false, "other models log the attempt verbatim");
 });
