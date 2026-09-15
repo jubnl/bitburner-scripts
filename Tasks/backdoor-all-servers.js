@@ -2,12 +2,18 @@ import { getNsDataThroughFile, getFilePath, getConfiguration, instanceCount, log
 
 const argsSchema = [
     ['spawn-delay', 50], // Delay to allow time for `installBackdoor` to start running before a we connect back to 'home' and optionally start backdooring the next server
-    ['reserved-home-ram', 22], // Don't spawn additional backdoor scripts if home free ram dips below this amount (each parallel backdoor consumes 3.6 GB)
+    ['reserved-home-ram', 22], // Leave at least this much home RAM free after spawning a backdoor script (HC-11: its cost is measured - 3.6 GB at SF4.3, 8.6 GB at SF4.2, 33.6 GB below)
 ];
 
 export function autocomplete(data, args) {
     data.flags(argsSchema);
     return [];
+}
+
+/** HC-11: may another backdoor-one.js be spawned on home? Its RAM is 1.6 GB base + installBackdoor (2 GB x 16 below SF4.2, x 4 at SF4.2, x 1 at SF4.3:
+ * src/Netscript/RamCostGenerator.ts SF4Cost), so the guard uses the measured cost and keeps `reservedHomeRam` free after the spawn. */
+export function canSpawnBackdoor(homeFreeRam, reservedHomeRam, backdoorRam) {
+    return homeFreeRam - backdoorRam >= reservedHomeRam;
 }
 
 /** Scan all servers, backdoor anything that can be backdoored, and leave a file to indicate it's been done
@@ -73,6 +79,9 @@ export async function main(ns) {
 
         // Collect information about any servers still being backdoored (from a prior run), so we can skip them
         let scriptPath = getFilePath('/Tasks/backdoor-all-servers.js.backdoor-one.js');
+        // HC-11: the per-backdoor cost depends on the SF4 level (33.6 GB below SF4.3), measure it rather than assuming 3.6 GB
+        const backdoorRam = await getNsDataThroughFile(ns, 'ns.getScriptRam(ns.args[0], "home")', '/Temp/backdoor-one-ram.txt', [scriptPath]);
+        ns.print(`Each backdoor script needs ${backdoorRam} GB; will keep ${options['reserved-home-ram']} GB of home RAM free.`);
         let serversBeingBackdoored = await getNsDataThroughFile(ns,
             'ns.ps().filter(script => script.filename == ns.args[0]).map(script => script.args[0])',
             '/Temp/servers-being-backdoored.txt', [scriptPath]);
@@ -87,8 +96,9 @@ export async function main(ns) {
             const homeFreeRam = await getNsDataThroughFile(ns,
                 'ns.getServerMaxRam(ns.args[0]) - ns.getServerUsedRam(ns.args[0])',
                 '/Temp/getServerFreeRam.txt', ["home"]);
-            if (homeFreeRam < options['reserved-home-ram'])
-                return log(ns, `WARNING: Home is low on RAM, will skip backdooring remaining servers.`);
+            if (!canSpawnBackdoor(homeFreeRam, options['reserved-home-ram'], backdoorRam)) // HC-11
+                return log(ns, `WARNING: Home has ${homeFreeRam.toFixed(1)} GB free; a backdoor needs ${backdoorRam} GB and we keep ` +
+                    `${options['reserved-home-ram']} GB free, so the remaining servers will be backdoored later.`);
 
             ns.print(`Hopping to ${server}`);
             notAtHome = true; // Set a flag to get us back home if we encounter an error
