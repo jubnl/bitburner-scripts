@@ -191,8 +191,19 @@ const ALPHA_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 // Numeric charset is "0123456789"; alphanumeric adds lowercase then uppercase (matches the
 // game's `letters` = lowercase + uppercase, ServerGenerator.ts's `numbers + letters`).
+// passwordFormat is getPasswordType(password) (ServerGenerator.ts), so a letters-allowed
+// password that happens to contain no digit is reported as "alphabetic": letters only.
 function charset(d) {
-    return d.passwordFormat === "alphanumeric" ? NUMERIC_CHARS + ALPHA_CHARS : NUMERIC_CHARS;
+    if (d.passwordFormat === "alphanumeric") return NUMERIC_CHARS + ALPHA_CHARS;
+    if (d.passwordFormat === "alphabetic") return ALPHA_CHARS;
+    return NUMERIC_CHARS;
+}
+
+// Worst case of solveByExactCount: (charset - 1) multiset probes, at most L*(L-1)/2 positional
+// probes (all L symbols distinct) and one final attempt = charset + L*(L-1)/2.
+function exactCountBudget(d) {
+    const L = Number(d.passwordLength) || 0;
+    return charset(d).length + (L * (L - 1)) / 2;
 }
 
 // All length-L strings over charset cs, in charset order. Only used when cs.length**L is
@@ -670,10 +681,24 @@ export const SOLVERS = {
 // enforcement and clue-trying work for them from day one.
 export const BUDGETS = {
     ZeroLogon: 1, "DeskMemo_3.1": 1, "FreshInstall_1.0": 4, Laika4: 4, TopPass: 93, "EuroZone Free": 27, "CloudBlare(tm)": 1,
-    Pr0verFl0: 1, NIL: 64, DeepGreen: 30, "2G_cellular": 500, "110100100": 1, OrdoXenos: 1, BellaCuore: 14, "AccountsManager_4.2": 60,
-    "PrimeTime 2": 1, "Factori-Os": 200, "BigMo%od": 12, OctantVoxel: 1, MathML: 1, KingOfTheHill: 120, "RateMyPix.Auth": 120, "PHP 5.4": 30,
+    Pr0verFl0: 1, NIL: 64, "2G_cellular": 500, "110100100": 1, OrdoXenos: 1, BellaCuore: 14, "AccountsManager_4.2": 60,
+    "PrimeTime 2": 1, "Factori-Os": 200, "BigMo%od": 12, OctantVoxel: 1, MathML: 1, KingOfTheHill: 120, "PHP 5.4": 30,
     OpenWebAccessPoint: 10, "(The Labyrinth)": 0,
+    // Password-dependent: above difficulty 16 (DeepGreen) / 8 (RateMyPix.Auth) the game rolls
+    // 62-symbol alphanumeric passwords (ServerGenerator.ts getMastermindHintConfig /
+    // getSpiceLevelConfig), and solveByExactCount then needs up to 62 + L*(L-1)/2 attempts
+    // (107 for DeepGreen at L=10) -- a flat 30 aborted every such server at attempt 30.
+    DeepGreen: (d) => Math.max(30, exactCountBudget(d)),
+    "RateMyPix.Auth": (d) => Math.max(120, exactCountBudget(d)),
 };
+
+/** The attempt cap solve() enforces for a server: the BUDGETS entry, evaluated against the
+ * server details when it depends on the password length/format. Unknown models are uncapped. */
+export function budgetFor(details) {
+    const cap = BUDGETS[details.modelId];
+    if (cap === undefined) return Infinity;
+    return typeof cap === "function" ? cap(details) : cap;
+}
 
 // details: getServerDetails shape (modelId, passwordHint, data, passwordLength,
 // passwordFormat, difficulty, hostname). attemptFn(password) resolves to
@@ -682,8 +707,7 @@ export async function solve(details, attemptFn, opts = {}) {
     const clues = opts.clues ?? [];
     const budgetScale = opts.budgetScale ?? 1;
     const log = opts.log ?? (() => {});
-    const budgetCap = BUDGETS[details.modelId];
-    const budget = budgetCap === undefined ? Infinity : Math.floor(budgetCap * budgetScale);
+    const budget = Math.floor(budgetFor(details) * budgetScale);
     let count = 0;
 
     const tryPw = async (pw) => {

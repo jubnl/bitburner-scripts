@@ -105,6 +105,17 @@ function clampNumber(value, min, max) {
     return Math.max(Math.min(value, max), min);
 }
 
+// ServerGenerator.ts getPasswordType: what getServerDetails reports as passwordFormat. An
+// "allowLetters" password that happens to contain no digit is reported as "alphabetic".
+export function getPasswordType(password) {
+    const chars = password.split("");
+    if (chars.every((c) => numbers.includes(c))) return "numeric";
+    if (chars.every((c) => letters.includes(c))) return "alphabetic";
+    if (chars.every((c) => numbers.includes(c) || letters.includes(c))) return "alphanumeric";
+    if (chars.every((c) => c.charCodeAt(0) < 128)) return "ASCII";
+    return "unicode";
+}
+
 function getPassword(rng, length, allowLetters = false) {
     const characters = numbers + (allowLetters ? letters : "");
     let password = "";
@@ -522,7 +533,7 @@ export function makeServer(modelId, difficulty, rng) {
         staticPasswordHint: config.staticPasswordHint,
         passwordHintData: config.passwordHintData ?? "",
         passwordLength: password.length,
-        passwordFormat: /^[0-9]+$/.test(password) ? "numeric" : "alphanumeric",
+        passwordFormat: getPasswordType(password),
         requiredCharismaSkill: requiredCharisma(difficulty, rng),
     };
 }

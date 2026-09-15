@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeServer, feedback } from "./darknet-mock.js";
-import { solve, BUDGETS } from "../darknet/solvers.js";
+import { solve, BUDGETS, budgetFor } from "../darknet/solvers.js";
 import { logMatchesAttempt } from "../darknet/lib.js";
 
 function detailsOf(s) {
@@ -22,7 +22,7 @@ for (const modelId of DIRECT) {
         for (const seed of [1, 2, 3, 4, 5]) for (const difficulty of [1, 6, 13, 20]) {
             const { r, attempts, s } = await runModel(modelId, difficulty, seed);
             assert.equal(r.password, s.password, `${modelId} seed ${seed} d${difficulty}`);
-            assert.ok(attempts <= BUDGETS[modelId], `${modelId} used ${attempts} > ${BUDGETS[modelId]}`);
+            assert.ok(attempts <= budgetFor(detailsOf(s)), `${modelId} used ${attempts} > ${budgetFor(detailsOf(s))}`);
         }
     });
 }
@@ -54,10 +54,35 @@ for (const modelId of ORACLE) {
         for (const seed of [1, 2, 3, 4, 5]) for (const difficulty of [2, 9, 17, 26]) {
             const { r, attempts, s } = await runModel(modelId, difficulty, seed);
             assert.equal(r.password, s.password, `${modelId} seed ${seed} d${difficulty}`);
-            assert.ok(attempts <= BUDGETS[modelId], `${modelId} seed ${seed} d${difficulty} used ${attempts} > ${BUDGETS[modelId]}`);
+            assert.ok(attempts <= budgetFor(detailsOf(s)), `${modelId} seed ${seed} d${difficulty} used ${attempts} > ${budgetFor(detailsOf(s))}`);
         }
     });
 }
+// DN-F3: above difficulty 16 DeepGreen rolls a 62-symbol alphanumeric password 30% of the time
+// (ServerGenerator.ts getMastermindHintConfig), and RateMyPix.Auth does above difficulty 8
+// (getSpiceLevelConfig). Both then go through solveByExactCount, whose worst case is
+// charset + L*(L-1)/2 attempts: 107 for DeepGreen at L=10, far above the old flat budget of 30.
+// An alphanumeric roll with no digit is reported as passwordFormat "alphabetic" (getPasswordType).
+for (const modelId of ["DeepGreen", "RateMyPix.Auth"]) {
+    test(`solves alphanumeric and alphabetic ${modelId} passwords within budgetFor`, async () => {
+        const formats = new Set();
+        for (let seed = 1; seed <= 40; seed++) for (const difficulty of [17, 26, 35]) {
+            const { r, attempts, s } = await runModel(modelId, difficulty, seed);
+            formats.add(s.passwordFormat);
+            assert.equal(r.password, s.password, `${modelId} seed ${seed} d${difficulty} (${s.passwordFormat}, L=${s.passwordLength})`);
+            assert.ok(attempts <= budgetFor(detailsOf(s)), `${modelId} seed ${seed} d${difficulty} used ${attempts} > ${budgetFor(detailsOf(s))}`);
+        }
+        assert.ok(formats.has("alphanumeric") && formats.has("alphabetic"), `sampled formats: ${[...formats]}`);
+    });
+}
+test("budgetFor is the flat BUDGETS entry unless the model's budget depends on the password", () => {
+    assert.equal(budgetFor({ modelId: "TopPass" }), BUDGETS.TopPass);
+    assert.equal(budgetFor({ modelId: "unknown-model" }), Infinity);
+    assert.equal(budgetFor({ modelId: "DeepGreen", passwordLength: 10, passwordFormat: "alphanumeric" }), 62 + 45);
+    assert.equal(budgetFor({ modelId: "DeepGreen", passwordLength: 3, passwordFormat: "numeric" }), 30, "the enumeration path keeps the old floor");
+    assert.equal(budgetFor({ modelId: "RateMyPix.Auth", passwordLength: 14, passwordFormat: "alphabetic" }), 52 + 91);
+});
+
 test("clues are tried first", async () => {
     const s = makeServer("TopPass", 10, makeRng(9));
     let attempts = 0;
