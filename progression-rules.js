@@ -65,3 +65,30 @@ export function filterCityFactionInvites(invites, joinedFactions, allowedFaction
     if (joinedFactions.some(f => cityFactions.includes(f))) return invites.slice();
     return invites.filter(f => !cityFactions.includes(f) || allowedFactions.includes(f));
 }
+
+/** Duration and combat exp (per physical stat, at 100 % success) of the crimes the stat grind chooses between (src/Crime/Crimes.ts).
+ *  Every player / bitnode / focus multiplier applies equally to all crimes, so they cancel when comparing. */
+export const crimeStats = {
+    "Mug": { timeMs: 4e3, combatExp: 3 },
+    "Homicide": { timeMs: 3e3, combatExp: 2 },
+    "Assassination": { timeMs: 300e3, combatExp: 300 },
+    "Heist": { timeMs: 600e3, combatExp: 450 },
+};
+/** Crimes excluded by --fast-crimes-only (too long to interrupt at will) */
+export const slowCrimes = ["Heist", "Assassination"];
+
+/** Expected combat exp per stat per second of a crime at the given success chance: a failed crime still grants 25 % of the exp
+ *  (src/Work/CrimeWork.ts commit: scaleWorkStats(gains, 0.25)), so the expectation is base * (0.25 + 0.75 * chance). */
+export function crimeCombatExpRate(crime, chance) {
+    const stats = crimeStats[crime];
+    return stats.combatExp / (stats.timeMs / 1000) * (0.25 + 0.75 * chance);
+}
+
+/** The crime that trains the four combat stats fastest at the given success chances. Ties go to the shorter crime (interruptible sooner).
+ * @param {{[crime: string]: number}} crimeChances success chance (0-1) per crime name (ns.singularity.getCrimeChance); crimes missing here are not considered
+ * @param {boolean} fastCrimesOnly exclude Heist and Assassination (--fast-crimes-only)
+ * @returns {string|undefined} */
+export function bestCombatExpCrime(crimeChances, fastCrimesOnly = false) {
+    const candidates = Object.keys(crimeStats).filter(c => c in crimeChances && !(fastCrimesOnly && slowCrimes.includes(c)));
+    return candidates.sort((a, b) => crimeCombatExpRate(b, crimeChances[b]) - crimeCombatExpRate(a, crimeChances[a]) || crimeStats[a].timeMs - crimeStats[b].timeMs)[0];
+}

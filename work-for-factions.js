@@ -2,7 +2,7 @@ import {
     instanceCount, getConfiguration, getNsDataThroughFile, getFilePath, getActiveSourceFiles, tryGetBitNodeMultipliers,
     formatDuration, formatMoney, formatNumberShort, disableLogs, log, getErrorInfo, tail
 } from './helpers.js'
-import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites } from './progression-rules.js'
+import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites, bestCombatExpCrime } from './progression-rules.js'
 
 let options;
 const argsSchema = [
@@ -665,9 +665,14 @@ export async function crimeForKillsKarmaStats(ns, reqKills, reqKarma, reqStats, 
         // Homicide 3 karma / 3s vs Mug 0.25 karma / 4s. So Homicide's *worst* case (0% success) is 0.25 karma/s, which already beats
         // Mug's *best* case (0.0625 karma/s). Hence, whenever karma or kills are needed, Homicide is always the right crime.
         const homicideForKarma = needKarmaOrKills && !(options ? options['crime-warmup-with-mug'] : false);
+        // Pure stat grind (karma/kills satisfied, finite stat target): pick the crime with the best combat exp/s at our current success chances.
+        // Homicide at 50 % gives 0.42 exp/s per stat vs Mug's 0.75 (src/Crime/Crimes.ts exp/time, src/Work/CrimeWork.ts failure x0.25);
+        // only Assassination above ~67 % beats Mug. crime.js's "forever" mode keeps the money-oriented tiers below.
+        const statGrindOnly = needStats && !needKarmaOrKills && !forever;
         crime = (crimeCount < 2 && !homicideForKarma) ? (crimeChances["Homicide"] > 0.75 ? "Homicide" : "Mug") : // Start with a few fast & easy crimes to boost stats if we're just starting
             (!needStats && needKarmaOrKills) ? "Homicide" : // If *all* we need now is kills or Karma, homicide is the fastest way to do that, even at low proababilities
-                bestCrimesByDifficulty.find((c, index) => doFastCrimesOnly && index <= 1 ? 0 : crimeChances[c] >= chanceThresholds[index]); // Otherwise, crime based on success chance vs relative reward (precomputed)
+                statGrindOnly ? bestCombatExpCrime(crimeChances, doFastCrimesOnly) : // Best combat exp/s for the stat grind
+                    bestCrimesByDifficulty.find((c, index) => doFastCrimesOnly && index <= 1 ? 0 : crimeChances[c] >= chanceThresholds[index]); // Otherwise (forever mode), crime based on success chance vs relative reward (precomputed)
         if (crime == "Mug" && homicideForKarma) crime = "Homicide"; // Never fall back to Mug while karma/kills are still needed (Heist/Assassination tiers are kept for money/stat grinding)
         // Warn if current crime is disrupted
         let currentWork = await getCurrentWorkInfo(ns);

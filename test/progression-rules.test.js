@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import {
     jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT,
     pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites,
+    crimeStats, slowCrimes, crimeCombatExpRate, bestCombatExpCrime,
 } from "../progression-rules.js";
 
 const SRC = "/home/jubnl/dev/bitburner/bitburner-src/src/";
@@ -92,4 +93,39 @@ test("filterCityFactionInvites: city invites are held back unless allowed or a c
     // Input is not mutated
     assert.deepEqual(invites, ["Volhaven", "CyberSec", "Aevum", "Tian Di Hui"]);
     assert.deepEqual(filterCityFactionInvites([], []), []);
+});
+
+const crimesSrc = readFileSync(SRC + "Crime/Crimes.ts", "utf8");
+test("crimeStats match Crimes.ts (time = 4th constructor arg, strength_exp)", () => {
+    const key = { Mug: "mug", Homicide: "homicide", Assassination: "assassination", Heist: "heist" };
+    for (const [crime, stats] of Object.entries(crimeStats)) {
+        const block = crimesSrc.match(new RegExp(`\\[CrimeType\\.${key[crime]}\\]: new Crime\\(([\\s\\S]*?)\\n {2}\\),`))[1];
+        const timeMs = Number(block.match(/^\s+([\d.e]+),$/m)[1]); // first bare numeric argument = time
+        const combatExp = Number(block.match(/strength_exp: ([\d.]+)/)[1]);
+        assert.equal(stats.timeMs, timeMs, `${crime} time`);
+        assert.equal(stats.combatExp, combatExp, `${crime} exp`);
+        for (const stat of ["defense_exp", "dexterity_exp", "agility_exp"])
+            assert.equal(Number(block.match(new RegExp(`${stat}: ([\\d.]+)`))[1]), combatExp, `${crime} ${stat} equals strength_exp`);
+    }
+    assert.deepEqual(slowCrimes, ["Heist", "Assassination"]);
+});
+
+test("crimeCombatExpRate = exp/time * (0.25 + 0.75 chance)", () => {
+    const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
+    near(crimeCombatExpRate("Mug", 1), 0.75);
+    near(crimeCombatExpRate("Homicide", 0.5), 2 / 3 * 0.625); // 0.4167, the spec's "Homicide at threshold" number
+    near(crimeCombatExpRate("Assassination", 0.9), 0.925);
+    near(crimeCombatExpRate("Heist", 0.75), 0.75 * (0.25 + 0.75 * 0.75)); // 0.609
+    near(crimeCombatExpRate("Mug", 0), 0.1875); // a 0 % crime still yields 25 % of the exp
+});
+
+test("bestCombatExpCrime prefers Mug over Homicide/Heist and Assassination only above ~67 %", () => {
+    // The spec's table: Homicide at its 50 % threshold (0.417) vs Mug (0.75)
+    assert.equal(bestCombatExpCrime({ Heist: 0, Assassination: 0, Homicide: 0.5, Mug: 0.95 }), "Mug");
+    assert.equal(bestCombatExpCrime({ Heist: 0.1, Assassination: 0.2, Homicide: 1, Mug: 1 }), "Mug"); // Homicide 0.667 < Mug 0.75
+    assert.equal(bestCombatExpCrime({ Heist: 1, Assassination: 0.6, Homicide: 1, Mug: 1 }), "Mug"); // Heist ties at p=1 -> shorter crime wins; Assassination 0.70 < 0.75
+    assert.equal(bestCombatExpCrime({ Heist: 1, Assassination: 0.9, Homicide: 1, Mug: 1 }), "Assassination"); // 0.925 > 0.75
+    assert.equal(bestCombatExpCrime({ Heist: 1, Assassination: 0.9, Homicide: 1, Mug: 1 }, true), "Mug"); // --fast-crimes-only excludes the slow crimes
+    assert.equal(bestCombatExpCrime({ Homicide: 0.3, Mug: 0.4 }), "Mug"); // only the crimes present are considered
+    assert.equal(bestCombatExpCrime({}), undefined);
 });
