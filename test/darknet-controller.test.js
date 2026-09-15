@@ -756,3 +756,42 @@ test("applyMessage no longer keeps prevNeighbours when a host's neighbour list e
     assert.deepEqual(state.servers.alpha.neighbours, []);
     assert.equal(state.servers.alpha.prevNeighbours, undefined, "the only reader of prevNeighbours was the island block");
 });
+
+// ------------------------------------------------------------------ R13: unchanged pushes
+
+// Per commandable host per loop, pushFiles opened a session (useful: it is the liveness probe) and then wrote and
+// scp'd passwords.txt and cmd.txt even when neither had changed since the last loop.
+test("pushFiles skips the scp when neither passwords.txt nor the host's cmd changed, and re-pushes after an agent restart", () => {
+    const ns = makeNs({});
+    let sessions = 0;
+    ns.dnet.connectToSession = () => { sessions++; return { success: true, code: 200 }; };
+    const state = makeState({ cacheA: { depth: 1 }, cacheB: { depth: 2 }, cacheC: { depth: 3 } });
+    state.servers.cacheA.agentPid = 11; state.servers.cacheB.agentPid = 12; state.servers.cacheC.agentPid = 13;
+    state.passwords.cacheC.stale = true;                   // not pushable yet
+    const plan = planLoot(ns, state, baseOptions, 10);
+    assert.equal(pushFiles(ns, state, plan), 3, "darkweb + two hosts on the first push");
+    assert.equal(ns.scps.length, 3);
+    assert.equal(pushFiles(ns, state, plan), 0, "nothing changed: no scp at all");
+    assert.equal(ns.scps.length, 3);
+    assert.equal(sessions, 4, "the session is still opened every loop: it is the liveness probe");
+    // A password that comes back changes passwords.txt for everyone.
+    delete state.passwords.cacheC.stale;
+    assert.equal(pushFiles(ns, state, plan), 4);
+    // A plan change for one host re-pushes only that host.
+    assert.deepEqual(plan.stasisTargets, ["cacheA"], "the loot planner pinned the first 32 GB host");
+    plan.stasisTargets = ["cacheA", "cacheB"];
+    assert.equal(pushFiles(ns, state, plan), 1);
+    assert.equal(ns.scps.at(-1).host, "cacheB");
+    // A restarted agent (new pid) received a neighbour's cmd.txt with the spread, so its own goes out again.
+    state.servers.cacheA.agentPid = 99;
+    assert.equal(pushFiles(ns, state, plan), 1);
+    assert.equal(ns.scps.at(-1).host, "cacheA");
+    // A host whose session fails is forgotten, so it is pushed again once it is back.
+    ns.dnet.connectToSession = (host) => ({ success: host !== "cacheB", code: host !== "cacheB" ? 200 : 503 });
+    assert.equal(pushFiles(ns, state, plan), 0);
+    assert.equal(state.servers.cacheB.online, false);
+    ns.dnet.connectToSession = () => ({ success: true, code: 200 });
+    state.servers.cacheB.online = true;
+    assert.equal(pushFiles(ns, state, plan), 1);
+    assert.equal(ns.scps.at(-1).host, "cacheB");
+});

@@ -893,7 +893,15 @@ export function bootstrap(ns, state, plan, options) {
     return !!started;
 }
 
-/** Push `passwords.txt` and a per-host `cmd.txt` to every online cracked server.
+// What each host was last given -- the passwords.txt text, its own cmd.txt text and the pid of the agent
+// that received them -- so an unchanged pair is not scp'd again every loop (R13). The agent pid is part of
+// the key because a restarted or re-spread agent got its NEIGHBOUR's cmd.txt with the spread
+// (darknet/agent.js copies its own files), so the host's own command file has to go out again even when
+// the plan for it did not change.
+const lastPushed = new Map();
+
+/** Push `passwords.txt` and a per-host `cmd.txt` to every online cracked server whose copy is out of
+ * date. The session is opened for every host regardless: it is the liveness probe.
  * @param {NS} ns */
 export function pushFiles(ns, state, plan) {
     const live = {};
@@ -901,7 +909,8 @@ export function pushFiles(ns, state, plan) {
         if (!entry || entry.stale || entry.password === undefined) continue;
         live[name] = entry.password;
     }
-    ns.write(FILES.passwords, JSON.stringify(live), "w");
+    const passwordsText = JSON.stringify(live);
+    ns.write(FILES.passwords, passwordsText, "w");
 
     let delivered = 0;
     const seen = new Set();
@@ -921,12 +930,20 @@ export function pushFiles(ns, state, plan) {
                 // no longer knows the name at all -- gone, and the password is worthless too (R15).
                 if ((session.code === 401 || session.code === 404) && state.passwords[host]) state.passwords[host].stale = true;
                 if (session.code === 503 || session.code === 404) { entry.online = false; entry.lastSeen = Date.now(); }
+                lastPushed.delete(host);       // whatever it holds now, it is not something to rely on
                 continue;
             }
             entry.lastSeen = Date.now();   // a live session is proof the host still exists
         }
-        ns.write(FILES.cmd, JSON.stringify(buildCmd(state, plan, host)), "w");
-        if (ns.scp([FILES.passwords, FILES.cmd], host, "home")) delivered++;
+        const cmdText = JSON.stringify(buildCmd(state, plan, host));
+        const agentPid = Number(state.servers[host]?.agentPid) || 0;
+        const previous = lastPushed.get(host);
+        if (previous && previous.passwords === passwordsText && previous.cmd === cmdText && previous.agentPid === agentPid) continue;
+        ns.write(FILES.cmd, cmdText, "w");
+        if (ns.scp([FILES.passwords, FILES.cmd], host, "home")) {
+            delivered++;
+            lastPushed.set(host, { passwords: passwordsText, cmd: cmdText, agentPid });
+        }
     }
     return delivered;
 }
