@@ -100,3 +100,10 @@ test("agent.js reserves the full commanded crack thread count for a pending crac
     assert.match(agent, /let reserve = pending\.length \? \(cmd\.threads\.crack \|\| 6\) \* WORKER_RAM\.crack : 0;/);
     assert.doesNotMatch(agent, /Math\.min\(cmd\.threads\.crack \|\| 6, 4\)/);
 });
+
+test("crack.js renews its claim from inside the attempt loop", () => {
+    const crack = src("darknet/crack.js");
+    assert.match(crack, /const CLAIM_REFRESH = 60000;/);
+    assert.match(crack, /kind: "crack", host: target, workerPid: pid, renewed: true/);
+    assert.match(crack, /if \(Date\.now\(\) - claimedAt >= CLAIM_REFRESH\) renewClaim\(\);/);
+});

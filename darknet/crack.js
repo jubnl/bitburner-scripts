@@ -4,6 +4,7 @@ import { encodeMsg, PORT_DEFAULT, FILES, FEEDBACK_MODELS, parsePasswords, parseC
 
 const argsSchema = [["port", PORT_DEFAULT], ["clues", ""]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
+const CLAIM_REFRESH = 60000;   // re-send the crack claim this often; the controller forgets a claim after 120 s
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -11,6 +12,15 @@ export async function main(ns) {
     const target = hostFromArg(options._[0]); if (!target) return ns.tprint("crack.js: missing target host");
     const me = ns.getHostname(), pid = ns.pid;
     const send = (payload) => { const line = encodeMsg("crack", me, pid, payload); if (!ns.tryWritePort(options.port, line)) ns.print(`WARN: port full, dropped: ${line}`); };
+    // The agent claimed `target` when it launched us, but the controller expires a claim after 2 minutes and
+    // an oracle crack can run 4-30 minutes; a neighbouring agent would then start a duplicate whose heartbleed
+    // lines break both cracks (R6). Same envelope as the agent's claim, so the controller re-stamps it.
+    let claimedAt = Date.now();
+    const renewClaim = () => {
+        claimedAt = Date.now();
+        const line = encodeMsg("worker", me, pid, { kind: "crack", host: target, workerPid: pid, renewed: true });
+        if (!ns.tryWritePort(options.port, line)) ns.print(`WARN: port full, dropped claim renewal: ${line}`);
+    };
     const details = ns.dnet.getServerDetails(target);
     if (!details.isOnline || !details.isConnectedToCurrentServer) return send({ host: target, success: false, attempts: 0, reason: "unreachable" });
     details.hostname = target;
@@ -23,6 +33,7 @@ export async function main(ns) {
     // charisma gate, so a heartbleed there would only add 1.5x the auth delay per miss or abort with 451 (R4).
     const wantsFeedback = FEEDBACK_MODELS.has(details.modelId);
     const attemptFn = async (password, needFeedback = true) => {
+        if (Date.now() - claimedAt >= CLAIM_REFRESH) renewClaim();
         let incremented = false;
         for (let tries = 0; tries < 5; tries++) {
             const r = await ns.dnet.authenticate(target, password);

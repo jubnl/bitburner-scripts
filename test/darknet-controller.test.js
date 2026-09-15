@@ -650,3 +650,16 @@ test("planLabyrinth releases a pinned host when every crossing candidate is pinn
     assert.ok(!plan.stasisTargets.includes("only"));
     assert.deepEqual(plan.stasisRelease, ["only"], "stasis:false goes out so the host becomes movable");
 });
+
+// R6: a claim stamped once at launch expired after 2 minutes while oracle cracks run 4-30 minutes, so a second
+// agent started a duplicate crack whose heartbleed lines made both fail with `timeouts`. crack.js now renews.
+test("a renewed crack claim keeps the host claimed past CLAIM_LIFETIME", () => {
+    const state = makeState({ alpha: {}, beta: {} });
+    const t0 = Date.now() - 150000;
+    applyMessage(state, { type: "worker", kind: "crack", from: "alpha", host: "gamma", pid: 7, ts: t0, workerPid: 42 });
+    applyMessage(state, { type: "worker", kind: "crack", from: "alpha", host: "gamma", pid: 42, ts: t0 + 60000, workerPid: 42, renewed: true });
+    applyMessage(state, { type: "worker", kind: "crack", from: "alpha", host: "gamma", pid: 42, ts: t0 + 120000, workerPid: 42, renewed: true });
+    const plan = planLoot(makeNs({}), state, baseOptions, 10);
+    assert.deepEqual(buildCmd(state, plan, "beta").claimed, ["gamma"], "150 s after launch, renewed 30 s ago");
+    assert.deepEqual(buildCmd(state, plan, "alpha").claimed, [], "the claimant itself is never blocked");
+});
