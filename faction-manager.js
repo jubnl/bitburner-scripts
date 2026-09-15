@@ -447,7 +447,7 @@ class AugmentationData {
             desiredStatsFilters.includes('*') || desiredStatsFilters.includes('_') || // Wildcards - all stats are desired (_ is for backwards compatibility when all stat names ended with '_mult')
             Object.keys(this.stats).some(stat => isStatDesired(stat));
         // Get the name of the "most-early-game" faction from which we can buy this augmentation. Estimate this by cost of the most expensive aug the offer
-        this.getFromAny = factionNames.map(f => factionData[f]).sort((a, b) => a.mostExpensiveAugCost - b.mostExpensiveAugCost)
+        this.getFromAny = factionNames.map(f => factionData[f]).sort((a, b) => a.mostExpensiveAugCost() - b.mostExpensiveAugCost())
             .filter(f => f.augmentations.includes(aug))[0]?.name ?? "(unknown)";
     }
     /** @returns {FactionData[]} A list of joined factions that have this augmentation */
@@ -990,7 +990,7 @@ function displayFactionSummary(ns, sortBy, unique, overrideFinishedFactions, exc
         if (sort2 != 0) return sort2;
         let sort3 = b.reputation - a.reputation; // If tied, sort by which faction we have the most rep with
         if (sort3 != 0) return sort3;
-        let sort4 = a.mostExpensiveAugCost().length - b.mostExpensiveAugCost().length; // If tied, "soonest to unlock", estimated by their most expensive aug cost
+        let sort4 = a.mostExpensiveAugCost() - b.mostExpensiveAugCost(); // If tied, "soonest to unlock", estimated by their most expensive aug cost
         if (sort4 != 0) return sort4;
         return (a.name).localeCompare(b.name) // If still tied, sort by naeme
     };
