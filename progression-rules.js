@@ -45,9 +45,11 @@ export function pickSilhouetteCompany(companies, repByCompany, favorByCompany, b
 }
 
 /** Requirements of one tier of a job track at a company with the given extra stat modifier (0 or 25) and backdoor status.
- * @returns {{rep: number, hack: number, cha: number}} */
+ *  Note: the hacking field is named `hacking`, not `hack` — `hack` collides with the NS function name and would be RAM-charged
+ *  wherever a caller writes `req.hack` (the game's RAM walker charges any property access matching an NS function name).
+ * @returns {{rep: number, hacking: number, cha: number}} */
 export function jobTierRequirements(trackName, tier, statModifier = 0, backdoored = false) {
     const job = jobs.find(j => j.name == trackName);
     const withOffset = v => v === 0 ? 0 : v + statModifier; // A 0 requirement stays 0 (the game has no requirement at all)
-    return { rep: job.reqRep[tier] * (backdoored ? BACKDOOR_REP_MULT : 1), hack: withOffset(job.reqHck[tier]), cha: withOffset(job.reqCha[tier]) };
+    return { rep: job.reqRep[tier] * (backdoored ? BACKDOOR_REP_MULT : 1), hacking: withOffset(job.reqHck[tier]), cha: withOffset(job.reqCha[tier]) };
 }

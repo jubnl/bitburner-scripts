@@ -62,9 +62,9 @@ test("executive titles match FactionJoinCondition.ts executiveEmployee and Enums
 });
 
 test("jobTierRequirements applies the company stat offset and the backdoor rep multiplier", () => {
-    assert.deepEqual(jobTierRequirements("Business", 4, 0, false), { rep: 800e3, hack: 300, cha: 725 });
-    assert.deepEqual(jobTierRequirements("Business", 4, 25, true), { rep: 600e3, hack: 325, cha: 750 });
-    assert.deepEqual(jobTierRequirements("Software", 0, 25, false), { rep: 0, hack: 250, cha: 0 }); // 0 = no requirement, offset not added
+    assert.deepEqual(jobTierRequirements("Business", 4, 0, false), { rep: 800e3, hacking: 300, cha: 725 });
+    assert.deepEqual(jobTierRequirements("Business", 4, 25, true), { rep: 600e3, hacking: 325, cha: 750 });
+    assert.deepEqual(jobTierRequirements("Software", 0, 25, false), { rep: 0, hacking: 250, cha: 0 }); // 0 = no requirement, offset not added
 });
 
 test("pickSilhouetteCompany minimises remaining CFO rep / (100 + favor)", () => {

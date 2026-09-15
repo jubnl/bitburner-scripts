@@ -1343,7 +1343,7 @@ async function earnExecutiveJob(ns, companyName, executiveJob, statModifier, bac
         const currentRep = await getCompanyReputation(ns, companyName);
         const missing = [];
         if (currentRep < req.rep) missing.push(`Rep ${Math.round(currentRep).toLocaleString('en')}/${req.rep.toLocaleString('en')}`);
-        if (player.skills.hacking < req.hack) missing.push(`Hack ${player.skills.hacking}/${req.hack}`);
+        if (player.skills.hacking < req.hacking) missing.push(`Hack ${player.skills.hacking}/${req.hacking}`);
         if (player.skills.charisma < req.cha) missing.push(`Cha ${player.skills.charisma}/${req.cha}`);
         if (missing.length == 0) { // All requirements met: apply for the track, the game promotes us straight to the highest tier we qualify for
             if (await tryApplyToCompany(ns, companyName, executiveJob.track)) {
