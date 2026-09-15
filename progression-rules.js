@@ -92,3 +92,22 @@ export function bestCombatExpCrime(crimeChances, fastCrimesOnly = false) {
     const candidates = Object.keys(crimeStats).filter(c => c in crimeChances && !(fastCrimesOnly && slowCrimes.includes(c)));
     return candidates.sort((a, b) => crimeCombatExpRate(b, crimeChances[b]) - crimeCombatExpRate(a, crimeChances[a]) || crimeStats[a].timeMs - crimeStats[b].timeMs)[0];
 }
+
+/** Invite prerequisites that no stat grinding can satisfy right now, for the three end-game factions
+ *  (src/Faction/FactionInfo.tsx Illuminati / Daedalus / The Covenant inviteReqs). `augs: null` = bitNodeMults.DaedalusAugsRequirement.
+ *  haveAugmentations counts *installed* augs (src/Faction/FactionJoinCondition.ts: p.augmentations.length, NeuroFlux counts once). */
+export const endgameInviteRequirements = {
+    "The Covenant": { augs: 20, money: 75e9 },
+    "Daedalus": { augs: null, money: 100e9 },
+    "Illuminati": { augs: 30, money: 150e9 },
+};
+
+/** @returns {null|{reason: "augs"|"money", have: number, need: number}} why we cannot be invited yet regardless of stats, or null */
+export function endgameInviteBlocker(factionName, money, installedAugCount, daedalusAugsRequirement) {
+    const req = endgameInviteRequirements[factionName];
+    if (!req) return null;
+    const augsNeeded = req.augs ?? daedalusAugsRequirement;
+    if (installedAugCount < augsNeeded) return { reason: "augs", have: installedAugCount, need: augsNeeded };
+    if (money < req.money) return { reason: "money", have: money, need: req.money };
+    return null;
+}

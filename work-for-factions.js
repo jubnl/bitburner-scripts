@@ -2,7 +2,7 @@ import {
     instanceCount, getConfiguration, getNsDataThroughFile, getFilePath, getActiveSourceFiles, tryGetBitNodeMultipliers,
     formatDuration, formatMoney, formatNumberShort, disableLogs, log, getErrorInfo, tail
 } from './helpers.js'
-import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites, bestCombatExpCrime } from './progression-rules.js'
+import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites, bestCombatExpCrime, endgameInviteBlocker } from './progression-rules.js'
 
 let options;
 const argsSchema = [
@@ -95,7 +95,7 @@ const waitForFactionInviteTime = 30 * 1000; // The game will only issue one new 
 let shouldFocus; // Whether we should focus on work or let it be backgrounded (based on whether "Neuroreceptor Management Implant" is owned, or "--no-focus" is specified)
 // And a bunch of globals because managing state and encapsulation is hard.
 let hasFocusPenalty, hasSimulacrum, favorToDonate, fulcrumHackReq, notifiedAboutDaedalus, playerInBladeburner, wasGrafting, currentBitnode;
-let dictSourceFiles, dictFactionFavors, playerGang, mainLoopStart, scope, numJoinedFactions, lastTravel, crimeCount;
+let dictSourceFiles, dictFactionFavors, playerGang, mainLoopStart, scope, numJoinedFactions, lastTravel, crimeCount, numInstalledAugs;
 let firstFactions, skipFactions, completedFactions, softCompletedFactions, mostExpensiveAugByFaction, mostExpensiveDesiredAugByFaction;
 let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)(); // Trick to get strong typing in mono
 let lastCityInviteNotice = ""; // De-duplicates the "not auto-joining city faction" log line
@@ -192,6 +192,7 @@ async function loadStartupData(ns) {
     hasFocusPenalty = !installedAugmentations.includes("Neuroreceptor Management Implant"); // Check if we have an augmentation that lets us not have to focus at work (always nicer if we can background it)
     shouldFocus = !options['no-focus'] && hasFocusPenalty; // Focus at work for the best rate of rep gain, unless focus activities are disabled via command line
     hasSimulacrum = installedAugmentations.includes("The Blade's Simulacrum");
+    numInstalledAugs = installedAugmentations.length; // What the game's haveAugmentations(n) invite condition counts (NeuroFlux appears once)
 
     // Find out if we're in a gang
     const gangInfo = await getGangInfo(ns);
@@ -464,6 +465,13 @@ async function earnFactionInvite(ns, factionName) {
         ["Chongqing", "New Tokyo", "Ishima"].includes(factionName) && (precludingFaction = ["Aevum", "Sector-12", "Volhaven"].find(f => joinedFactions.includes(f))) ||
         ["Volhaven"].includes(factionName) && (precludingFaction = ["Aevum", "Sector-12", "Chongqing", "New Tokyo", "Ishima"].find(f => joinedFactions.includes(f))))
         return ns.print(`${reasonPrefix} precluding faction "${precludingFaction}"" has been joined.`);
+    // Daedalus / The Covenant / Illuminati also need N *installed* augs and a lot of money (src/Faction/FactionInfo.tsx). Neither can be earned
+    // by the crime / study grinds below, so check them first instead of spending up to 10 minutes per pass on stats that cannot yield the invite.
+    const inviteBlocker = endgameInviteBlocker(factionName, player.money, numInstalledAugs, bitNodeMults.DaedalusAugsRequirement);
+    if (inviteBlocker?.reason == "augs")
+        return ns.print(`${reasonPrefix} you have ${inviteBlocker.have} of the ${inviteBlocker.need} installed augmentations required.`);
+    if (inviteBlocker?.reason == "money")
+        return ns.print(`${reasonPrefix} you have insufficient money. Need: ${formatMoney(inviteBlocker.need)}, Have: ${formatMoney(inviteBlocker.have)}`);
     let requirement;
     // See if we can take action to earn an invite for the next faction under consideration
     let workedForInvite = false;

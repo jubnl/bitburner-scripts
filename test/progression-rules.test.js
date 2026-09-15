@@ -7,6 +7,7 @@ import {
     jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT,
     pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites,
     crimeStats, slowCrimes, crimeCombatExpRate, bestCombatExpCrime,
+    endgameInviteRequirements, endgameInviteBlocker,
 } from "../progression-rules.js";
 
 const SRC = "/home/jubnl/dev/bitburner/bitburner-src/src/";
@@ -128,4 +129,29 @@ test("bestCombatExpCrime prefers Mug over Homicide/Heist and Assassination only 
     assert.equal(bestCombatExpCrime({ Heist: 1, Assassination: 0.9, Homicide: 1, Mug: 1 }, true), "Mug"); // --fast-crimes-only excludes the slow crimes
     assert.equal(bestCombatExpCrime({ Homicide: 0.3, Mug: 0.4 }), "Mug"); // only the crimes present are considered
     assert.equal(bestCombatExpCrime({}), undefined);
+});
+
+const factionInfoSrc = readFileSync(SRC + "Faction/FactionInfo.tsx", "utf8");
+test("endgameInviteRequirements match FactionInfo.tsx", () => {
+    const req = (faction) => {
+        const block = factionInfoSrc.match(new RegExp(`\\[FactionName\\.${faction}\\]: new FactionInfo\\(\\{([\\s\\S]*?)inviteReqs: \\[([^\\n]*)`))[2];
+        return { augs: block.match(/haveAugmentations\((\d+)\)/)?.[1], money: Number(block.match(/haveMoney\(([\d.e]+)\)/)[1]) };
+    };
+    assert.deepEqual(req("Illuminati"), { augs: "30", money: 150e9 });
+    assert.deepEqual(req("TheCovenant"), { augs: "20", money: 75e9 });
+    assert.deepEqual(endgameInviteRequirements["Illuminati"], { augs: 30, money: 150e9 });
+    assert.deepEqual(endgameInviteRequirements["The Covenant"], { augs: 20, money: 75e9 });
+    assert.deepEqual(endgameInviteRequirements["Daedalus"], { augs: null, money: 100e9 });
+    assert.match(factionInfoSrc, /\[FactionName\.Daedalus\][\s\S]*?haveMoney\(100e9\)/);
+    assert.match(factionInfoSrc, /\[FactionName\.Daedalus\][\s\S]*?haveAugmentations\(currentNodeMults\.DaedalusAugsRequirement\)/);
+});
+
+test("endgameInviteBlocker: augs first, then money, null when satisfied or not an end-game faction", () => {
+    assert.deepEqual(endgameInviteBlocker("The Covenant", 1e12, 5, 30), { reason: "augs", have: 5, need: 20 });
+    assert.deepEqual(endgameInviteBlocker("The Covenant", 1e9, 25, 30), { reason: "money", have: 1e9, need: 75e9 });
+    assert.equal(endgameInviteBlocker("The Covenant", 75e9, 20, 30), null);
+    assert.deepEqual(endgameInviteBlocker("Daedalus", 1e12, 29, 30), { reason: "augs", have: 29, need: 30 });
+    assert.deepEqual(endgameInviteBlocker("Daedalus", 1e12, 29, 25), null); // BN-specific requirement honoured
+    assert.deepEqual(endgameInviteBlocker("Illuminati", 149e9, 40, 30), { reason: "money", have: 149e9, need: 150e9 });
+    assert.equal(endgameInviteBlocker("Tetrads", 0, 0, 30), null);
 });
