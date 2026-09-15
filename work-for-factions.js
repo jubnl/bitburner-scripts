@@ -2,6 +2,7 @@ import {
     instanceCount, getConfiguration, getNsDataThroughFile, getFilePath, getActiveSourceFiles, tryGetBitNodeMultipliers,
     formatDuration, formatMoney, formatNumberShort, disableLogs, log, getErrorInfo, tail
 } from './helpers.js'
+import { jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT, pickSilhouetteCompany, jobTierRequirements } from './progression-rules.js'
 
 let options;
 const argsSchema = [
@@ -42,25 +43,11 @@ const companySpecificConfigs = [
     { name: "MegaCorp", statModifier: 25 },
     { name: "ECorp", statModifier: 25 },
     { name: "Fulcrum Secret Technologies", companyName: "Fulcrum Technologies" }, // Special snowflake
-    { name: "Silhouette", companyName: "TBD", repRequiredForFaction: 1.0e7 } // Hack: 3.2e6 should be enough rep to get the CTO position, but once
-    // we hit this rep we might break out of the work loop before getting the final promotion, so we keep working until we get the faction invite.
+    // Silhouette invites any CTO / CFO / CEO (src/Faction/FactionJoinCondition.ts executiveEmployee). The cheapest is the CFO: Business tier 4 at
+    // 800k company rep (CTO needs 3.2M). We earn the rep on the IT/Software track (best rep/s for a hacker), then apply to Business (see earnExecutiveJob)
+    { name: "Silhouette", companyName: "TBD", repRequiredForFaction: SILHOUETTE_EXECUTIVE_REP, executiveJob: silhouetteExecutiveJob }
 ]
-const jobs = [ // Job stat requirements for a company with a base stat modifier of +224 (modifier of all megacorps except the ones above which are 25 higher)
-    {
-        name: "IT",
-        reqRep: [0e0, 7e3, 35e3, 175e3],
-        reqHck: [225, 250, 375, 475], // [1, 26, 151, 251] + 224 (src/Company/data/CompanyPositionsMetadata.ts IT1-IT3 reqdHacking)
-        reqCha: [0e0, 0e0, 275, 300], // [0,  0, 51,  76] + 224
-        repMult: [0.9, 1.1, 1.3, 1.4]
-    },
-    {
-        name: "Software",
-        reqRep: [0e0, 8e3, 4e4, 2e5, 4e5, 8e5, 16e5, 32e5],
-        reqHck: [225, 275, 475, 625, 725, 725, 825, 975],   // [1, 51, 251, 401, 501, 501, 601, 751] + 224
-        reqCha: [0e0, 0e0, 275, 375, 475, 475, 625, 725],   // [0,  0,  51, 151, 251, 251, 401, 501] + 224
-        repMult: [0.9, 1.1, 1.3, 1.5, 1.6, 1.6, 1.75, 2.0]
-    },
-]
+// The job stat requirement tables (IT / Software / Business) live in progression-rules.js (`jobs`) so they can be unit-tested against the game source.
 const factions = ["Illuminati", "Daedalus", "The Covenant", "ECorp", "MegaCorp", "Bachman & Associates", "Blade Industries", "NWO", "Clarke Incorporated", "OmniTek Incorporated",
     "Four Sigma", "KuaiGong International", "Fulcrum Secret Technologies", "BitRunners", "The Black Hand", "NiteSec", "Aevum", "Chongqing", "Ishima", "New Tokyo", "Sector-12",
     "Volhaven", "Speakers for the Dead", "The Dark Army", "The Syndicate", "Silhouette", "Tetrads", "Slum Snakes", "Netburners", "Tian Di Hui", "CyberSec"];
@@ -577,27 +564,26 @@ async function earnFactionInvite(ns, factionName) {
         player = await getPlayerInfo(ns); // Update player.city
     }
 
-    // Special case: earn a CEO position to gain an invite to Silhouette
+    // Special case: earn an executive position (CFO is the cheapest: 800k company rep on the Business track) to gain an invite to Silhouette
     if ("Silhouette" == factionName) {
-        ns.print(`You must be a CO (e.g. CEO/CTO) of a company to earn an invite to "Silhouette". This may take a while!`);
+        ns.print(`You must be a CTO, CFO or CEO of a company to earn an invite to "Silhouette". Working towards CFO ` +
+            `(${SILHOUETTE_EXECUTIVE_REP.toLocaleString('en')} company rep, x${BACKDOOR_REP_MULT} if the company server is backdoored)...`);
         let factionConfig = companySpecificConfigs.find(f => f.name == "Silhouette"); // We set up Silhouette with a "company-specific-config" so that we can work for an invite like any megacorporation faction.
         let companyNames = preferredCompanyFactionOrder.map(f => companySpecificConfigs.find(cf => cf.name == f)?.companyName || f);
         let favorByCompany = await getNsDataThroughFile(ns, dictCommand('ns.singularity.getCompanyFavor(o)'), '/Temp/getCompanyFavors.txt', companyNames);
         let repByCompany = await getNsDataThroughFile(ns, dictCommand('ns.singularity.getCompanyRep(o)'), '/Temp/getCompanyReps.txt', companyNames);
-        // Change the company to work for into whichever company we can get to CEO fastest with.
-        // Minimize needed_rep/rep_gain_rate. CEO job is at 3.2e6 rep, so (3.2e6-current_rep)/(100+favor).
-        // Also take into account that some companies will have lowered rep requirement if they are backdoored
+        // Change the company to work for into whichever company we can reach the CFO rep requirement with soonest:
+        // minimize needed_rep/rep_gain_rate = (800e3 * (backdoored ? 0.75 : 1) - current_rep) / (100 + favor)
         const backdoorByServer = await backdoorStatusByServer(ns);
-        factionConfig.companyName = companyNames.sort((a, b) =>
-            ((backdoorByServer[serverByCompany[a]] ? 0.75 : 1.0) * 3.2e6 - repByCompany[a]) / (100 + favorByCompany[a]) -
-            ((backdoorByServer[serverByCompany[b]] ? 0.75 : 1.0) * 3.2e6 - repByCompany[b]) / (100 + favorByCompany[b]))[0];
+        const backdooredByCompany = Object.fromEntries(companyNames.map(c => [c, backdoorByServer[serverByCompany[c]] ?? false]));
+        factionConfig.companyName = pickSilhouetteCompany(companyNames, repByCompany, favorByCompany, backdooredByCompany);
         // If the company we chose has a required stat modifier, we need to add it to the one for Silhouette
         factionConfig.statModifier = companySpecificConfigs.find(c => (c.companyName ?? c.name) == factionConfig.companyName)?.statModifier || 0;
         // If the company we chose gets backdoored, this should appear to affect Silhouette too. A hack is to add a new "serverByCompany" dict entry
         serverByCompany["Silhouette"] = serverByCompany[factionConfig.companyName]
 
         // Hack: We will be working indefinitely, so we rely on an external script (daemon + faction-manager) to join this faction for us, or for checkForNewPrioritiesInterval to elapse.
-        workedForInvite = await workForMegacorpFactionInvite(ns, factionName, false); // Work until CTO and the external script joins this faction, triggering an exit condition.
+        workedForInvite = await workForMegacorpFactionInvite(ns, factionName, false); // Work until the CFO rep, then earnExecutiveJob takes the title; the waitForFactionInvite below picks up the invite
     }
 
     // Special case: check hacknet stats before we try to join Netburners
@@ -1193,7 +1179,8 @@ export async function workForMegacorpFactionInvite(ns, factionName, waitForInvit
     let lastStatus = "", lastStatusUpdateTime = 0;
     let isStudying = false, isWorking = false, decidedNotToStudy = false;
     let backdoored = await checkForBackdoor(ns, companyName);
-    let repRequiredForFaction = (companyConfig?.repRequiredForFaction || 400_000) - (backdoored ? 100_000 : 0);
+    // src/Company/utils.ts calculateEffectiveRequiredReputation: every company rep requirement is x0.75 while the company server is backdoored (400k -> 300k, 800k -> 600k)
+    let repRequiredForFaction = Math.round((companyConfig?.repRequiredForFaction || 400_000) * (backdoored ? BACKDOOR_REP_MULT : 1));
     while (((currentReputation = (await getCompanyReputation(ns, companyName))) < repRequiredForFaction) && !player.factions.includes(factionName)) {
         if (breakToMainLoop()) return ns.print('INFO: Interrupting corporation work to check on high-level priorities.');
         // Determine the next promotion we're striving for (the sooner we get promoted, the faster we can earn company rep)
@@ -1276,7 +1263,7 @@ export async function workForMegacorpFactionInvite(ns, factionName, waitForInvit
         if (!backdoored) { // Don't need to check again once we've confirmed a backdoor.
             backdoored = await checkForBackdoor(ns, companyName);
             if (backdoored) {
-                repRequiredForFaction -= 100_000; // Adjust total required faction reputation (since this was initialized outside of the loop)
+                repRequiredForFaction = Math.round(repRequiredForFaction * BACKDOOR_REP_MULT); // Adjust total required faction reputation (since this was initialized outside of the loop)
                 continue; // Restat the loop so we recompute promotion requirements
             }
         }
@@ -1322,11 +1309,65 @@ export async function workForMegacorpFactionInvite(ns, factionName, waitForInvit
     // Return true if we succeeded, false otherwise.
     if (currentReputation >= repRequiredForFaction) {
         ns.print(`Attained ${repRequiredForFaction.toLocaleString('en')} rep with "${companyName}".`);
+        // Silhouette: rep alone does not earn the invite, we must also hold an executive title (CFO) at this company
+        if (companyConfig?.executiveJob && !player.factions.includes(factionName) &&
+            !(await earnExecutiveJob(ns, companyName, companyConfig.executiveJob, statModifier, backdoored)))
+            return false;
         if (!player.factions.includes(factionName) && waitForInvite)
             return await waitForFactionInvite(ns, factionName);
         return true;
     }
     ns.print(`Stopped working for "${companyName}" repRequiredForFaction: ${repRequiredForFaction.toLocaleString('en')} ` +
         `currentReputation: ${Math.round(currentReputation).toLocaleString('en')} inFaction: ${player.factions.includes(factionName)}`);
+    return false;
+}
+
+/** Silhouette special case: once the company rep for the executive tier is earned, switch tracks and apply for the title. The game's
+ *  applyToCompany starts at the track's entry position and climbs every tier we qualify for (src/PersonObjects/Player/PlayerObjectGeneralMethods.ts
+ *  applyForJob), so one application lands directly on CFO. Studies Leadership first if charisma is the only missing requirement.
+ * @param {NS} ns
+ * @param {string} companyName
+ * @param {{track: string, tier: number}} executiveJob The job track and tier index (in `jobs`) whose title satisfies the invite condition
+ * @param {number} statModifier Extra stat requirement of this company (0 or 25)
+ * @param {boolean} backdoored Whether the company server is backdoored (rep requirements x0.75)
+ * @returns {Promise<boolean>} true once player.jobs[companyName] is an executive title */
+async function earnExecutiveJob(ns, companyName, executiveJob, statModifier, backdoored) {
+    const req = jobTierRequirements(executiveJob.track, executiveJob.tier, statModifier, backdoored);
+    const jobDesc = `'${executiveJob.track}' #${executiveJob.tier} at "${companyName}"`;
+    while (!breakToMainLoop()) {
+        const player = await getPlayerInfo(ns);
+        if (executiveJobTitles.includes(player.jobs[companyName])) {
+            log(ns, `SUCCESS: We are now "${player.jobs[companyName]}" at "${companyName}", which qualifies for the Silhouette invite.`, false, 'success');
+            return true;
+        }
+        const currentRep = await getCompanyReputation(ns, companyName);
+        const missing = [];
+        if (currentRep < req.rep) missing.push(`Rep ${Math.round(currentRep).toLocaleString('en')}/${req.rep.toLocaleString('en')}`);
+        if (player.skills.hacking < req.hack) missing.push(`Hack ${player.skills.hacking}/${req.hack}`);
+        if (player.skills.charisma < req.cha) missing.push(`Cha ${player.skills.charisma}/${req.cha}`);
+        if (missing.length == 0) { // All requirements met: apply for the track, the game promotes us straight to the highest tier we qualify for
+            if (await tryApplyToCompany(ns, companyName, executiveJob.track)) {
+                log(ns, `Applied to "${companyName}" for a '${executiveJob.track}' position (expecting tier ${executiveJob.tier}).`, false, 'success');
+                continue; // Re-read player.jobs to confirm the title
+            }
+            ns.print(`ERROR: Application for ${jobDesc} failed although the rep/hack/cha requirements appear to be met.`);
+            return false;
+        }
+        // Only charisma can be trained here (company rep is earned by workForMegacorpFactionInvite, hack by daemon.js)
+        if (missing.length == 1 && player.skills.charisma < req.cha && !options['no-studying']) {
+            const em = req.cha / options['training-stat-per-multi-threshold'];
+            const chaHeuristic = classHeuristic(player, 'charisma');
+            if (chaHeuristic < em) {
+                ns.print(`Cannot become ${jobDesc}: charisma ${player.skills.charisma} < ${req.cha}, and our charisma multipliers look too low to train it ` +
+                    `in a reasonable amount of time (${formatNumberShort(chaHeuristic)} < ${formatNumberShort(em, 2)} - configure with --training-stat-per-multi-threshold)`);
+                return false;
+            }
+            if (!(await studyForCharisma(ns, shouldFocus))) return false;
+            if (!(await monitorStudies(ns, 'charisma', req.cha))) return false;
+            continue;
+        }
+        ns.print(`Cannot yet become ${jobDesc}. Missing: ${missing.join(', ')}`);
+        return false;
+    }
     return false;
 }
