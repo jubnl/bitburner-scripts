@@ -62,10 +62,36 @@ function setStatus(ns, logMessage) {
     if (logMessage != lastUpgradeLog) ns.print(lastUpgradeLog = logMessage);
 }
 
+// HN-1: upgrade cost constants from src/Hacknet/data/Constants.ts (HacknetNodeConstants / HacknetServerConstants)
+const hacknetNodeCostConstants = { levelBaseCost: 500, ramBaseCost: 30e3, coreBaseCost: 500e3, upgradeLevelMult: 1.04, upgradeRamMult: 1.28, upgradeCoreMult: 1.48, levelExponentOffset: 1 };
+const hacknetServerCostConstants = { levelBaseCost: 10 * 50e3, ramBaseCost: 200e3, coreBaseCost: 1e6, upgradeLevelMult: 1.1, upgradeRamMult: 1.4, upgradeCoreMult: 1.55, levelExponentOffset: 0 };
+
+/** HN-1: money needed to take a fresh node/server (level 1, 1 GB, 1 core) to the given level, ram and cores, transcribed from the game's
+ * cost formulas (src/Hacknet/formulas/HacknetNodes.ts and HacknetServers.ts calculateLevelUpgradeCost / calculateRamUpgradeCost /
+ * calculateCoreUpgradeCost, which ns.hacknet.get*UpgradeCost and ns.formulas.hacknet* call). Servers: 10*BaseCost*sum_{L=1}^{level-1} 1.1^L;
+ * nodes: LevelBaseCost*sum_{L=1}^{level-1} 1.04^(L-1). RAM (both): sum over doublings r=1,2,..,ram/2 of r*RamBaseCost*UpgradeRamMult^log2(r).
+ * Cores (both): CoreBaseCost*sum_{c=1}^{cores-1} UpgradeCoreMult^(c-1). Each component is scaled by the player's cost multiplier.
+ * @param {boolean} isServer @param {number} level @param {number} ram @param {number} cores
+ * @param {{hacknet_node_level_cost?: number, hacknet_node_ram_cost?: number, hacknet_node_core_cost?: number}} mults */
+export function costToMatchStats(isServer, level, ram, cores, mults = {}) {
+    const c = isServer ? hacknetServerCostConstants : hacknetNodeCostConstants;
+    let levelCost = 0;
+    for (let l = 1; l < level; l++) levelCost += Math.pow(c.upgradeLevelMult, l - c.levelExponentOffset);
+    levelCost *= c.levelBaseCost * (mults.hacknet_node_level_cost ?? 1);
+    let ramCost = 0;
+    for (let r = 1, n = 0; r < ram; r *= 2, n++) ramCost += r * c.ramBaseCost * Math.pow(c.upgradeRamMult, n);
+    ramCost *= mults.hacknet_node_ram_cost ?? 1;
+    let coreCost = 0;
+    for (let k = 1; k < cores; k++) coreCost += Math.pow(c.upgradeCoreMult, k - 1);
+    coreCost *= c.coreBaseCost * (mults.hacknet_node_core_cost ?? 1);
+    return levelCost + ramCost + coreCost;
+}
+
 // Will buy the most effective hacknet upgrade, so long as it will pay for itself in the next {payoffTimeSeconds} seconds.
 /** @param {NS} ns **/
 export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600 sec == 1 hour */, options) {
-    const currentHacknetMult = ns.getPlayer().mults.hacknet_node_money;
+    const playerMults = ns.getPlayer().mults;
+    const currentHacknetMult = playerMults.hacknet_node_money;
     // Detect up-front whether we have hacknet nodes or hacknet servers (hashCapacity is 0 for plain nodes), so the right formulas are used from the first purchase
     if (haveHacknetServers && ns.hacknet.numNodes() > 0 && ns.hacknet.hashCapacity() == 0)
         haveHacknetServers = false;
@@ -117,11 +143,13 @@ export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600
     let cost = 0;
     let upgradedValue = 0;
     let worstNodeProduction = Number.MAX_VALUE; // Used to how productive a newly purchased node might be
+    let worstNodeStats = null, worstNodeIndex = -1; // HN-1: the (level, ram, cores) a new node must be upgraded to before it produces worstNodeProduction
     for (var i = 0; i < ns.hacknet.numNodes(); i++) {
         let nodeStats = ns.hacknet.getNodeStats(i);
         if (haveHacknetServers && formulasAvailable) // When a hacknet server runs scripts, nodeStats.production lags behind what it should be for current ram usage. Get the "raw" rate
             nodeStats.production = fnProduction(nodeStats.level, nodeStats.ram, nodeStats.cores);
         // (If we do not have the formulas API yet, we cannot account for this and must simply fall-back to using the production reported by the node)
+        if (nodeStats.production < worstNodeProduction) [worstNodeStats, worstNodeIndex] = [nodeStats, i];
         worstNodeProduction = Math.min(worstNodeProduction, nodeStats.production);
         for (let up = 1; up < upgrades.length; up++) {
             let currentUpgradeCost = upgrades[up].cost(i);
@@ -135,12 +163,18 @@ export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600
             }
         }
     }
-    // Compare this to the cost of adding a new node. This is an imperfect science. We are paying to unlock the ability to buy all the same upgrades our
-    // other nodes have - all of which have been deemed worthwhile. Not knowing the sum total that will have to be spent to reach that same production,
-    // the "most optimistic" case is to treat "price" of all that production to be just the cost of this server, but this is **very** optimistic.
-    // In practice, the cost of new hacknodes scales steeply enough that this should come close to being true (cost of server >> sum of cost of upgrades)
+    // Compare this to the cost of adding a new node. A new node produces next to nothing (level 1, 1 GB, 1 core) until it has been upgraded to
+    // match our worst existing node, so (HN-1) the worst node's production is priced at the node cost PLUS the upgrades needed to reach its
+    // level, ram and cores: the game's cost formulas via ns.formulas when available, otherwise the same formulas transcribed in costToMatchStats.
+    // (Each of those upgrades is later tested against the payoff limit individually, so without this the true payoff of node + upgrades was ~2x the limit.)
     let newNodeCost = ns.hacknet.getPurchaseNodeCost();
-    let newNodePayoff = ns.hacknet.numNodes() == ns.hacknet.maxNumNodes() ? 0 : worstNodeProduction / newNodeCost;
+    const fnCosts = haveHacknetServers ? ns.formulas.hacknetServers : ns.formulas.hacknetNodes;
+    const upgradeCostToMatchWorst = worstNodeStats == null ? 0 : haveFormulas ?
+        fnCosts.levelUpgradeCost(1, worstNodeStats.level - 1, playerMults.hacknet_node_level_cost) +
+        fnCosts.ramUpgradeCost(1, Math.log2(worstNodeStats.ram), playerMults.hacknet_node_ram_cost) +
+        fnCosts.coreUpgradeCost(1, worstNodeStats.cores - 1, playerMults.hacknet_node_core_cost) :
+        costToMatchStats(haveHacknetServers, worstNodeStats.level, worstNodeStats.ram, worstNodeStats.cores, playerMults);
+    let newNodePayoff = ns.hacknet.numNodes() == ns.hacknet.maxNumNodes() ? 0 : worstNodeProduction / (newNodeCost + upgradeCostToMatchWorst);
     let shouldBuyNewNode = newNodePayoff > bestUpgradePayoff;
     if (newNodePayoff == 0 && bestUpgradePayoff == 0) {
         setStatus(ns, `All upgrades have no value (is hashNet income disabled in this BN?)`);
@@ -153,8 +187,9 @@ export function upgradeHacknet(ns, maxSpend, maxPayoffTimeSeconds = 3600 /* 3600
 
     // Prepare info about the next uprade. Whether we end up purchasing or not, we will display this info.
     let strPurchase = (shouldBuyNewNode ? `a new node "hacknet-node-${ns.hacknet.numNodes()}"` :
-        `hacknet-node-${nodeToUpgrade} ${bestUpgrade.name} ${upgradedValue}`) + ` for ${formatMoney(cost)}`;
-    let strPayoff = `production ${((shouldBuyNewNode ? newNodePayoff : bestUpgradePayoff) * cost).toPrecision(3)} payoff time: ${formatDuration(1000 * payoffTimeSeconds)}`
+        `hacknet-node-${nodeToUpgrade} ${bestUpgrade.name} ${upgradedValue}`) + ` for ${formatMoney(cost)}` +
+        (shouldBuyNewNode && upgradeCostToMatchWorst > 0 ? ` (+ ${formatMoney(upgradeCostToMatchWorst)} of upgrades to match hacknet-node-${worstNodeIndex})` : '');
+    let strPayoff = `production ${(shouldBuyNewNode ? worstNodeProduction : bestUpgradePayoff * cost).toPrecision(3)} payoff time: ${formatDuration(1000 * payoffTimeSeconds)}`
     if (cost > maxSpend) {
         setStatus(ns, `The next best purchase would be ${strPurchase}, but the cost exceeds the spending limit (${formatMoney(maxSpend)})`);
         return false; // Shut-down. As long as maxSpend doesn't change, we will never purchase another upgrade
