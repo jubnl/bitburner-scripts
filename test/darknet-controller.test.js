@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseCmd, emptyState, encodeMsg, WORKER_RAM } from "../darknet/lib.js";
+import { parseCmd, emptyState, encodeMsg, WORKER_RAM, LABS, LAB_AUGMENTATIONS, labFromAugmentations, labFromDifficulty } from "../darknet/lib.js";
 import {
     applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
-    loadState, planLabyrinth, planLoot, planPromotions, pushFiles, saveState,
+    loadState, planLabyrinth, planLoot, planPromotions, pushFiles, recomputeCompleted, saveState,
 } from "../darknet.js";
 
 /* Node-only tests for darknet.js's planning and state machine.
@@ -34,7 +34,13 @@ function makeNs(config = {}) {
         readPort: () => (ports.length ? ports.shift() : "NULL PORT DATA"),
         tryWritePort: (_port, data) => { ports.push(data); return true; },
         getPlayer: () => ({ skills: { charisma: config.charisma ?? 0 } }),
-        getResetInfo: () => ({ lastAugReset: config.resetTime ?? 1000 }),
+        getResetInfo: () => ({
+            lastAugReset: config.resetTime ?? 1000,
+            currentNode: config.bitNode ?? 1,
+            // undefined (the default) models a build whose ResetInfo has no ownedAugs, which exercises the
+            // difficulty fallback; a list (possibly empty) models the real game.
+            ownedAugs: config.ownedAugs ? new Map(config.ownedAugs.map(name => [name, 1])) : undefined,
+        }),
         isRunning: () => config.isRunning ?? false,
         exec: (script, host, opts, ...rest) => { ns.execs.push({ script, host, opts, args: rest }); return ns.execs.length + 100; },
         scp: (what, host) => { ns.scps.push({ what, host }); return true; },
@@ -399,14 +405,13 @@ test("loot mode pins the biggest host first, then the deepest ones", () => {
 // defaults to server.difficulty), wherever it currently sits. So the air-gap candidates are
 // the hosts whose difficulty reaches past the gap, not the ones sitting just above it.
 test("planLabyrinth picks air-gap migration targets by difficulty, strongest first", () => {
-    const ns = makeNs({ charisma: 600, details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
+    const ns = makeNs({ charisma: 600, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings], details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
     const state = makeState({
         shallow: { depth: 7, difficulty: 3, neighbours: ["charger"] },   // depth 7 but 3 + 4 = 7 never reaches row 9
         deep: { depth: 6, difficulty: 5, neighbours: ["charger"] },      // 5 + 4 = 9 > 8: can land past the gap
         best: { depth: 5, difficulty: 7, neighbours: ["charger"] },      // reaches row 11
         charger: { depth: 6, difficulty: 4, neighbours: ["shallow", "deep", "best"] },
     });
-    state.labs.completed = ["th3_l4byr1nth"];
     assert.equal(currentLab(ns, state).host, "cru3l_l4byr1nth");
 
     const plan = planLabyrinth(ns, state, baseOptions, 600);
@@ -416,15 +421,86 @@ test("planLabyrinth picks air-gap migration targets by difficulty, strongest fir
 });
 
 test("chooseMode counts a charging migration by the same difficulty rule", () => {
-    const ns = makeNs({ charisma: 600, details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
+    const ns = makeNs({ charisma: 600, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings], details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
     const state = makeState({ deep: { depth: 5, difficulty: 5, neighbours: [] } });
-    state.labs.completed = ["th3_l4byr1nth"];
     const options = { ...baseOptions, mode: "balanced" };
     assert.equal(chooseMode(ns, state, options, 600), "loot");
     state.servers.deep.migrationCharge = 0.5; state.servers.deep.migrationChargeAt = Date.now();
     assert.equal(chooseMode(ns, state, options, 600), "labyrinth");
     state.servers.deep.difficulty = 3;
     assert.equal(chooseMode(ns, state, options, 600), "loot", "a charge that cannot cross the gap does not count");
+});
+
+// ------------------------------------------------------------------ R1: which labyrinth is current
+
+// labyrinth.ts getCurrentLabName: the lab is chosen from *installed* augmentations, in this order, with a
+// BN15 branch (TRP gates the fifth lab there) and TRP only gating the seventh lab outside BN8
+// (BitNode.tsx:792 is the only DarknetLabyrinthRewardsTheRedPill: 0).
+test("labFromAugmentations mirrors labyrinth.ts getCurrentLabName, BN15 branch included", () => {
+    const A = LAB_AUGMENTATIONS;
+    assert.equal(labFromAugmentations([], 1), "th3_l4byr1nth");
+    assert.equal(labFromAugmentations([A.TheBrokenWings], 1), "cru3l_l4byr1nth");
+    assert.equal(labFromAugmentations([A.TheBrokenWings, A.TheBoots], 1), "m3rc1l3ss_l4byr1nth");
+    assert.equal(labFromAugmentations([A.TheBrokenWings, A.TheBoots, A.TheHammer], 1), "ub3r_l4byr1nth");
+    const four = [A.TheBrokenWings, A.TheBoots, A.TheHammer, A.TheStaff];
+    assert.equal(labFromAugmentations(four, 1), "et3rn4l_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheLaw], 1), "end13ss_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheLaw, A.TheSword], 1), "f1n4l_l4byr1nth", "TRP still to be won outside BN8");
+    assert.equal(labFromAugmentations([...four, A.TheLaw, A.TheSword], 8), "b0nus_l4byr1nth", "BN8 never offers TRP from the labyrinth");
+    assert.equal(labFromAugmentations([...four, A.TheLaw, A.TheSword, A.TheRedPill], 1), "b0nus_l4byr1nth");
+    // BN15: TRP gates the fifth lab, then Law, then Sword.
+    assert.equal(labFromAugmentations(four, 15), "et3rn4l_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheRedPill], 15), "end13ss_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheRedPill, A.TheLaw], 15), "f1n4l_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheRedPill, A.TheLaw, A.TheSword], 15), "b0nus_l4byr1nth");
+    assert.equal(labFromAugmentations([...four, A.TheLaw, A.TheSword], 15), "et3rn4l_l4byr1nth", "in BN15 the Law/Sword order only counts once TRP is installed");
+});
+
+test("labFromDifficulty is the first lab deeper than every difficulty seen so far", () => {
+    // NetworkMovement.ts:194: difficulty is uniform in [0, netDepth), so netDepth >= max + 1.
+    assert.equal(labFromDifficulty(0), "th3_l4byr1nth");
+    assert.equal(labFromDifficulty(6), "th3_l4byr1nth");
+    assert.equal(labFromDifficulty(7), "cru3l_l4byr1nth", "a difficulty-7 host cannot exist on a net of depth 7");
+    assert.equal(labFromDifficulty(11), "cru3l_l4byr1nth");
+    assert.equal(labFromDifficulty(12), "m3rc1l3ss_l4byr1nth");
+    assert.equal(labFromDifficulty(99), "b0nus_l4byr1nth");
+});
+
+test("currentLab follows the installed augmentations after a state wipe, not state.labs.completed", () => {
+    // Every install wipes the darknet and the controller's state; the second lab (depth 12) is wired to
+    // depth-11 hosts beyond the row-8 air gap, so nothing near it is ever observed.
+    const ns = makeNs({
+        charisma: 700, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings],
+        details: { cru3l_l4byr1nth: { isOnline: true, depth: -1 } },   // not wired in yet: depth -1 like NetworkGenerator creates it
+    });
+    const state = makeState({
+        shallow: { depth: 3, difficulty: 3, neighbours: ["mover"] },
+        mover: { depth: 5, difficulty: 6, neighbours: ["shallow"] },   // 6 + 4 = 10 > 8: can land past the first gap
+    });
+    assert.deepEqual(state.labs.completed, [], "fresh state knows nothing");
+    const lab = currentLab(ns, state);
+    assert.equal(lab.host, "cru3l_l4byr1nth");
+    assert.equal(lab.depth, 12, "LABS depth is used while the lab reports -1");
+    assert.deepEqual(recomputeCompleted(ns, state), ["th3_l4byr1nth"]);
+
+    const plan = planLabyrinth(ns, state, baseOptions, 700);
+    assert.deepEqual(Object.keys(plan.migrationTargets), ["mover"], "the row-8 gap below the inferred lab is planned");
+    assert.deepEqual(plan.migrationTargets.mover, ["shallow"]);
+    assert.equal(plan.charismaGoal, 0, "700 already clears the 600 gate");
+});
+
+test("currentLab falls back to the deepest observed difficulty when ownedAugs is unavailable", () => {
+    const ns = makeNs({ details: { cru3l_l4byr1nth: { isOnline: true, depth: -1 } } });   // no ownedAugs at all
+    const state = makeState({ a: { depth: 2, difficulty: 6 }, b: { depth: 4, difficulty: 7 } });
+    assert.equal(currentLab(ns, state).host, "cru3l_l4byr1nth", "a difficulty-7 host rules out the depth-7 lab");
+    state.servers.b.difficulty = 5;
+    assert.equal(currentLab(ns, state).host, "th3_l4byr1nth");
+});
+
+test("currentLab trusts a lab an agent has probed over the difficulty fallback", () => {
+    const ns = makeNs({});
+    const state = makeState({ near: { depth: 11, difficulty: 2, neighbours: ["cru3l_l4byr1nth"] } });
+    assert.equal(currentLab(ns, state).host, "cru3l_l4byr1nth");
 });
 
 // ------------------------------------------------------------------ R15: a host the game no longer knows

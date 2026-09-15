@@ -87,6 +87,51 @@ export const LABS = [
 
 export const AIR_GAP_ROWS = [8, 16, 24, 32];
 
+// The augmentation each labyrinth is gated on (src/Augmentation/Enums.ts). Keyed by the enum member name
+// labyrinth.ts getCurrentLabName uses, valued by the in-game name getResetInfo().ownedAugs is keyed by.
+export const LAB_AUGMENTATIONS = {
+    TheBrokenWings: "The W1ngs of Icarus",
+    TheBoots: "The B00ts of Perseus",
+    TheHammer: "The H4mmer of Daedalus",
+    TheStaff: "The St4ff of Asclepius",
+    TheRedPill: "The Red Pill",
+    TheLaw: "The L4w of Bayes",
+    TheSword: "The B1ade of Solomonoff",
+};
+
+/** The labyrinth the game considers current, from the *installed* augmentations. A line-for-line mirror of
+ * src/DarkNet/effects/labyrinth.ts getCurrentLabName: `hasAugment` there reads Player.augmentations (installed,
+ * not queued), which is exactly what getResetInfo().ownedAugs exposes. BN15 gates the fifth lab on The Red Pill;
+ * everywhere else TRP only gates the seventh, and never in BN8 (BitNode.tsx:792 is the only
+ * DarknetLabyrinthRewardsTheRedPill: 0). */
+export function labFromAugmentations(ownedNames, bitNode) {
+    const owned = new Set(ownedNames ?? []);
+    const has = (key) => owned.has(LAB_AUGMENTATIONS[key]);
+    if (!has("TheBrokenWings")) return "th3_l4byr1nth";
+    if (!has("TheBoots")) return "cru3l_l4byr1nth";
+    if (!has("TheHammer")) return "m3rc1l3ss_l4byr1nth";
+    if (!has("TheStaff")) return "ub3r_l4byr1nth";
+    if (Number(bitNode) === 15) {
+        if (!has("TheRedPill")) return "et3rn4l_l4byr1nth";
+        if (!has("TheLaw")) return "end13ss_l4byr1nth";
+        if (!has("TheSword")) return "f1n4l_l4byr1nth";
+        return "b0nus_l4byr1nth";
+    }
+    if (!has("TheLaw")) return "et3rn4l_l4byr1nth";
+    if (!has("TheSword")) return "end13ss_l4byr1nth";
+    const allowTRP = Number(bitNode) !== 8;
+    if (allowTRP && !has("TheRedPill")) return "f1n4l_l4byr1nth";
+    return "b0nus_l4byr1nth";
+}
+
+/** Lower bound on the current lab from what the network shows: every server's difficulty is drawn uniformly
+ * from [0, netDepth) (NetworkMovement.ts:194), so the net is at least `max + 1` deep and the current lab is the
+ * first one at that depth or deeper. Used only when getResetInfo() carries no ownedAugs. */
+export function labFromDifficulty(maxDifficulty) {
+    const bound = (Number(maxDifficulty) || 0) + 1;
+    return (LABS.find(row => row.depth >= bound) ?? LABS[LABS.length - 1]).host;
+}
+
 export function isLabHost(host) {
     return host.endsWith("_l4byr1nth");
 }

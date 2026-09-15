@@ -1,5 +1,5 @@
 import { log, getConfiguration, formatMoney, formatRam, formatNumberShort, parseShortNumber, getErrorInfo } from "./helpers.js";
-import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse, hostArg, canHoldStasis } from "./darknet/lib.js";
+import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse, hostArg, canHoldStasis, labFromAugmentations, labFromDifficulty } from "./darknet/lib.js";
 
 /* The darknet controller. Runs on home, owns `darknet/state.txt`, drains the report port,
  * plans loot / labyrinth work and pushes `darknet/passwords.txt` + `darknet/cmd.txt` to every
@@ -94,7 +94,7 @@ export async function main(ns) {
                     state = emptyState(resetTime);
                 }
             }
-            recomputeCompleted(state);
+            recomputeCompleted(ns, state);
 
             const charisma = ns.getPlayer().skills.charisma;
             const mode = chooseMode(ns, state, options, charisma);
@@ -614,40 +614,45 @@ function observedLab(state) {
     return null;
 }
 
-/** Recompute `state.labs.completed` from what the network shows. Cheap and pure, so the loop
- * runs it every pass rather than only at startup.
- *
- * The labs are gated on installed augmentations and unlock strictly in LABS order, so
- * `completed` is always a prefix of LABS. Primary signal: whichever lab an agent has probed
- * is the current one, so every earlier LABS entry is done. Fallback, before any agent has
- * reached a lab: a lab counts as completed when its password is known and no reward is still
- * queued -- a queued reward means the win happened during *this* reset and the augmentation
- * that unlocks the next lab has not been installed yet. */
-export function recomputeCompleted(state) {
-    const seen = observedLab(state);
-    if (seen) {
-        const index = LABS.findIndex(row => row.host === seen);
-        if (index >= 0) {
-            state.labs.completed = LABS.slice(0, index).map(row => row.host);
-            return state.labs.completed;
-        }
+/** The lab the game itself says is current (labyrinth.ts getCurrentLabName), or null on a build whose
+ * ResetInfo has no ownedAugs. getResetInfo is already in this script's static budget and is free to call.
+ * @param {NS} ns */
+function gameLab(ns) {
+    const info = ns.getResetInfo();
+    const owned = info?.ownedAugs;
+    if (!owned || typeof owned.keys !== "function") return null;
+    return labFromAugmentations([...owned.keys()], info.currentNode);
+}
+
+function maxObservedDifficulty(state) {
+    let deepest = 0;
+    for (const [name, entry] of Object.entries(state.servers ?? {})) {
+        if (isLabHost(name)) continue;
+        deepest = Math.max(deepest, Number(entry.difficulty) || 0);
     }
-    if (state.labs.rewardQueuedAt) return state.labs.completed;
-    const done = [];
-    for (const lab of LABS) {
-        if (!state.passwords[lab.host]) break;
-        done.push(lab.host);
-    }
-    state.labs.completed = done;
-    return done;
+    return deepest;
+}
+
+/** The current labyrinth's hostname. The game's augmentation list is authoritative; a lab an agent has probed
+ * says the same thing; failing both, the deepest difficulty seen bounds the net depth from below. None of
+ * these needs any host near the lab to exist, which after a reset none does (R1). */
+function inferredLabHost(ns, state) {
+    return gameLab(ns) ?? observedLab(state) ?? labFromDifficulty(maxObservedDifficulty(state));
+}
+
+/** Recompute `state.labs.completed` from the current lab: the labs unlock strictly in LABS order, so
+ * everything before the current one is done. Cheap and pure, so the loop runs it every pass.
+ * @param {NS} ns */
+export function recomputeCompleted(ns, state) {
+    const index = LABS.findIndex(row => row.host === inferredLabHost(ns, state));
+    state.labs.completed = index > 0 ? LABS.slice(0, index).map(row => row.host) : [];
+    return state.labs.completed;
 }
 
 /** The labyrinth the player is currently working on, or null when there is none (no SF15/BN15).
  * @param {NS} ns */
 export function currentLab(ns, state) {
-    const done = state.labs?.completed ?? [];
-    const seen = observedLab(state);
-    const lab = seen ? LABS.find(row => row.host === seen) : LABS[Math.min(done.length, LABS.length - 1)];
+    const lab = LABS.find(row => row.host === inferredLabHost(ns, state));
     if (!lab) return null;
     const details = ns.dnet.getServerDetails(lab.host);
     if (!details || !details.isOnline) return null;
