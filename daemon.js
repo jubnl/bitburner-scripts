@@ -204,6 +204,15 @@ export function prepTiming(now, weakenTime, growTime, delayInterval, needsWeaken
     return { weakenStart: now, growStart: now + weakenTime - growTime + delayInterval, weaken2Start: now + 2 * delayInterval };
 }
 
+// --- HC-4: share gate (pure) ---
+
+/** Whether ns.singularity.getCurrentWork() says the player is working for a faction (src/Work/Work.ts WorkType.FACTION = "FACTION",
+ * returned by src/Work/FactionWork.tsx APICopy). The share bonus multiplies only faction-work rep gain
+ * (src/PersonObjects/formulas/reputation.ts getHackingWorkRepGain / getFactionSecurityWorkRepGain / getFactionFieldWorkRepGain). */
+export function isFactionWork(workInfo) {
+    return workInfo?.type === "FACTION";
+}
+
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
@@ -295,6 +304,7 @@ export async function main(ns) {
     let lowUtilizationIterations = 0;
     let highUtilizationIterations = 0;
     let lastShareTime = 0; // Tracks when share was last invoked so we can respect the configured share-cooldown
+    let isDoingFactionWork = true; // HC-4: refreshed every 60 loops from getCurrentWork (share is useless otherwise). Assumed true without SF4.
     let allTargetsPrepped = false;
 
     /** Ram-dodge getting updated player info.
@@ -819,6 +829,7 @@ export async function main(ns) {
         }, () => new Error(`Failed to exec ${script} on ${hostname}. ` +
             `This is likely due to having insufficient RAM.\nArgs were: [${args}]`),
             undefined, undefined, undefined, verbose, verbose);
+        if (pid) getServerByName(hostname)?.refreshUsedRam(); // HC-6: helper scripts are not sized by us, re-read the host's used RAM
         return pid; // Caller is responsible for handling errors if final pid returned is 0 (indicating failure)
     }
 
@@ -829,6 +840,7 @@ export async function main(ns) {
         if (verbose) log(ns, `Rooting Server ${server.name}`);
         const pid = await exec(ns, getFilePath('/Tasks/crack-host.js'), daemonHost, { temporary: true }, server.name);
         await waitForProcessToComplete_Custom(ns, getHomeProcIsAlive(ns), pid);
+        homeServer?.refreshUsedRam(); // HC-6: crack-host.js has exited, its RAM is free again
         server.resetCaches(); // If rooted status was cached, we must now reset it
     }
 
@@ -899,6 +911,7 @@ export async function main(ns) {
                 let start = Date.now();
                 psCache = {}; // Clear the cache of the process list we update once per loop
                 launchFailuresLastLoop = launchFailuresThisLoop; launchFailuresThisLoop = 0;
+                for (const server of getAllServers()) server.refreshUsedRam(); // HC-6: one used-RAM snapshot per loop; kept current locally by noteRamUsed
                 await launchDueTasks(ns); // HC-1: exec batch/prep tasks that are due, before any of the slower bookkeeping below
                 await buildServerList(ns, true); // Check if any new servers have been purchased by the external host_manager process
                 await updateCachedServerData(ns); // Update server data that only needs to be refreshed once per loop
@@ -1158,9 +1171,10 @@ export async function main(ns) {
                     await farmHackXp(ns, freeRamToUse, verbose && (expectedRunTime > 10000 || lowUtilizationIterations % 10 == 0), 1);
                 }
 
-                // Use any unspent RAM on share if we are currently working for a faction
+                // Use any unspent RAM on share if we are currently working for a faction (HC-4: checked via getCurrentWork every 60 loops; when we are not,
+                // the RAM stays free for the idle-RAM hack-XP farm above, which share used to starve by pushing utilization to share-max-utilization)
                 const maxShareUtilization = options['share-max-utilization']
-                const shouldShare = failed.length <= 0 && utilizationPercent < maxShareUtilization && // Only share RAM if we have succeeded in all hack cycle scheduling and have RAM to space
+                const shouldShare = isDoingFactionWork && failed.length <= 0 && utilizationPercent < maxShareUtilization && // Only share RAM if we have succeeded in all hack cycle scheduling and have RAM to space
                     (Date.now() - lastShareTime) > options['share-cooldown'] && // Respect the share rate-limit if configured to leave gaps for scheduling
                     options['share'] !== false && options['no-share'] !== true &&
                     (options['share'] === true || network.totalMaxRam > 1024); // If not explicitly enabled or disabled, auto-enable share at 1TB of network RAM
@@ -1331,6 +1345,7 @@ export async function main(ns) {
         // Core counts can increase over time (ram-manager.js buys home cores, hacknet servers can be upgraded) and affect grow/weaken/share thread sizing
         dictServerCores = await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(server => [server, ns.getServer(server).cpuCores]))`,
             '/Temp/getServer-cpuCores-all.txt', allHostNames);
+        getAllServers().forEach(s => s.resetFileCache()); // HC-5: re-verify remote file lists once a minute instead of every loop
         // Get the information about the relative profitability of each server (affects targetting order)
         const pid = await exec(ns, getFilePath('analyze-hack.js'), null, null, '--all', '--silent');
         await waitForProcessToComplete_Custom(ns, getHomeProcIsAlive(ns), pid);
@@ -1354,6 +1369,8 @@ export async function main(ns) {
         hasFormulas = await doesFileExist(ns, "Formulas.exe")
         // Update our cache of income / expenses by category
         moneySources = await getNsDataThroughFile(ns, 'ns.getMoneySources()');
+        // HC-4: share only helps while working for a faction. Without SF4 we cannot ask, so keep sharing enabled (the player may be working manually).
+        isDoingFactionWork = (4 in dictSourceFiles) ? isFactionWork(await getCurrentWorkInfo(ns)) : true;
     }
 
     class Server {
@@ -1376,15 +1393,20 @@ export async function main(ns) {
             this._isXpFarming = null;
             this._percentStolenPerHackThread = null;
             this._hasRootCached = null; // Once we get root, we never lose it, so we can stop asking
-            this._files = (/**@returns{Set<string>}*/() => null)(); // Unfortunately, can't cache this forever because a "kill-all-scripts.js" or "cleanup.js" run will wipe them.
+            this._usedRam = null; // HC-6: per-loop snapshot of ns.getServerUsedRam (refreshUsedRam), kept current locally by noteRamUsed after each exec
+            // HC-5: kept across loops (one ram-dodged ns.ls per host was costing a temp-script round trip per used host per loop). A "kill-all-scripts.js"
+            // or "cleanup.js" run can wipe files, so it is dropped when an exec on the host fails (resetFileCache) and on the 60-loop refresh.
+            this._files = (/**@returns{Set<string>}*/() => null)();
         }
         resetCaches() {
-            // Reset any caches that can change over time
+            // Reset any caches that can change over time (not _files, see resetFileCache)
             this._isPrepped = this._isPrepping = this._isTargeting = this._isXpFarming =
-                this._percentStolenPerHackThread = this._files = null;
+                this._percentStolenPerHackThread = null;
             // Once true - Does not need to be reset, because once rooted, this fact will never change
             if (this._hasRootCached == false) this._hasRootCached = null;
         }
+        /** HC-5: forget which files this host has; the next hasFile() re-reads them (and arbitraryExecution re-copies missing tools) */
+        resetFileCache() { this._files = null; }
         getMinSecurity() { return dictServerMinSecurityLevels[this.name] ?? 0; } // Servers not in our dictionary were purchased, and so undefined is okay
         getMaxMoney() { return dictServerMaxMoney[this.name] ?? 0; }
         /** @returns {number} The number of CPU cores on this server. Boosts grow/weaken/share scripts that RUN here (see coreBonus) */
@@ -1533,7 +1555,13 @@ export async function main(ns) {
                 maxRam = Math.max(0, maxRam - homeReservedRam);
             return maxRam;
         }
-        usedRam() { return this.ns.getServerUsedRam(this.name); }
+        usedRam() { return this._usedRam ??= this.ns.getServerUsedRam(this.name); } // HC-6: snapshot (see refreshUsedRam / noteRamUsed)
+        /** HC-6: re-read this host's used RAM from the game (one 0.05 GB API call). Done once per loop for every host, and for a host right
+         * after a helper script was exec'd on it outside arbitraryExecution. */
+        refreshUsedRam() { this._usedRam = this.ns.getServerUsedRam(this.name); _freeRamSortDirty = true; }
+        /** HC-6: account for RAM a script we just started on this host will hold, without asking the game again
+         * @param {number} gb threads x script cost */
+        noteRamUsed(gb) { if (this._usedRam != null) this._usedRam += gb; _freeRamSortDirty = true; }
         ramAvailable(ignoreReservedRam = false) { return this.totalRam(ignoreReservedRam) - this.usedRam(); }
         growDelay() { return this.timeToWeaken() - this.timeToGrow() + cycleTimingDelay; }
         hackDelay() { return this.timeToWeaken() - this.timeToHack(); }
@@ -2004,8 +2032,11 @@ export async function main(ns) {
             const pid = await exec(ns, tool.name, targetServer.name, { threads: maxThreadsHere, temporary: (tool.runOptions.temporary ?? true) }, ...(args || []));
             if (pid == 0) {
                 log(ns, `ERROR: Failed to exec ${tool.name} on server ${targetServer.name} with ${maxThreadsHere} threads`, false, 'error');
+                targetServer.refreshUsedRam(); // HC-6: our snapshot was wrong for this host (a temp script may have fired), re-read it
+                targetServer.resetFileCache(); // HC-5: a missing script (files wiped) is one cause of exec returning 0 - re-check and re-copy next time
                 return false;
             }
+            targetServer.noteRamUsed(maxThreadsHere * tool.cost); // HC-6: keep the snapshot current without another API call
             // Decrement the threads that have been successfully scheduled (in 1-core units: threads run on a multi-core host count for more)
             if (maxThreadsHere >= wantHere)
                 remainingThreads = 0;
@@ -2504,7 +2535,8 @@ export async function main(ns) {
     let _serverListByFreeRam = (/**@returns{Server[]}*/() => undefined)();
     let _serverListByMaxRam = (/**@returns{Server[]}*/() => undefined)();
     let _serverListByTargetOrder = (/**@returns{Server[]}*/() => undefined)();
-    const resetServerSortCache = () => _serverListByFreeRam = _serverListByMaxRam = _serverListByTargetOrder = undefined;
+    let _freeRamSortDirty = true; // HC-6: set whenever any server's used RAM snapshot changes; getAllServersByFreeRam re-sorts only then
+    const resetServerSortCache = () => { _serverListByFreeRam = _serverListByMaxRam = _serverListByTargetOrder = undefined; _freeRamSortDirty = true; };
 
     /** @param {Server[]} toSort
      * @param {(a: Server, b: Server) => number} compareFn
@@ -2514,12 +2546,18 @@ export async function main(ns) {
         return toSort;
     }
 
-    /** @returns {Server[]} Sorted by most free (available) ram to least */
+    /** @returns {Server[]} Sorted by most free (available) ram to least. HC-6: the comparator reads the per-loop used-RAM snapshot (no API calls),
+     * and the list is only re-sorted when some snapshot changed since the last call (every exec changes one, so in practice once per task). */
     function getAllServersByFreeRam() {
-        return _sortServersAndReturn(_serverListByFreeRam ??= getAllServers().slice(), function (a, b) {
-            const ramDiff = b.ramAvailable() - a.ramAvailable();
-            return ramDiff != 0.0 ? ramDiff : sortServerTieBreaker(a, b);
-        });
+        if (_serverListByFreeRam === undefined) { _serverListByFreeRam = getAllServers().slice(); _freeRamSortDirty = true; }
+        if (_freeRamSortDirty) {
+            _sortServersAndReturn(_serverListByFreeRam, function (a, b) {
+                const ramDiff = b.ramAvailable() - a.ramAvailable();
+                return ramDiff != 0.0 ? ramDiff : sortServerTieBreaker(a, b);
+            });
+            _freeRamSortDirty = false;
+        }
+        return _serverListByFreeRam;
     }
 
     /** @returns {Server[]} Sorted by most max ram to least */
