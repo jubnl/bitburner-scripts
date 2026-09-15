@@ -1,7 +1,11 @@
 // HC-1: pure helpers of the just-in-time batch launcher in daemon.js.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { partitionDueTasks, nextRoundStart, canPlanNextRound, withStockManipulationFlag } from "../daemon.js";
+import { partitionDueTasks, nextRoundStart, canPlanNextRound, withStockManipulationFlag, chainingRegressed, dropBatchAfterFailure } from "../daemon.js";
+
+/** A queued task as performScheduling builds it (only the fields the pure helpers read) */
+const task = (target, batchNumber, description, start) => ({ target: { name: target }, start, description: `Batch ${batchNumber}-${description}` });
+const ids = queue => queue.map(t => `${t.target.name} ${t.description}`);
 
 test("partitionDueTasks returns due tasks sorted by start and keeps the rest", () => {
     const queue = [{ start: 5000, id: "c" }, { start: 1500, id: "a" }, { start: 2200, id: "b" }, { start: 900, id: "z" }];
@@ -30,7 +34,9 @@ test("withStockManipulationFlag rewrites the flag of hack/grow tasks only, witho
     const hackArgs = ["joesguns", 1000, 500, "Batch 0-hack", 1, 0, 0];
     assert.deepEqual(withStockManipulationFlag("hack", hackArgs, false), ["joesguns", 1000, 500, "Batch 0-hack", 0, 0, 0]);
     assert.equal(hackArgs[4], 1, "input is not mutated");
-    assert.equal(withStockManipulationFlag("grow", hackArgs, true)[4], 1);
+    const growArgs = ["joesguns", 1000, 500, "Batch 0-grow", 0, 0, 0];
+    assert.equal(growArgs[4], 0, "sanity: the flag starts off, so the assertion below cannot pass on an untouched array");
+    assert.equal(withStockManipulationFlag("grow", growArgs, true)[4], 1);
     assert.equal(withStockManipulationFlag("manualhack", hackArgs, false)[4], 0, "the -i manual hack tool carries the same flag");
 });
 
@@ -50,4 +56,44 @@ test("canPlanNextRound is true once the last batch's first task is due to launch
     assert.equal(canPlanNextRound(round, 19500, 1000), true);
     assert.equal(canPlanNextRound(round, 25000, 1000), true);
     assert.equal(canPlanNextRound(undefined, 25000, 1000), false);
+});
+
+test("chainingRegressed tolerates the dip between a hack and its grow, but not a real regression", () => {
+    // One batch of this round hardens security by 50 hack threads * 0.002 + 120 grow threads * 0.004 = 0.58
+    const hackHardening = 50 * 0.002, growHardening = 120 * 0.004;
+    // Security threshold: minSecurity (10) + 2 * 0.58 + 1 = 12.16. Money threshold: 0.5 * 1e9 * (1 - 0.25) = 3.75e8
+    const regressed = (security, money) => chainingRegressed(security, 10, money, 1e9, hackHardening, growHardening, 0.25);
+    assert.equal(regressed(10, 1e9), false, "a fully prepped target is not regressed");
+    assert.equal(regressed(12.16, 7.5e8), false, "two batches' worth of hardening + 1, and money down by one theft, is tolerated");
+    assert.equal(regressed(12.17, 7.5e8), true, "more security than that is a regression");
+    assert.equal(regressed(10, 3.75e8), false, "money at half of what a theft leaves is still tolerated");
+    assert.equal(regressed(10, 3.74e8), true, "less money than that is a regression");
+});
+
+test("dropBatchAfterFailure drops the failed task's own later tasks and nothing else", () => {
+    // Within a batch the launch order is weak1, weak2, grow, hack (see getScheduleTiming). The failed task is already off the queue.
+    const queue = [
+        task("joesguns", 7, "weak1", 2000), task("joesguns", 7, "weak2", 3000), task("joesguns", 7, "hack", 5000),
+        task("joesguns", 8, "grow", 4200), task("joesguns", 8, "hack", 5200),
+        task("phantasy", 7, "hack", 5500),
+    ];
+    const [remaining, dropped] = dropBatchAfterFailure(queue, task("joesguns", 7, "grow", 4000));
+    assert.equal(dropped, 1, "only batch 7's hack, which would otherwise steal money nothing grows back");
+    assert.deepEqual(ids(remaining), ["joesguns Batch 7-weak1", "joesguns Batch 7-weak2",
+        "joesguns Batch 8-grow", "joesguns Batch 8-hack", "phantasy Batch 7-hack"]);
+    assert.equal(queue.length, 6, "input is not mutated");
+});
+
+test("dropBatchAfterFailure drops nothing when the failed task is the last of its batch", () => {
+    const queue = [task("joesguns", 7, "weak1", 2000), task("joesguns", 8, "grow", 4200), task("joesguns", 8, "hack", 5200)];
+    const [remaining, dropped] = dropBatchAfterFailure(queue, task("joesguns", 7, "hack", 5000));
+    assert.equal(dropped, 0, "a dropped hack strands nothing: the weakens before it are harmless on their own");
+    assert.deepEqual(ids(remaining), ids(queue));
+});
+
+test("dropBatchAfterFailure drops both the grow and the hack when a second weaken fails", () => {
+    const queue = [task("joesguns", 7, "grow", 4000), task("joesguns", 7, "hack", 5000), task("joesguns", 8, "weak2", 5000)];
+    const [remaining, dropped] = dropBatchAfterFailure(queue, task("joesguns", 7, "weak2", 3000));
+    assert.equal(dropped, 2, "a grow with no weaken to follow it would permanently harden the target");
+    assert.deepEqual(ids(remaining), ["joesguns Batch 8-weak2"]);
 });

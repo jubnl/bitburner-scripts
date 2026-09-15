@@ -96,7 +96,10 @@ export function autocomplete(data, args) {
 
 // --- HC-1: just-in-time batch launcher helpers (pure; exported for unit tests, they reference no ns function so they cost no RAM) ---
 
-/** Splits the launch queue into the tasks that must be exec'd now (start within `leadMs` of `now`, sorted by start) and the rest.
+/** Splits the launch queue into the tasks that must be exec'd now (start within `leadMs` of `now`) and the rest.
+ * Note the `due` sort is by start time across *all* batches and targets, which is launch order, not batch order: a due window
+ * typically holds one task each from four different batches. It implies nothing about which task type is dropped when RAM runs
+ * out - that is dropBatchAfterFailure's job.
  * @param {{start: number}[]} queue
  * @returns {[due: {start: number}[], pending: {start: number}[]]} */
 export function partitionDueTasks(queue, now, leadMs) {
@@ -117,6 +120,36 @@ export function nextRoundStart(now, queueDelay, prevLastBatchStart, cycleTimingD
  * @param {{lastBatchStart: number, readyAt: number, nextBatchNumber: number}|undefined} roundInfo */
 export function canPlanNextRound(roundInfo, now, leadMs) {
     return roundInfo != null && now >= roundInfo.readyAt - leadMs;
+}
+
+/** Whether a target we are chaining rounds against has drifted too far from "prepped" to keep planning rounds for it.
+ * A targeted server is never exactly prepped - every hack lands before its grow, and every grow before its weaken - so we tolerate
+ * two batches' worth of un-weakened hardening (plus 1, for jitter and for the +1 dollar grow injects) and half of what one theft
+ * leaves behind. Beyond that the thread counts a new round would be sized with are fiction, and the target must be re-prepped.
+ * @param {number} hackHardening Security added by one batch's hack threads (0.002 each)
+ * @param {number} growHardening Security added by one batch's grow threads (0.004 each)
+ * @param {number} percentToSteal The fraction of max money one batch's hack is sized to steal */
+export function chainingRegressed(security, minSecurity, money, maxMoney, hackHardening, growHardening, percentToSteal) {
+    return security > minSecurity + 2 * (hackHardening + growHardening) + 1
+        || money < 0.5 * maxMoney * (1 - percentToSteal);
+}
+
+/** The batch a queued task belongs to, e.g. "Batch 12-grow-from-zero" -> "Batch 12" (prep tasks have no batch and group under "prep") */
+function batchOf(description) {
+    const separator = description.indexOf('-');
+    return separator < 0 ? description : description.substring(0, separator);
+}
+
+/** HC-1: a batch is all-or-nothing from its first failed task onward. If one task cannot be exec'd, every *later-starting* task of the
+ * same batch against the same target must go too, or the batch lands a grow with no weaken to undo its hardening, or a hack with no
+ * grow to restore the money. Tasks of the batch that already launched are weakens (they start first) and are harmless on their own.
+ * @param {{target: {name: string}, start: number, description: string}[]} queue Tasks not yet launched (the failed task is already out)
+ * @param {{target: {name: string}, start: number, description: string}} failedTask
+ * @returns {[remaining: object[], dropped: number]} */
+export function dropBatchAfterFailure(queue, failedTask) {
+    const batch = batchOf(failedTask.description), targetName = failedTask.target?.name;
+    const remaining = queue.filter(t => !(t.target?.name === targetName && batchOf(t.description) === batch && t.start >= failedTask.start));
+    return [remaining, queue.length - remaining.length];
 }
 
 // The tools whose remote scripts take a "manipulate the stock market" argument, and where that argument sits in their args
@@ -770,31 +803,40 @@ export async function main(ns) {
         return batchQueue.filter(t => t.target.name == serverName && t.description.startsWith(descriptionPrefix)).length;
     }
 
-    /** HC-1: exec every queued task whose planned start is within loopInterval. A task that cannot be started (no RAM) is dropped and counted;
-     * because tasks are launched in start order (W1, W2, grow, then hack last), RAM pressure drops hacks first, which leaves the target prepped.
+    /** HC-1: exec every queued task whose planned start is within loopInterval. A task that cannot be started (no RAM) is dropped, and with it
+     * the rest of its batch (see dropBatchAfterFailure) - a half-launched batch would harden the target or steal money nothing grows back.
      * @param {NS} ns
-     * @returns {Promise<number>} launch failures in this call */
+     * @returns {Promise<number>} tasks that failed to launch or were dropped with their batch, in this call */
     async function launchDueTasks(ns) {
         if (batchQueue.length == 0) return 0;
-        const [due, pending] = partitionDueTasks(batchQueue, Date.now(), loopInterval);
+        let [due, pending] = partitionDueTasks(batchQueue, Date.now(), loopInterval);
         batchQueue = pending;
-        let failures = 0;
-        for (const task of due) {
+        let attempted = 0, failures = 0, dropped = 0;
+        while (due.length > 0) {
+            const task = due.shift();
+            attempted++;
             // HC-1: our stock position may have reversed since this task was planned. Running scripts can only be killed for that
             // (see terminateScriptsManipulatingStock); a task that has not launched yet we simply re-flag from the current position.
             const args = withStockManipulationFlag(task.toolShortName, task.args, shouldManipulateStock(task.toolShortName, task.target.name));
             const ok = await arbitraryExecution(ns, getTool(task.toolShortName), task.threads, args, undefined, undefined, task.allowSplit, task.threadsByCores);
             if (ok == false) {
                 failures++;
+                // Abandon the rest of this batch, both the tasks already due in this window and those still queued for later
+                const remainingDue = dropBatchAfterFailure(due, task), remainingQueued = dropBatchAfterFailure(batchQueue, task);
+                due = remainingDue[0], batchQueue = remainingQueued[0];
+                const droppedNow = remainingDue[1] + remainingQueued[1];
+                dropped += droppedNow;
                 if (verbose || failures == 1)
                     log(ns, `WARNING: Could not launch ${task.threads}x ${task.toolShortName} "${task.description}" against ${task.target.name} ` +
-                        `(due to start in ${Math.round(task.start - Date.now())} ms): insufficient RAM. Dropping it.`, false, 'warning');
+                        `(due to start in ${Math.round(task.start - Date.now())} ms): insufficient RAM. ` +
+                        `Dropping it and the ${droppedNow} later task(s) of that batch.`, false, 'warning');
             }
         }
-        launchFailuresThisLoop += failures;
-        if (verbose && due.length > 0)
-            log(ns, `INFO: Launched ${due.length - failures} of ${due.length} due tasks (${batchQueue.length} still queued, ${failures} failed)`);
-        return failures;
+        launchFailuresThisLoop += failures + dropped;
+        if (verbose && attempted > 0)
+            log(ns, `INFO: Launched ${attempted - failures} of ${attempted} due tasks ` +
+                `(${batchQueue.length} still queued, ${failures} failed, ${dropped} dropped with their batch)`);
+        return failures + dropped;
     }
 
     // Main targeting loop
@@ -916,10 +958,24 @@ export async function main(ns) {
                             cantHackButPrepping.push(server);
                     } else if (await server.isTargeting()) { // Note servers already being targeted from a prior loop
                         targeting.push(server);
+                        const round = roundState[server.name];
+                        // HC-1: chaining would otherwise keep a target "targeting" forever, so this is now the only checkpoint that notices a
+                        // de-prepped target (batch thread counts only undo their own hardening and assume max money before the theft). Stop
+                        // chaining when it drifts too far; once the in-flight round drains, isTargeting() goes false and the pre-existing
+                        // prepServer path below re-preps it exactly as it did before chaining existed.
+                        if (!xpOnly && !hackOnly && round && chainingRegressed(server.getSecurity(), server.getMinSecurity(), server.getMoney(),
+                            server.getMaxMoney(), round.hackHardening, round.growHardening, round.percentToSteal)) {
+                            log(ns, `WARNING ${server.prepRegressions++}: Server was prepped, but now at security: ${formatNumber(server.getSecurity())} ` +
+                                `(min ${formatNumber(server.getMinSecurity())}) money: ${formatMoney(server.getMoney(), 3)} (max ${formatMoney(server.getMaxMoney(), 3)}). ` +
+                                `Prior cycle: ${server.previousCycle}. ETA now (Hack ${playerHackSkill()}) is ${formatDuration(server.timeToWeaken())}. ` +
+                                `No further rounds will be chained until it has been re-prepped.`, true, 'warning');
+                            server.previouslyPrepped = true; // So that the prepServer path logs this regression too, as it would have pre-chaining
+                            delete roundState[server.name];
+                        }
                         // HC-1: chain rounds. Once the last batch of the current round has begun launching, plan the next round so that its first
                         // hack lands one cycle-timing-delay after this round's last hack (previously a target idled a full weaken-time between rounds).
                         // A targeted server is momentarily un-prepped between each hack landing and its W2, so do not route this through prepServer.
-                        if (!xpOnly && canPlanNextRound(roundState[server.name], Date.now(), loopInterval) && !isContinuationCapped()) {
+                        else if (!xpOnly && canPlanNextRound(round, Date.now(), loopInterval) && !isContinuationCapped()) {
                             const performanceSnapshot = optimizePerformanceMetrics(ns, server);
                             if (server.actualPercentageToSteal() === 0)
                                 log(ns, `INFO: Not enough free RAM to plan the next round for ${server.name} yet (RAM Utilization: ${(getTotalNetworkUtilization() * 100).toFixed(2)}%). Will retry next loop.`);
@@ -1631,10 +1687,15 @@ export async function main(ns) {
             }
         }
         const lastSched = scheduledTasks[scheduledTasks.length - 1];
+        // The security one batch of this round adds before its weakens undo it, used to spot a de-prepped target while chaining (chainingRegressed)
+        const threadsOf = (...tools) => lastSched.scheduleItems.filter(i => tools.includes(i.toolShortName)).reduce((total, i) => total + i.threadsNeeded, 0);
         roundState[currentTarget.name] = {
             lastBatchStart: lastSched.batchStart.getTime(),
             readyAt: Math.min(...lastSched.scheduleItems.map(i => i.start.getTime())), // When the last batch begins launching, the next round may be planned
             nextBatchNumber: batchNumberBase + scheduledTasks.length,
+            hackHardening: threadsOf("hack", "manualhack") * hackThreadHardening,
+            growHardening: threadsOf("grow") * growthThreadHardening,
+            percentToSteal: currentTarget.actualPercentageToSteal(),
         };
         if (verbose)
             log(ns, `Queued ${cyclesScheduled} x ${getTargetSummary(currentTarget)} starting ${formatDateTime(new Date(firstBatchStart))} ` +
