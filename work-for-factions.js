@@ -672,11 +672,11 @@ export async function crimeForKillsKarmaStats(ns, reqKills, reqKarma, reqStats, 
             if (await isValidInterruption(ns, currentWork)) return;
             if (lastCrime) {
                 log(ns, `Committing Crime "${lastCrime}" Interrupted. (Now: ${crimeType ?? currentWork.type}) Restarting...`, false, 'warning');
-                if (!options['no-tail-windows']) tail(ns); // Force a tail window open to help the user kill this script if they accidentally closed the tail window and don't want to keep doing crime
+                if (!options?.['no-tail-windows']) tail(ns); // Force a tail window open to help the user kill this script if they accidentally closed the tail window and don't want to keep doing crime
             }
             let focusArg = shouldFocus === undefined ? true : shouldFocus; // Only undefined if running as imported function
             crimeTime = await getNsDataThroughFile(ns, 'ns.singularity.commitCrime(ns.args[0], ns.args[1])', null, [crime, focusArg])
-            if (shouldFocus && !options['no-tail-windows']) tail(ns); // Force a tail window open when auto-criming with focus so that the user can more easily kill this script
+            if (shouldFocus && !options?.['no-tail-windows']) tail(ns); // Force a tail window open when auto-criming with focus so that the user can more easily kill this script
         }
         // Periodic status update with progress
         if (lastCrime != crime || (Date.now() - lastStatusUpdateTime) > statusUpdateInterval) {
@@ -879,7 +879,8 @@ async function isValidInterruption(ns, currentWork = null) {
         wasGrafting = true;
     }
     // If bladeburner is currently active, but we do not yet have The Blade's Simulacrum, we may choose to we pause working.
-    else if (7 in dictSourceFiles && !hasSimulacrum && !options['no-bladeburner-check']) {
+    // (dictSourceFiles/options are only set by main(); when crimeForKillsKarmaStats is imported by crime.js they are undefined, so skip this check)
+    else if (dictSourceFiles && options && 7 in dictSourceFiles && !hasSimulacrum && !options['no-bladeburner-check']) {
         // Heuristic: If we're in a gang, its rep will give us access to most augs, we can take a break from working in favour of bladeburner progress
         //       Also, if we're done all "priority" work (scope >= 2), consider letting Bladeburner take over
         // TODO: Are there other situations we want to prioritize bladeburner over normal work? Perhaps if we're in a Bladeburner BN? (6 or 7)
