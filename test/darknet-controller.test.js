@@ -570,3 +570,58 @@ test("chooseMode flips to labyrinth when the frontier sits just above an air gap
     const gapNotBlocked = makeState({ deep: { depth: 14, difficulty: 12 } });
     assert.equal(chooseMode(ns2, gapNotBlocked, options, 2500), "loot", "frontier 14 is not row-1 of any gap");
 });
+
+// ------------------------------------------------------------------ R3: never migrate a pinned host
+
+// R3: a linked server is immutable (NetworkMovement.ts isImmutable = openServer || isConnectedTo || hasStasisLink)
+// and a full migration charge on it is thrown away (effects.ts:257-260). Before the first crossing the deepest
+// hosts and the highest-difficulty hosts are the same handful, so the old plan pinned its own migration target.
+test("planLabyrinth never pins the host it is migrating, and never migrates a pinned host", () => {
+    const ns = makeNs({
+        charisma: 700, stasisLimit: 2, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings],
+        details: { cru3l_l4byr1nth: { isOnline: true, depth: -1 } },
+    });
+    const state = makeState({
+        best: { depth: 7, difficulty: 7, maxRam: 64, neighbours: ["charger"] },     // deepest AND the strongest candidate
+        deep: { depth: 7, difficulty: 5, maxRam: 64, neighbours: ["charger"] },
+        charger: { depth: 6, difficulty: 4, maxRam: 64, neighbours: ["best", "deep"] },
+    });
+    const plan = planLabyrinth(ns, state, baseOptions, 700);
+    assert.deepEqual(Object.keys(plan.migrationTargets), ["best", "deep"]);
+    for (const target of Object.keys(plan.migrationTargets)) {
+        assert.ok(!plan.stasisTargets.includes(target), `${target} is being migrated and must not be pinned`);
+    }
+    assert.deepEqual(plan.stasisTargets, ["charger"], "the slots go to hosts that are not crossing");
+});
+
+test("planLabyrinth skips hosts the game already holds in stasis when another candidate exists", () => {
+    const ns = makeNs({
+        charisma: 700, stasisLimit: 2, stasisLinked: ["best"], ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings],
+        details: { cru3l_l4byr1nth: { isOnline: true, depth: -1 } },
+    });
+    const state = makeState({
+        best: { depth: 7, difficulty: 7, maxRam: 64, neighbours: ["charger"] },
+        deep: { depth: 7, difficulty: 5, maxRam: 64, neighbours: ["charger"] },
+        selfReported: { depth: 6, difficulty: 6, maxRam: 64, neighbours: ["charger"] },
+        charger: { depth: 6, difficulty: 4, maxRam: 64, neighbours: ["best", "deep", "selfReported"] },
+    });
+    state.servers.selfReported.stasis = true;   // stasis.js reported success, the game list is stale
+    const plan = planLabyrinth(ns, state, baseOptions, 700);
+    assert.deepEqual(Object.keys(plan.migrationTargets), ["deep"], "best (linked) and selfReported (stasis:true) cannot move");
+    assert.ok(plan.stasisTargets.includes("best"), "an existing link on a non-target is kept");
+});
+
+test("planLabyrinth releases a pinned host when every crossing candidate is pinned", () => {
+    const ns = makeNs({
+        charisma: 700, stasisLimit: 1, stasisLinked: ["only"], ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings],
+        details: { cru3l_l4byr1nth: { isOnline: true, depth: -1 } },
+    });
+    const state = makeState({
+        only: { depth: 7, difficulty: 6, maxRam: 64, neighbours: ["charger"] },
+        charger: { depth: 6, difficulty: 2, maxRam: 64, neighbours: ["only"] },   // 2 + 4 = 6 < 8: cannot cross
+    });
+    const plan = planLabyrinth(ns, state, baseOptions, 700);
+    assert.deepEqual(Object.keys(plan.migrationTargets), ["only"]);
+    assert.ok(!plan.stasisTargets.includes("only"));
+    assert.deepEqual(plan.stasisRelease, ["only"], "stasis:false goes out so the host becomes movable");
+});

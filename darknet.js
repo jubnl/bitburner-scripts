@@ -688,30 +688,40 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     // starts because its command file said so, so pinning a host we cannot reach does nothing
     // except waste a slot in `assignStasis`'s budget.
     const reachable = commandable(state);
-    // darkweb and any isStationary host are never valid stasis targets (see planLoot); lab hosts
-    // are already excluded from `online` above.
-    const adjacent = online
-        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry)
-            && reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
-        .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
-        .map(([name]) => name);
-    const deepest = online
-        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry) && reachable.includes(name))
-        .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
-        .map(([name]) => name);
-    plan.stasisTargets = assignStasis(ns, plan, adjacent.length ? adjacent : deepest);
-
+    // Air-gap crossings are planned BEFORE stasis: a linked server is immutable (NetworkMovement.ts
+    // isImmutable = openServer || isConnectedTo || hasStasisLink) and induceServerMigration discards a full
+    // charge on it, so a migration target must not hold a link and must not be given one until it has landed
+    // beyond the gap -- after landing it is the deepest host and the rule below pins it, which is right (R3).
+    const linked = new Set(ns.dnet.getStasisLinkedServers());
+    for (const [name, entry] of online) if (entry.stasis === true) linked.add(name);
     for (const row of AIR_GAP_ROWS) {
         if (row >= lab.depth) continue;
         if (online.some(([, entry]) => (Number(entry.depth) || 0) > row)) continue;   // gap already crossed
         // Strongest candidate first: buildCmd gives a charger to the first target that lists it.
         const candidates = online.filter(([, entry]) => canCrossAirGap(entry, row))
             .sort((a, b) => (Number(b[1].difficulty) || 0) - (Number(a[1].difficulty) || 0));
-        for (const [name, entry] of candidates) {
+        // Prefer hosts that can move now. When every candidate is pinned, take them anyway: excluding them
+        // from the stasis candidates below makes assignStasis release the link, and next loop they can move.
+        const movable = candidates.filter(([name]) => !linked.has(name));
+        for (const [name, entry] of (movable.length ? movable : candidates)) {
             const chargers = (entry.neighbours ?? []).filter(charger => reachable.includes(charger));
             if (chargers.length) plan.migrationTargets[name] = chargers;
         }
     }
+    const crossing = (name) => name in plan.migrationTargets;
+    // darkweb and any isStationary host are never valid stasis targets (see planLoot); lab hosts
+    // are already excluded from `online` above.
+    const adjacent = online
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry)
+            && reachable.includes(name) && !crossing(name) && (entry.neighbours ?? []).includes(lab.host))
+        .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
+        .map(([name]) => name);
+    const deepest = online
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry)
+            && reachable.includes(name) && !crossing(name))
+        .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
+        .map(([name]) => name);
+    plan.stasisTargets = assignStasis(ns, plan, adjacent.length ? adjacent : deepest);
     // Crack priority (depth desc, then difficulty desc) is deliberately not expressed: the agent
     // ignores priority and RAM is not yet scarce enough for the controller to withhold claims. YAGNI.
 
