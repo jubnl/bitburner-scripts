@@ -306,7 +306,7 @@ async function mainLoop(ns) {
     else if (chaosByCity[currentCity] > options['chaos-recovery-threshold'] && citiesWithinChaos.length == 0 &&
         shouldRunDiplomacy(chaosByCity[currentCity], options['chaos-recovery-threshold'], (await refreshPlayer(ns)).skills.charisma, options['chaos-diplomacy-horizon-minutes'])) {
         bestActionName = "Diplomacy";
-        reason = `Chaos ${chaosByCity[currentCity].toFixed(2)} > ${options['chaos-recovery-threshold']} in every city (x${chaosDifficultyMult(chaosByCity[currentCity], options['chaos-recovery-threshold']).toFixed(2)} difficulty); ` +
+        reason = `Chaos ${chaosByCity[currentCity].toFixed(2)} > ${options['chaos-recovery-threshold']} in every city (x${chaosDifficultyMult(chaosByCity[currentCity]).toFixed(2)} difficulty); ` +
             `Diplomacy at charisma ${player.skills.charisma} needs ~${formatDuration(60000 * diplomacyMinutesTo(chaosByCity[currentCity], options['chaos-recovery-threshold'], player.skills.charisma))}`;
     } // If current city chaos is very high, we should be very wary of the snowballing effects, and try to reduce it.
     else if (chaosByCity[currentCity] > options['max-chaos']) {

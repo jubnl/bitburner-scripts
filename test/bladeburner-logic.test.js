@@ -71,6 +71,13 @@ test("BB-3: Diplomacy beats working under the penalty over an hour's stay, never
     assert.equal(shouldRunDiplomacy(60, 50, 500, 5), false);  // 9.9 min > 5 * 0.70
 });
 
+// Fix round 1: the difficulty penalty the pay-off protects against is the game's fixed cliff (Action.ts getChaosSuccessFactor always uses 50),
+// never --chaos-recovery-threshold. At chaos 51 the real penalty is only x1.41 (lostFraction ~0.29); if the pay-off wrongly used
+// chaosDifficultyMult(chaos, 5) for a low --chaos-recovery-threshold of 5, it would compute x6.86 (lostFraction ~0.85) and wrongly say "yes".
+test("BB-3: the pay-off's difficulty penalty always uses the game's fixed 50 cliff, not --chaos-recovery-threshold", () => {
+    assert.equal(shouldRunDiplomacy(51, 5, 5000, 60), false);
+});
+
 // BB-4: Skill.ts calculateCost is linear in level (baseCost + costInc * level, x BitNode mult), so the per-level increment is
 // costForTwo - 2 * costForOne. Cloak at level 10: cost for one 13, for two 27 (increment ~1.1, rounded).
 test("BB-4: bulk count stops at the perceived-cost crossover, at affordability, and at max level", () => {
@@ -81,4 +88,10 @@ test("BB-4: bulk count stops at the perceived-cost crossover, at affordability, 
     assert.equal(planSkillUpgradeCount(13, 27, 1, Infinity, 100), 6);   // no competing skill: 13+14+15+16+17+18 = 93
     assert.equal(planSkillUpgradeCount(13, 26, 1, 13, 39), 3);          // flat cost (rounding hid the increment): 3 x 13
     assert.equal(planSkillUpgradeCount(0, 0, 1, 10, 10), 0);            // unusable cost (null/Infinity from the API become 0/Infinity)
+});
+
+// Fix round 1: maxCount <= 0 (already at max level) must buy nothing; `count` was initialised to 1 before the `while (count < maxCount)` guard,
+// so a maxCount of 0 (or negative) fell through to a return of 1.
+test("BB-4: a non-positive maxCount buys nothing", () => {
+    assert.equal(planSkillUpgradeCount(13, 27, 1, 100, 1000, 0), 0);
 });
