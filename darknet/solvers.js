@@ -298,7 +298,7 @@ function uniquePermutations(str) {
 // (f = r.feedback, so this reads f.data). Returns Infinity if absent (e.g. the probe's
 // length didn't match, or the model's password is under 5 chars).
 function rmsd(f) {
-    const m = /RMS Deviation:(\d+\.\d+)/.exec(f.data ?? "");
+    const m = (f.data ?? "").match(/RMS Deviation:(\d+\.\d+)/);
     return m ? Number(m[1]) : Infinity;
 }
 
@@ -457,7 +457,7 @@ export const SOLVERS = {
                 const guess = (prefix + c).padEnd(L, cs[0]);
                 const r = await tryPw(guess);
                 if (r.success) return guess;
-                const m = /\((\d+)\)/.exec(r.feedback.message);
+                const m = r.feedback.message.match(/\((\d+)\)/);
                 const idx = m ? Number(m[1]) : -1;
                 if (idx > prefix.length) {
                     prefix += c;
@@ -582,7 +582,7 @@ export const SOLVERS = {
     // squaredError = S + 81 - 18*actual_i where S = sum of the known digits squared, so
     // actual_i is recovered exactly from the reported RMS deviation.
     "PHP 5.4": async (d, tryPw) => {
-        const m = /(\d+)\s*$/.exec(d.passwordHint) || /(\d+)/.exec(d.data || "");
+        const m = d.passwordHint.match(/(\d+)\s*$/) || (d.data || "").match(/(\d+)/);
         if (!m) return null;
         const sorted = m[1], L = sorted.length;
         if (L < 5) {
@@ -648,7 +648,7 @@ export const SOLVERS = {
     OpenWebAccessPoint: async (d, tryPw) => {
         const first = await tryPw("0");
         if (first.success) return "0";
-        const m = new RegExp(`\\s${escapeRe(d.hostname)}:(\\S+)\\s`).exec(first.feedback.data);
+        const m = first.feedback.data.match(new RegExp(`\\s${escapeRe(d.hostname)}:(\\S+)\\s`));
         if (m) return (await tryPw(m[1])).success ? m[1] : null;
         let common = null;
         for (let i = 0; i < 7; i++) {

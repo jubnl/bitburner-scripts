@@ -35,13 +35,13 @@ export const AGENT_FILES = [
 ];
 
 export const WORKER_RAM = {
-    crack: 2.6,
-    realloc: 2.6,
-    phish: 3.6,
-    migrate: 5.6,
-    promote: 3.6,
-    cache: 3.8,
-    stasis: 13.6,
+    crack: 2.95,
+    realloc: 2.65,
+    phish: 3.65,
+    migrate: 5.65,
+    promote: 3.65,
+    cache: 3.85,
+    stasis: 13.65,
     // Every entry includes the 1.6 GB script base cost (e.g. share.js = 1.6 + ns.share 2.4).
     // lab.js = 1.6 base + dnet.authenticate 0.4 + scp 0.6 + exec 1.3 + getHostname 0.05.
     lab: 3.95,
