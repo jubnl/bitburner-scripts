@@ -101,6 +101,9 @@ export async function main(ns) {
     let alreadyJoinedDaedalus = false, autoJoinDaedalusUnavailable = false, reservingMoneyForDaedalus = false, disableStockmasterForDaedalus = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
     let prioritizeHackForDaedalus = false, prioritizeHackForWd = false;
     let lastScriptsCheck = 0; // Last time we got a listing of all running scripts
+    let lastCachedDataUpdate = 0; // Last time updateCachedData refreshed the installed-augs list (on the --interval-check-scripts cadence)
+    let lastBladeburnerCheck = 0, bladeburnerComplete = false; // Bladeburner win-condition polling (on the --interval-check-scripts cadence)
+    let lastCasinoCheck = 0; // Last time maybeDoCasino evaluated whether to run casino.js (on the --interval-check-scripts cadence)
     let homeRam = 0; // Amount of RAM on the home server, last we checked
     let killScripts = []; // A list of scripts flagged to be restarted due to changes in priority
     let dictOwnedSourceFiles = (/**@returns{{[k: number]: number;}}*/() => [])(); // Player owned source files
@@ -259,8 +262,8 @@ export async function main(ns) {
         await checkIfBnIsComplete(ns, player);
         await maybeAcceptStaneksGift(ns, player);
         await checkOnRunningScripts(ns, player);
-        await maybeDoCasino(ns, player);
-        await maybeInstallAugmentations(ns, player);
+        await maybeDoCasino(ns, player, stocksValue);
+        await maybeInstallAugmentations(ns, player, stocksValue);
         return shouldWeKeepRunning(ns); // Return false to shut down autopilot.js if we installed augs, or don't have enough home RAM
     }
 
@@ -274,6 +277,9 @@ export async function main(ns) {
     /** Update some information that can be safely cached for small periods of time
      * @param {NS} ns */
     async function updateCachedData(ns) {
+        // Installed augs only change on install / graft completion, so refresh on the --interval-check-scripts cadence rather than every 2 s loop
+        if (lastCachedDataUpdate > Date.now() - options['interval-check-scripts']) return;
+        lastCachedDataUpdate = Date.now();
         // Now that grafting is a thing, we need to check if new augmentations have been installed between resets
         if ((4 in unlockedSFs)) { // Note: Installed augmentations can also be obtained from getResetInfo() (without SF4), but this seems unintended and will probably be removed from the game.
             try {
@@ -412,13 +418,16 @@ export async function main(ns) {
                 bnComplete = false;
         }
 
-        // Detect the BB win condition (requires SF7 (bladeburner API) or being in BN6)
-        if (7 in unlockedSFs) // No point making this async check if bladeburner API is unavailable
+        // Detect the BB win condition (requires SF7 (bladeburner API) or being in BN6). Poll on the --interval-check-scripts cadence, not every 2 s loop.
+        if (7 in unlockedSFs && !bladeburnerComplete && lastBladeburnerCheck <= Date.now() - options['interval-check-scripts']) {
+            lastBladeburnerCheck = Date.now();
             playerInBladeburner = playerInBladeburner || await getNsDataThroughFile(ns, 'ns.bladeburner.inBladeburner()');
-        if (!bnComplete && playerInBladeburner)
-            bnComplete = await getNsDataThroughFile(ns,
-                `ns.bladeburner.getActionCountRemaining('Black Operations', 'Operation Daedalus') === 0`,
-                '/Temp/bladeburner-completed.txt');
+            if (playerInBladeburner)
+                bladeburnerComplete = await getNsDataThroughFile(ns,
+                    `ns.bladeburner.getActionCountRemaining('Black Operations', 'Operation Daedalus') === 0`,
+                    '/Temp/bladeburner-completed.txt');
+        }
+        if (bladeburnerComplete) bnComplete = true;
 
         // HEURISTIC: If we naturally get within 75% of the if w0r1d_d43m0n hack stat requirement,
         //    switch daemon.js to prioritize earning hack exp for the remainder of the BN
@@ -797,9 +806,13 @@ export async function main(ns) {
 
     /** Logic to steal 10b from the casino
      * @param {NS} ns
-     * @param {Player} player */
-    async function maybeDoCasino(ns, player) {
+     * @param {Player} player
+     * @param {number} stocksValue Current value of all stock positions (computed once per main loop) */
+    async function maybeDoCasino(ns, player, stocksValue) {
         if (ranCasino || options['disable-casino']) return;
+        // Casino earnings and our income trend change slowly: evaluate on the --interval-check-scripts cadence rather than every 2 s loop
+        if (lastCasinoCheck > Date.now() - options['interval-check-scripts']) return;
+        lastCasinoCheck = Date.now();
         // Figure out whether we've already been kicked out of the casino for earning more than 10b there
         const moneySources = await getPlayerMoneySources(ns);
         const casinoEarnings = moneySources.sinceInstall.casino;
@@ -808,7 +821,7 @@ export async function main(ns) {
             return ranCasino = true;
         }
         // If we already have more than 1t money but hadn't run casino.js yet, don't bother. Another 10b won't move the needle much.
-        const playerWealth = player.money + (await getStocksValue(ns));
+        const playerWealth = player.money + stocksValue;
         if (playerWealth >= 1e12) {
             log(ns, `INFO: Skipping running casino.js, since we're already ridiculously wealthy (${formatMoney(playerWealth)} > 1t).`);
             return ranCasino = true;
@@ -864,8 +877,9 @@ export async function main(ns) {
 
     /** Logic to detect if it's a good time to install augmentations, and if so, do so
      * @param {NS} ns
-     * @param {Player} player */
-    async function maybeInstallAugmentations(ns, player) {
+     * @param {Player} player
+     * @param {number} stocksValue Current value of all stock positions (computed once per main loop) */
+    async function maybeInstallAugmentations(ns, player, stocksValue) {
         if (!(4 in unlockedSFs))  // Cannot automate augmentations or installs without singularity
             return setStatus(ns, `No singularity access, so you're on your own. You should manually work for factions and install augmentations!`);
 
@@ -959,7 +973,7 @@ export async function main(ns) {
             return reservedPurchase = 0; // If we were previously reserving money for a purchase, reset that flag now
         }
         // If we want to reset, but there is a reason to delay, don't reset
-        if (await shouldDelayInstall(ns, player, facman)) // If we're currently in a state where we should not be resetting, skip reset logic
+        if (await shouldDelayInstall(ns, player, facman, stocksValue)) // If we're currently in a state where we should not be resetting, skip reset logic
             return reservedPurchase = 0;
 
         // Ensure the money needed for the above augs doesn't get ripped out from under us by reserving it
@@ -1024,8 +1038,9 @@ export async function main(ns) {
      *           awaiting_install_augs: string[], awaiting_install_count: number, awaiting_install_count_nf: number, awaiting_install_count_ex_nf: number,
      *           affordable_augs: string[], affordable_count: number, affordable_count_nf: number, affordable_count_ex_nf: number,
      *           total_rep_cost: number, total_aug_cost: number, unowned_count: number }} facmanOutput
+     * @param {number} stocksValue Current value of all stock positions (computed once per main loop)
     */
-    async function shouldDelayInstall(ns, player, facmanOutput) {
+    async function shouldDelayInstall(ns, player, facmanOutput, stocksValue) {
         // Don't install if we're currently grafting an augmentation
         if (await checkIfGrafting(ns))
             return true;
@@ -1033,7 +1048,7 @@ export async function main(ns) {
         if (!have4STixApi) have4STixApi = await getNsDataThroughFile(ns, `ns.stock.has4SDataTixApi()`);
         if (!options['disable-wait-for-4s'] && !have4STixApi) {
             if (!have4SData) have4SData = await getNsDataThroughFile(ns, `ns.stock.has4SData()`);
-            const totalWorth = player.money + await getStocksValue(ns);
+            const totalWorth = player.money + stocksValue;
             const totalCost = 25E9 * bitNodeMults.FourSigmaMarketDataApiCost +
                 (have4SData ? 0 : 1E9 * bitNodeMults.FourSigmaMarketDataCost);
             const ratio = totalWorth / totalCost;
