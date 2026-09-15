@@ -1,12 +1,13 @@
 import { log, getConfiguration, instanceCount, disableLogs, getActiveSourceFiles, getNsDataThroughFile, runCommand, formatMoney, formatDuration, getErrorInfo } from './helpers.js'
-import { canAffordTraining } from './lib/sleeve-logic.js'
+import { canAffordTraining, karmaRatePerAttempt, shouldFillWithKarmaHomicide } from './lib/sleeve-logic.js'
 
 const argsSchema = [
     ['min-shock-recovery', 97], // Minimum shock recovery before attempting to train or do crime (Set to 100 to disable, 0 to recover fully)
     ['shock-recovery', 0.05], // Set to a number between 0 and 1 to devote that ratio of time to periodic shock recovery (until shock is at 0)
     ['crime', null], // If specified, sleeves will perform only this crime regardless of stats
     ['homicide-chance-threshold', 0.5], // Sleeves on crime will automatically start homicide once their chance of success exceeds this ratio
-    ['disable-gang-homicide-priority', false], // By default, sleeves will do homicide to farm Karma until we're in a gang. Set this flag to disable this priority.
+    ['disable-gang-homicide-priority', false], // By default, sleeves that can earn karma efficiently (see --karma-homicide-min-rate) do homicide until we're in a gang. Set this flag to disable this priority.
+    ['karma-homicide-min-rate', 0.1], // Farm Homicide for gang karma ahead of other work only while (success chance x sync%) is at least this. Karma is only earned on success and is scaled by sync; 0.1 = 0.3 karma per 3 s attempt, ~10% of the player's own homicide rate
     ['aug-budget', 0.1], // Spend up to this much of current cash on augs per tick (Default is high, because these are permanent for the rest of the BN)
     ['buy-cooldown', 60 * 1000], // Must wait this may milliseconds before buying more augs for a sleeve
     ['min-aug-batch', 20], // Must be able to afford at least this many augs before we pull the trigger (or fewer if buying all remaining augs)
@@ -286,9 +287,9 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     if (lastSleeveShock[i] === undefined) lastSleeveShock[i] = sleeve.shock;
     // Synchronization only affects karma gained from sleeve crime (src/PersonObjects/Sleeve/Work/SleeveCrimeWork.ts: karma * syncBonus())
     // and the exp copied to the player / other sleeves (Work.ts applySleeveGains). The sleeve's own exp, rep and shock recovery are unaffected,
-    // so only bother syncing first when this sleeve's job will be crime for gang karma (or when --sync-first is set).
-    const wantKarmaCrime = !playerInGang && !options['disable-gang-homicide-priority'] && (2 in ownedSourceFiles) && ns.heart.break() > -54000;
-    if (sleeve.sync < 100 && (options['sync-first'] || wantKarmaCrime))
+    // and synchronizing is glacial (SleeveSynchroWork.ts: 0.0002 sync per 200 ms cycle = 0.001/s, ~27 h from 1 to 100), so never block on it:
+    // only the legacy --sync-first flag forces it.
+    if (sleeve.sync < 100 && options['sync-first'])
         return ["synchronize", `ns.sleeve.setToSynchronize(ns.args[0])`, [i], `syncing... ${sleeve.sync.toFixed(2)}%`];
     // Opt to do shock recovery if above the --min-shock-recovery threshold
     if (sleeve.shock > options['min-shock-recovery'])
@@ -371,9 +372,15 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
             `helping earn rep with company ${companyName}.`
         ];
     }
-    // If gangs are available, prioritize homicide until we've got the requisite -54K karma to unlock them
-    if (!playerInGang && !options['disable-gang-homicide-priority'] && (2 in ownedSourceFiles) && ns.heart.break() > -54000)
-        return await crimeTask(ns, 'Homicide', i, sleeve, 'we want gang karma'); // Ignore chance - even a failed homicide generates more Karma than every other crime
+    // If gangs are available and we still need -54K karma to unlock them, a sleeve may farm Homicide - but karma is only earned on a successful
+    // crime and is scaled by sync (SleeveCrimeWork.ts process: Player.karma -= crime.karma * sleeve.syncBonus() only when success), so this is a
+    // filler that must clear --karma-homicide-min-rate; otherwise the sleeve falls through to the productive tasks below.
+    const wantKarmaCrime = !playerInGang && !options['disable-gang-homicide-priority'] && (2 in ownedSourceFiles) && ns.heart.break() > -54000;
+    if (wantKarmaCrime) {
+        const homicideChance = await calculateCrimeChance(ns, sleeve, 'Homicide');
+        if (shouldFillWithKarmaHomicide(homicideChance, sleeve.sync, options['karma-homicide-min-rate']))
+            return await crimeTask(ns, 'Homicide', i, sleeve, `we want gang karma (earning ${(100 * karmaRatePerAttempt(homicideChance, sleeve.sync)).toFixed(1)}% of the karma per attempt)`);
+    }
     // If the player is in bladeburner, and has already unlocked gangs with Karma, generate contracts and operations
     if (playerInBladeburner) {
         // Hack: Without paying much attention to what's happening in bladeburner, pre-assign a variety of tasks by sleeve index
