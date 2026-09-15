@@ -26,6 +26,7 @@ const argsSchema = [
     ['karma-threshold-for-gang-invites', -40000], // Prioritize working for gang invites once we have this much negative Karma
     ['disable-treating-gang-as-sole-provider-of-its-augs', false], // Set to true if you still want to grind for rep with factions that only have augs your gang provides
     ['no-bladeburner-check', false], // By default, will avoid working if bladeburner is active and "The Blade's Simulacrum" isn't installed
+    ['darknet-charisma', true], // When otherwise idle, study Leadership to satisfy the charisma goal left by darknet.js in /Temp/darknet-charisma-goal.txt
 ];
 
 // By default, consider these augs worth working towards regardless of whether they match one of the '--desired-stats'
@@ -388,6 +389,22 @@ async function mainLoop(ns) {
         ns.print(`INFO: All useful work complete. Grinding an additional 5% rep (to ${formatNumberShort(targetRep)}) ` +
             `with highest-favor faction: ${mostFavorFaction} (${(dictFactionFavors[mostFavorFaction] || 0).toFixed(2)} favor)`);
         foundWork = await workForSingleFaction(ns, mostFavorFaction, false, false, targetRep);
+    }
+    // If we're otherwise idle, see if darknet.js is waiting on us to raise our charisma to unlock its next blocked action
+    if (!foundWork && options['darknet-charisma']) {
+        const charismaGoal = Number(ns.read("/Temp/darknet-charisma-goal.txt")) || 0;
+        if (charismaGoal > player.skills.charisma) {
+            log(ns, `INFO: Studying Leadership to reach the darknet charisma goal of ${charismaGoal} (currently ${player.skills.charisma})...`);
+            let studyPlayer = player;
+            while (studyPlayer.skills.charisma < charismaGoal) {
+                if (breakToMainLoop()) return;
+                if (!(await studyForCharisma(ns, shouldFocus))) break;
+                await ns.sleep(30000);
+                studyPlayer = await getPlayerInfo(ns);
+            }
+            log(ns, `INFO: Finished studying Leadership for the darknet charisma goal (charisma now ${studyPlayer.skills.charisma}).`);
+            foundWork = true;
+        }
     }
     if (!foundWork && !options['no-crime']) { // Otherwise, kill some time by doing crimes for a little while
         ns.print(`INFO: Nothing to do. Doing a little crime...`);

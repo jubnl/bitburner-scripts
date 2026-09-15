@@ -30,6 +30,7 @@ const argsSchema = [
     ['train-with-pending-augs', false], // Set to true to train sleeves even when they still have purchasable augmentations (installing an aug resets all sleeve exp)
     ['max-faction-sleeves', 8], // Up to this many sleeves may work for (distinct) joined factions that still have unowned augmentations we need rep for. 0 to disable.
     ['faction-work-max-shock', 25], // Extra faction-work sleeves (above) must have shock at or below this (rep earned is scaled by (100 - shock)%), else they recover shock first
+    ['darknet-charisma', true], // When otherwise idle, study Leadership to help satisfy the charisma goal left by darknet.js in /Temp/darknet-charisma-goal.txt
 ];
 
 const interval = 1000; // Update (tick) this often to check on sleeves and recompute their ideal task
@@ -419,6 +420,24 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
         if (faction) {
             factionsTakenThisLoop.push(faction);
             return factionWorkTask(i, faction);
+        }
+    }
+    // If darknet.js is waiting on the player's charisma to unlock its next blocked action, put an otherwise-idle, healthy sleeve to studying Leadership too
+    if (options['darknet-charisma'] && canTrain && sleeve.shock <= options['train-max-shock']) {
+        const charismaGoal = Number(ns.read("/Temp/darknet-charisma-goal.txt")) || 0;
+        if (charismaGoal > playerInfo.skills.charisma) {
+            if (sleeve.city != ns.enums.CityName.Volhaven) {
+                log(ns, `Moving Sleeve ${i} from ${sleeve.city} to Volhaven so that they can study at ZB Institute.`);
+                await getNsDataThroughFile(ns, 'ns.sleeve.travel(ns.args[0], ns.args[1])', null, [i, ns.enums.CityName.Volhaven]);
+            }
+            const darknetUniv = ns.enums.LocationName.VolhavenZBInstituteOfTechnology;
+            const darknetCourse = ns.enums.UniversityClassType.leadership;
+            return [
+                `study charisma for darknet (${darknetUniv})`,
+                `ns.sleeve.setToUniversityCourse(ns.args[0], ns.args[1], ns.args[2])`,
+                [i, darknetUniv, darknetCourse],
+                `studying Leadership to help reach the darknet charisma goal of ${charismaGoal} (player currently at ${playerInfo.skills.charisma}).`
+            ];
         }
     }
     // If there's nothing more productive to do (above) and there's still shock, prioritize recovery

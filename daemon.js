@@ -41,6 +41,7 @@ const argsSchema = [
 
     ['share', undefined], // Enable sharing free ram to increase faction rep gain (by default, is enabled automatically once RAM is sufficient)
     ['no-share', false],  // Disable sharing free ram to increase faction rep gain
+    ['no-darknet', false], // Disable launching darknet.js to crawl the darknet for augmentations/rewards
     ['share-cooldown', 5000], // Wait before attempting to schedule more share threads (e.g. to free RAM to be freed for hack batch scheduling first)
     ['share-max-utilization', 0.8], // Set to 1 if you don't care to leave any RAM free after sharing. Will use up to this much of the available RAM
     // Cap on the number of share threads scheduled at once. The game's share bonus is 1 + ln(effectiveThreads) / 25 (src/NetworkShare/Share.ts calculateShareBonus),
@@ -432,6 +433,8 @@ export async function main(ns) {
             },
             // Check if any new servers can be backdoored. If there are many, this can eat up a lot of RAM, so make this the last script scheduled at startup.
             { interval: 33000, name: "/Tasks/backdoor-all-servers.js", shouldRun: () => 4 in dictSourceFiles && playerHackSkill() > 10 }, // Don't do this until we reach hack level 10. If we backdoor too early, it's very slow and eats up RAM for a long time,
+            // Crawl the darknet for augmentations/rewards once we can reach it (own the navigator program, are already in BN15, or have SF15)
+            { interval: 30000, name: "darknet.js", shouldRun: () => !options['no-darknet'] && (ownedPrograms.includes("DarkscapeNavigator.exe") || resetInfo.currentNode == 15 || 15 in dictSourceFiles) },
         ];
         periodicScripts.forEach(tool => tool.ignoreReservedRam = true);
         if (verbose) // In verbose mode, have periodic sripts persist their logs.
@@ -954,11 +957,13 @@ export async function main(ns) {
 
                 // Use any unspent RAM on share if we are currently working for a faction
                 const maxShareUtilization = options['share-max-utilization']
-                if (failed.length <= 0 && utilizationPercent < maxShareUtilization && // Only share RAM if we have succeeded in all hack cycle scheduling and have RAM to space
+                const shouldShare = failed.length <= 0 && utilizationPercent < maxShareUtilization && // Only share RAM if we have succeeded in all hack cycle scheduling and have RAM to space
                     (Date.now() - lastShareTime) > options['share-cooldown'] && // Respect the share rate-limit if configured to leave gaps for scheduling
                     options['share'] !== false && options['no-share'] !== true &&
-                    (options['share'] === true || network.totalMaxRam > 1024)) // If not explicitly enabled or disabled, auto-enable share at 1TB of network RAM
-                {
+                    (options['share'] === true || network.totalMaxRam > 1024) // If not explicitly enabled or disabled, auto-enable share at 1TB of network RAM
+                // Let other scripts (e.g. darknet.js) know whether we're currently sharing spare RAM, so they can decide whether to share their own spare RAM too.
+                ns.write("/Temp/share-active.txt", String(shouldShare), "w");
+                if (shouldShare) {
                     let shareTool = getTool("share");
                     let maxThreads = shareTool.getMaxThreads(); // This many threads would use up 100% of the (1-utilizationPercent)% RAM remaining
                     if (xpOnly) maxThreads -= Math.floor(getServerByName('home').ramAvailable() / shareTool.cost); // Reserve home ram entirely for XP cycles when in xpOnly mode
