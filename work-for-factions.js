@@ -49,7 +49,7 @@ const jobs = [ // Job stat requirements for a company with a base stat modifier 
     {
         name: "IT",
         reqRep: [0e0, 7e3, 35e3, 175e3],
-        reqHck: [225, 250, 275, 375], // [1, 26, 51, 151] + 224
+        reqHck: [225, 250, 375, 475], // [1, 26, 151, 251] + 224 (src/Company/data/CompanyPositionsMetadata.ts IT1-IT3 reqdHacking)
         reqCha: [0e0, 0e0, 275, 300], // [0,  0, 51,  76] + 224
         repMult: [0.9, 1.1, 1.3, 1.4]
     },
