@@ -203,7 +203,7 @@ export async function main(ns) {
             if (inProgress) break
         }
         const currentGame = await ns.go.opponentNextTurn(false)
-        checkNewGame(ns, currentGame)
+        await checkNewGame(ns, currentGame)
         const playStyle = getStyle(ns);
         while (true) {
             turn++
@@ -363,7 +363,7 @@ export async function main(ns) {
                         break
                 } //End of style switch
             } // end of turn >= 3
-            checkNewGame(ns, results)
+            await checkNewGame(ns, results)
         }
     }
 
@@ -383,10 +383,10 @@ export async function main(ns) {
     /** @param {NS} ns
      * @param {{ type:"move"|"pass"|"gameOver"; x:number; y:number;}} gameInfo
      */
-    function checkNewGame(ns, gameInfo) {
+    async function checkNewGame(ns, gameInfo) {
         if (gameInfo.type === "gameOver") {
             if (runOnce) ns.exit()
-            startNewGame(ns);
+            await startNewGame(ns);
             turn = 0
             ns.clearLog()
         }
@@ -395,10 +395,13 @@ export async function main(ns) {
     /** Start a new game against the most-preferred opponent whose win-streak favor bonus isn't capped yet.
      * ns.go.analysis.getStats() (0 GB) reports per-opponent "rep" = favor gained via win streaks (src/Go/boardAnalysis/scoring.ts), which
      * stops accruing at getMaxRep() (src/Go/effects/effect.ts). Once every preferred opponent is capped, we rotate randomly among them.
+     * Note: scoring.ts only adds rep when the opponent is a faction the player has joined (`Player.factions.includes(factionName)`), and
+     * "????????????" is not a faction at all, so an opponent we are not a member of can never become "capped" by rep: treat it as capped.
      * @param {NS} ns */
-    function startNewGame(ns) {
+    async function startNewGame(ns) {
         const stats = ns.go.analysis.getStats();
-        const uncapped = opponentPreference.filter(o => (stats[o]?.rep ?? 0) < maxFavorRep);
+        const joinedFactions = await getNsDataThroughFile(ns, 'ns.getPlayer().factions', '/Temp/player-factions.txt');
+        const uncapped = opponentPreference.filter(o => joinedFactions.includes(o) && (stats[o]?.rep ?? 0) < maxFavorRep);
         const candidates = uncapped.length > 0 ? uncapped : opponentPreference.slice().sort(() => Math.random() - 0.5);
         for (const candidate of candidates) {
             try {
