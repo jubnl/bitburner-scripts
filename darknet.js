@@ -6,18 +6,21 @@ import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decod
  * online cracked server. Agents never plan; they only execute the pushed command file.
  *
  * Static RAM budget (target: under 8 GB):
- *   base 1.60 | getResetInfo 1.00 | getPlayer 0.50 | exec 1.30 | scp 0.60 | kill 0.50
+ *   base 1.60 | getResetInfo 1.00 | getPlayer 0.50 | exec 1.30 | scp 0.60 | kill 0.50 | ps 0.20
  *   dnet.getServerDetails 0.10 | fileExists 0.10 | isRunning 0.10 | dnet.connectToSession 0.05
  *   getServerMaxRam 0.05 | getServerUsedRam 0.05
  *   dnet.getStasisLinkLimit 0 | dnet.getStasisLinkedServers 0 | read/write/readPort/print/tprint/
- *   toast/flags/getScriptName/disableLog/sleep 0                          => 5.95 GB
+ *   toast/flags/getScriptName/disableLog/sleep/args 0                     => 6.15 GB
  *
  * NOTE: object keys that collide with an NS function name are written as quoted strings
  * (e.g. "share", which would otherwise cost 4 GB). Same convention as darknet/lib.js.
  */
 
 const argsSchema = [
-    ["mode", "balanced"],           // balanced | loot | labyrinth. Re-read every loop, so it can change at runtime.
+    ["mode", "balanced"],           // balanced | loot | labyrinth. Re-read every loop. A --mode given
+                                     // on the command line pins the mode for the whole run; the config
+                                     // file's "mode" entry can only switch it at runtime when --mode
+                                     // was NOT passed on the command line (see printStatus's "source").
     ["port", PORT_DEFAULT],         // netscript port the agents report on
     ["interval", 10000],            // ms between controller loops
     ["crack-threads", 6],           // threads each agent may give one crack.js worker
@@ -40,7 +43,7 @@ const CLAIM_LIFETIME = 120000;      // a crack claim by another agent expires af
 const RESET_CHECK_INTERVAL = 300000;// getResetInfo costs 1 GB of static RAM but is free to call; poll every 5 min
 const STALE_FRONTIER = 3600000;     // no new server for an hour => the frontier is stale
 const STORM_COOLDOWN = 1800000;     // the game's global STORM_SEED cooldown is 30 minutes
-const KILL_GRACE = 5000;            // ms to let agents notice the stop flag before killing them
+const KILL_GRACE = 6000;            // ms to let agents notice the stop flag before killing them
 const MIGRATE_THREADS = 10;
 const PROMOTE_THREADS = 4;          // threads buildCmd hands a qualifying host for promote.js
 const MIN_PROMOTE_RAM = 64;         // buildCmd never hands out promote threads below this known maxRam
@@ -62,8 +65,8 @@ export async function main(ns) {
     let resetCheckedAt = Date.now();
     let state = loadState(ns, resetTime);
 
-    if (options.status) return printStatus(ns, state);
-    if (options["kill"]) return await stopEverything(ns, state, options);
+    if (options.status) return printStatus(ns, state, options);
+    if (options["kill"]) return await stopEverything(ns, state);
 
     // getConfiguration always logs its settings dump, so only call it again once
     // darknet.js.config.txt actually changes -- otherwise the log is flooded every loop.
@@ -929,8 +932,21 @@ export function launchWalkers(ns, state, plan, options) {
 
 // ---------------------------------------------------------------- status and shutdown
 
+/** Why `options.mode` currently has the value it does. A `--mode` on the command line always
+ * wins over the config file (see the argsSchema comment); absent that, a `mode` entry in
+ * `darknet.js.config.txt` is what drives it; absent both, it is just the schema default.
+ * @param {NS} ns */
+function modeSource(ns) {
+    if (ns.args.includes("--mode")) return "cli";
+    const confName = `${ns.getScriptName()}.config.txt`;
+    let parsed = safeParse(ns.read(confName), null);
+    if (Array.isArray(parsed)) parsed = Object.fromEntries(parsed);
+    if (parsed && typeof parsed === "object" && "mode" in parsed) return "config";
+    return "default";
+}
+
 /** @param {NS} ns */
-export function printStatus(ns, state) {
+export function printStatus(ns, state, options) {
     const names = Object.keys(state.servers);
     const online = names.filter(name => state.servers[name].online);
     const cracked = Object.keys(state.passwords).filter(name => !state.passwords[name].stale);
@@ -948,7 +964,7 @@ export function printStatus(ns, state) {
     const linked = ns.dnet.getStasisLinkedServers();
     const lines = [
         "=== darknet status ===",
-        `mode: ${state.mode}  |  known ${names.length}  online ${online.length}  cracked ${cracked.length}`,
+        `mode: ${state.mode} (requested: ${options.mode}, source: ${modeSource(ns)})  |  known ${names.length}  online ${online.length}  cracked ${cracked.length}`,
         `depth histogram: ${Object.keys(histogram).sort((a, b) => a - b).map(depth => `${depth}:${histogram[depth]}`).join(" ") || "(none)"}`,
         `passwords by model: ${Object.entries(perModel).sort((a, b) => b[1] - a[1]).map(([model, count]) => `${model}=${count}`).join(" ") || "(none)"}`,
         `cracks: ${Object.entries(state.stats.cracks).map(([model, row]) => `${model} ${row.won}/${row.won + row.failed} (${row.attempts} tries)`).join(", ") || "(none)"}`,
@@ -964,9 +980,24 @@ export function printStatus(ns, state) {
     log(ns, lines.join("\n"), true);
 }
 
-/** `--kill`: push a stop flag everywhere, wait, then kill whatever is still running.
+/** `--kill`: stop every other darknet.js controller on home first (a live controller would
+ * otherwise re-bootstrap and re-spread agents right behind this sweep), push a stop flag
+ * everywhere so agents get a chance to exit cleanly, wait, then kill whatever is still running
+ * by pid. The final sweep does not use `ns.isRunning` by name: workers carry varying args (a
+ * migrate/crack/walk target, thread counts, ...), so a name match cannot find them all.
  * @param {NS} ns */
-async function stopEverything(ns, state, options) {
+async function stopEverything(ns, state) {
+    // 1. Kill every OTHER darknet.js controller on home before anything else -- otherwise a
+    // still-running controller re-bootstraps darkweb and re-pushes command files behind us.
+    let controllersKilled = 0;
+    for (const proc of ns.ps("home")) {
+        if (proc.filename !== "darknet.js" || proc.pid === ns.pid) continue;
+        if (ns.kill(proc.pid)) controllersKilled++;
+    }
+    log(ns, `INFO: darknet --kill stopped ${controllersKilled} other darknet.js controller(s) on home.`, true);
+
+    // 2. Push the stop flag to every reachable known server, same as before, and give agents a
+    // few seconds to notice it and exit on their own.
     const stopCmd = {
         mode: "loot", claimed: [],
         threads: { crack: 0, realloc: 0, phish: 0, migrate: 0, promote: 0 },
@@ -994,11 +1025,35 @@ async function stopEverything(ns, state, options) {
     log(ns, `INFO: darknet --kill pushed the stop flag to ${reached.length} servers; waiting ${KILL_GRACE / 1000}s.`, true);
     await ns.sleep(KILL_GRACE);
 
-    let stopped = 0;
-    for (const host of reached) {
-        // By name and args, not by a stored pid: the agent may have been restarted (or the
-        // server bounced) since we recorded it.
-        if (ns.kill("darknet/agent.js", host, "--port", options.port)) stopped++;
+    // 3. Sweep darkweb, every known online server, and every lab host (a walker or its agent may
+    // be running there even though labs are excluded from `state.servers`) and kill anything the
+    // agent payload could have started. `ns.ps` throws or returns [] for an offline host.
+    const sweepHosts = new Set(["darkweb"]);
+    for (const [name, entry] of Object.entries(state.servers)) {
+        if (entry && entry.online) sweepHosts.add(name);
     }
-    log(ns, `SUCCESS: darknet --kill finished; ${stopped} agent(s) killed after the grace period.`, true, "success");
+    for (const lab of LABS) sweepHosts.add(lab.host);
+
+    let stopped = 0;
+    let hostsWithKills = 0;
+    for (const host of sweepHosts) {
+        let procs;
+        try {
+            procs = ns.ps(host);
+        } catch {
+            continue;
+        }
+        if (!Array.isArray(procs) || procs.length === 0) continue;
+        let hostStopped = 0;
+        for (const proc of procs) {
+            if (!(proc.filename.startsWith("darknet/") || proc.filename === "Remote/share.js")) continue;
+            if (ns.kill(proc.pid)) hostStopped++;
+        }
+        if (hostStopped > 0) {
+            stopped += hostStopped;
+            hostsWithKills++;
+            log(ns, `INFO: darknet --kill killed ${hostStopped} process(es) on ${host}.`);
+        }
+    }
+    log(ns, `SUCCESS: darknet --kill finished; stopped ${stopped} processes on ${hostsWithKills} hosts.`, true, "success");
 }
