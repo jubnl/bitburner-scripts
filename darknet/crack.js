@@ -1,6 +1,6 @@
 import { getConfiguration } from "../helpers.js";
 import { solve } from "./solvers.js";
-import { encodeMsg, PORT_DEFAULT, FILES, parsePasswords, parseClueText, safeParse } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, FILES, parsePasswords, parseClueText, safeParse, hostFromArg } from "./lib.js";
 
 const argsSchema = [["port", PORT_DEFAULT], ["clues", ""]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
@@ -8,7 +8,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 /** @param {NS} ns */
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
-    const target = String(options._[0] ?? ""); if (!target) return ns.tprint("crack.js: missing target host");
+    const target = hostFromArg(options._[0]); if (!target) return ns.tprint("crack.js: missing target host");
     const me = ns.getHostname(), pid = ns.pid;
     const send = (payload) => { const line = encodeMsg("crack", me, pid, payload); if (!ns.tryWritePort(options.port, line)) ns.print(`WARN: port full, dropped: ${line}`); };
     const details = ns.dnet.getServerDetails(target);

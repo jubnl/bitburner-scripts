@@ -8,6 +8,19 @@
 
 export const PORT_DEFAULT = 15;
 
+// Darknet hostnames are lore strings and may begin with "-" or "--" (e.g. the reversed
+// `--;SREVRES-ELBAT-PORD;)`), which ns.flags / getConfiguration would parse as an option and
+// throw ArgError. Every hostname handed to a worker as a positional argument goes through
+// hostArg, and the worker reads it back with hostFromArg. Both sides of an exec/isRunning pair
+// must use the same wrapped form so isRunning keeps matching.
+const HOST_ARG_PREFIX = "host:";
+export function hostArg(host) { return HOST_ARG_PREFIX + String(host); }
+export function hostFromArg(arg) {
+    if (arg === undefined || arg === null) return "";
+    const s = String(arg);
+    return s.startsWith(HOST_ARG_PREFIX) ? s.slice(HOST_ARG_PREFIX.length) : s;
+}
+
 export const FILES = {
     state: "darknet/state.txt",
     stateTmp: "darknet/state.tmp.txt",

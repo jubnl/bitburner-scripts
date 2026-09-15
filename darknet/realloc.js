@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { encodeMsg, PORT_DEFAULT, FILES, parseCmd } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, FILES, parseCmd, hostFromArg } from "./lib.js";
 
 const argsSchema = [["port", PORT_DEFAULT]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
@@ -7,7 +7,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 /** @param {NS} ns */
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
-    const me = ns.getHostname(), asked = String(options._[0] ?? me), target = asked === "self" ? me : asked;
+    const me = ns.getHostname(), asked = hostFromArg(options._[0] ?? me), target = asked === "self" ? me : asked;
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("freed", me, ns.pid, p));
     let calls = 0, freed = 0, before = ns.dnet.getBlockedRam(target);
     while (ns.dnet.getBlockedRam(target) > 0) {

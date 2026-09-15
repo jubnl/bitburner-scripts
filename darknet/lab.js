@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES, LABS } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES, LABS, hostFromArg } from "./lib.js";
 
 /* The labyrinth walker. Runs on a darknet server that is directly connected to the current
  * labyrinth (that is the game's requirement for labreport/labradar/authenticate) and walks
@@ -136,7 +136,7 @@ export async function main(ns) {
     ns.disableLog("ALL");
     const options = getConfiguration(ns, argsSchema);
     if (!options) return;
-    const labHost = String(options._[0] ?? "");
+    const labHost = hostFromArg(options._[0]);
     if (!labHost) return ns.tprint("ERROR: darknet/lab.js needs a labyrinth hostname as its first argument.");
     const me = ns.getHostname();
     const port = options.port;

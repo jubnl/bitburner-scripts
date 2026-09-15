@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText } from "./lib.js";
+import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg } from "./lib.js";
 
 /* The darknet agent. One per cracked, online darknet server. It never plans: it executes the
  * command file the controller pushes, reports what it sees, and spreads itself to neighbours.
@@ -78,9 +78,9 @@ export async function main(ns) {
         for (const h of neighbours) {
             const d = detailsByHost[h];
             if (!d.isOnline || passwords[h] !== undefined || cmd.claimed.includes(h) || isLabHost(h)) continue;
-            if (ns.isRunning("darknet/crack.js", me, h, "--port", port)) continue;
+            if (ns.isRunning("darknet/crack.js", me, hostArg(h), "--port", port)) continue;
             const threads = Math.min(cmd.threads.crack || 6, Math.floor(freeRam(ns, me) / WORKER_RAM.crack));
-            if (threads >= 1) { const pid = ns.exec("darknet/crack.js", me, { threads, preventDuplicates: true }, h, "--port", port); dispatch("worker", { kind: "crack", host: h, threads, workerPid: pid }); }
+            if (threads >= 1) { const pid = ns.exec("darknet/crack.js", me, { threads, preventDuplicates: true }, hostArg(h), "--port", port); dispatch("worker", { kind: "crack", host: h, threads, workerPid: pid }); }
         }
         // 3. spread to known neighbours without an agent
         for (const h of neighbours) {
@@ -108,9 +108,9 @@ export async function main(ns) {
         }
         // 4. spend free RAM: realloc self, migrate, promote, share, phish
         if (ns.dnet.getBlockedRam(me) > 0) spawnRealloc(ns, me, "self", cmd, port);
-        if (cmd.migrateTarget && !isLabHost(cmd.migrateTarget) && neighbours.includes(cmd.migrateTarget) && !ns.isRunning("darknet/migrate.js", me, cmd.migrateTarget, "--port", port) && (cmd.threads.migrate || 0) > 0) {
+        if (cmd.migrateTarget && !isLabHost(cmd.migrateTarget) && neighbours.includes(cmd.migrateTarget) && !ns.isRunning("darknet/migrate.js", me, hostArg(cmd.migrateTarget), "--port", port) && (cmd.threads.migrate || 0) > 0) {
             const migrateThreads = Math.min(cmd.threads.migrate, Math.floor(freeRam(ns, me) / WORKER_RAM.migrate));
-            if (migrateThreads >= 1) ns.exec("darknet/migrate.js", me, { threads: migrateThreads, preventDuplicates: true }, cmd.migrateTarget, "--port", port);
+            if (migrateThreads >= 1) ns.exec("darknet/migrate.js", me, { threads: migrateThreads, preventDuplicates: true }, hostArg(cmd.migrateTarget), "--port", port);
         }
         if (cmd.promoteSymbols.length && ns.getServerMaxRam(me) >= 64 && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
             const promoteThreads = Math.min(cmd.threads.promote, Math.floor((freeRam(ns, me) - reserve) / WORKER_RAM.promote));
@@ -119,10 +119,10 @@ export async function main(ns) {
         // The labyrinth walker has to run on a host directly connected to the lab, and ns.exec
         // needs a direct connection to its target, so only this agent can start it -- the
         // controller just names the host in the command file.
-        if (cmd.walk && neighbours.includes(cmd.walk) && (cmd.walkThreads || 0) >= 1 && !ns.isRunning("darknet/lab.js", me, cmd.walk, "--port", port)) {
+        if (cmd.walk && neighbours.includes(cmd.walk) && (cmd.walkThreads || 0) >= 1 && !ns.isRunning("darknet/lab.js", me, hostArg(cmd.walk), "--port", port)) {
             const walkThreads = Math.min(cmd.walkThreads, Math.floor(freeRam(ns, me) / WORKER_RAM.lab));
             if (walkThreads >= 1) {
-                const pid = ns.exec("darknet/lab.js", me, { threads: walkThreads, preventDuplicates: true }, cmd.walk, "--port", port);
+                const pid = ns.exec("darknet/lab.js", me, { threads: walkThreads, preventDuplicates: true }, hostArg(cmd.walk), "--port", port);
                 dispatch("worker", { kind: "walker-launch", host: me, lab: cmd.walk, threads: walkThreads, workerPid: pid });
             }
         }
@@ -164,8 +164,8 @@ function freeRam(ns, host) { return ns.getServerMaxRam(host) - ns.getServerUsedR
 // The duplicate check lives here rather than at the call sites so ns.isRunning and ns.exec
 // can never be handed different args (they have to match exactly for isRunning to find it).
 function spawnRealloc(ns, me, target, cmd, port) {
-    if (ns.isRunning("darknet/realloc.js", me, target, "--port", port)) return 0;
+    if (ns.isRunning("darknet/realloc.js", me, hostArg(target), "--port", port)) return 0;
     const threads = Math.min(cmd.threads.realloc || 50, Math.floor(freeRam(ns, me) / WORKER_RAM.realloc));
-    if (threads >= 1) return ns.exec("darknet/realloc.js", me, { threads, preventDuplicates: true }, target, "--port", port);
+    if (threads >= 1) return ns.exec("darknet/realloc.js", me, { threads, preventDuplicates: true }, hostArg(target), "--port", port);
     return 0;
 }

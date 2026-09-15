@@ -1,5 +1,5 @@
 import { log, getConfiguration, formatMoney, formatRam, formatNumberShort, parseShortNumber, getErrorInfo } from "./helpers.js";
-import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse } from "./darknet/lib.js";
+import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse, hostArg } from "./darknet/lib.js";
 
 /* The darknet controller. Runs on home, owns `darknet/state.txt`, drains the report port,
  * plans loot / labyrinth work and pushes `darknet/passwords.txt` + `darknet/cmd.txt` to every
@@ -958,7 +958,7 @@ export function launchWalkers(ns, state, plan, options) {
         plan.walkThreadsByHost[host] = cand.walkThreads;
         // darkweb is home's only direct darknet connection, so it is the one host the
         // controller can start a walker on itself -- useful before its agent comes up.
-        if (host === "darkweb" && !ns.isRunning("darknet/lab.js", host, lab.host, "--port", port)) {
+        if (host === "darkweb" && !ns.isRunning("darknet/lab.js", host, hostArg(lab.host), "--port", port)) {
             const files = agentPayload(ns);
             if (files.includes("darknet/lab.js")) {
                 ns.scp(files, host, "home");
@@ -967,7 +967,7 @@ export function launchWalkers(ns, state, plan, options) {
                 // max-RAM-based thread count can outrun what is free at this exact instant.
                 const threads = Math.min(cand.walkThreads, Math.floor(freeRam(ns, host) / WORKER_RAM.lab));
                 if (threads >= 1) {
-                    const pid = ns.exec("darknet/lab.js", host, { threads, preventDuplicates: true }, lab.host, "--port", port);
+                    const pid = ns.exec("darknet/lab.js", host, { threads, preventDuplicates: true }, hostArg(lab.host), "--port", port);
                     if (pid) {
                         state.labs.walkers.push({ host, pid, lab: lab.host, startedAt: Date.now(), lastSeen: Date.now(), steps: 0 });
                         log(ns, `SUCCESS: darknet sent a walker into ${lab.host} from darkweb (pid ${pid}, ${threads} threads).`, false, "success");

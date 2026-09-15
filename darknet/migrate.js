@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { encodeMsg, PORT_DEFAULT, FILES, parseCmd } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, FILES, parseCmd, hostFromArg } from "./lib.js";
 
 const argsSchema = [["port", PORT_DEFAULT]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
@@ -8,7 +8,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
     const me = ns.getHostname();
-    const target = String(options._[0] ?? me);
+    const target = hostFromArg(options._[0] ?? me);
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("worker", me, ns.pid, p));
     let calls = 0;
     while (true) {
