@@ -541,3 +541,23 @@ test("pushFiles treats an `Invalid host` throw from connectToSession as a delete
     const controller = readFileSync(new URL("../darknet.js", import.meta.url), "utf8");
     assert.equal((controller.match(/ns\.dnet\.connectToSession\(/g) ?? []).length, 1, "the only raw call is inside trySession; pushFiles and --kill go through it");
 });
+
+// R2: without a migration nothing is ever reachable past an air-gap row (rows 8/16/24/32 hold no servers and
+// connections only join rows x+-1), so the frontier stalls at row-1 and can never creep to within
+// LAB_DEPTH_SLACK of a lab at depth >= 19. Gap migrations are only planned in labyrinth mode.
+test("chooseMode flips to labyrinth when the frontier sits just above an air gap below the lab", () => {
+    const ns = makeNs({
+        charisma: 2000, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings, LAB_AUGMENTATIONS.TheBoots],
+        details: { m3rc1l3ss_l4byr1nth: { isOnline: true, depth: -1 } },
+    });
+    const options = { ...baseOptions, mode: "balanced" };
+    const blocked = makeState({ edge: { depth: 7, difficulty: 6 }, mid: { depth: 4, difficulty: 2 } });
+    assert.equal(currentLab(ns, blocked).host, "m3rc1l3ss_l4byr1nth");
+    assert.equal(chooseMode(ns, blocked, options, 2000), "labyrinth", "frontier 7 = row 8 - 1, lab at 19");
+    const creeping = makeState({ edge: { depth: 6, difficulty: 6 } });
+    assert.equal(chooseMode(ns, creeping, options, 2000), "loot", "row 7 is still crackable, keep looting");
+    const crossed = makeState({ beyond: { depth: 9, difficulty: 7 } });
+    assert.equal(chooseMode(ns, crossed, options, 2000), "loot", "past the gap and 10 rows short: loot until the next gap");
+    const secondGap = makeState({ beyond: { depth: 15, difficulty: 12 } });
+    assert.equal(chooseMode(ns, secondGap, options, 2000), "labyrinth", "row 16 also lies below the lab");
+});

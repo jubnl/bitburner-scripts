@@ -730,7 +730,12 @@ export function chooseMode(ns, state, options, charisma = 0) {
     // lab only appears once it is installed, so there is nothing left to walk toward.
     if (state.labs.rewardQueuedAt) return "loot";
     if (charisma < lab.cha) return "loot";
-    if (frontierDepth(state) >= lab.depth - LAB_DEPTH_SLACK) return "labyrinth";
+    const frontier = frontierDepth(state);
+    if (frontier >= lab.depth - LAB_DEPTH_SLACK) return "labyrinth";
+    // Blocked by an air gap: rows 8/16/24/32 hold no servers and connections only join adjacent rows
+    // (darknetNetworkUtils.ts:501, NetworkGenerator.ts:192-200), so a frontier at row-1 can only advance by
+    // the gap migrations planLabyrinth plans. Slack does not matter here (R2).
+    if (AIR_GAP_ROWS.some(row => row < lab.depth && frontier === row - 1)) return "labyrinth";
     // "a migration toward it is charging": a recently charged server sitting just above an air
     // gap that still separates us from the lab. Island migrations in loot mode do not qualify.
     const now = Date.now();
