@@ -175,7 +175,7 @@ export async function main(ns) {
                 playerInstalledAugCount = installedAugmentations.length;
             }
         } catch (err) {
-            if (unlockedSFs[4] || 0 == 3) throw err; // No idea why this failed, treat as temporary and allow auto-retry.
+            if ((unlockedSFs[4] || 0) == 3) throw err; // No idea why this failed, treat as temporary and allow auto-retry.
             log(ns, `WARNING: You only have SF4 level ${unlockedSFs[4]}. Without level 3, some singularity functions will be ` +
                 `too expensive to run until you have bought a lot of home RAM.`, true);
         }
