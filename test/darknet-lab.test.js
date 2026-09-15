@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeRng, makeLab, labStep, labReport } from "./darknet-mock.js";
-import { nextMove, cellKey, stepTo, findExit, shouldRestart, parseMoveOutcome } from "../darknet/lab.js";
+import { nextMove, cellKey, stepTo, findExit, shouldRestart, parseMoveOutcome, walkerOrder } from "../darknet/lab.js";
 
 /* Drives darknet/lab.js's navigation against the ported maze generator.
  *
@@ -226,4 +226,33 @@ test("parseMoveOutcome returns null for replies without a position", () => {
     assert.equal(parseMoveOutcome("You feel disconnected...", undefined), null);
     assert.equal(parseMoveOutcome("You have moved to 3,5.", "██\n█"), null, "a truncated window is not trusted");
     assert.equal(parseMoveOutcome(undefined, undefined), null);
+});
+
+// R8: labyrinth.ts starts every pid at [1,1] on the first three labs (offsetStartAndEnd false) and all walkers
+// share one maze, so walkers with the same tie-break walk the identical DFS. A per-pid direction order makes
+// them fan out at the first fork.
+test("walkerOrder rotates the direction preference by pid", () => {
+    assert.deepEqual(walkerOrder(0), ["north", "east", "south", "west"]);
+    assert.deepEqual(walkerOrder(1), ["east", "south", "west", "north"]);
+    assert.deepEqual(walkerOrder(6), ["south", "west", "north", "east"]);
+    assert.deepEqual(walkerOrder(-1), ["west", "north", "east", "south"]);
+    assert.deepEqual(walkerOrder(undefined), ["north", "east", "south", "west"]);
+});
+
+test("nextMove breaks a distance tie by the walker's own order", () => {
+    // Toward the far corner, east and south shorten the distance equally; north and west lengthen it.
+    const visited = new Set([cellKey([3, 3])]);
+    const open = { north: true, east: true, south: true, west: true };
+    assert.equal(nextMove(visited, [], [3, 3], open, null, walkerOrder(0)).dir, "east");
+    assert.equal(nextMove(visited, [], [3, 3], open, null, walkerOrder(2)).dir, "south");
+    assert.equal(nextMove(visited, [], [3, 3], open, null).dir, "east", "the default order is the old one");
+});
+
+test("every direction order still solves the maze", () => {
+    for (let pid = 0; pid < 4; pid++) {
+        const lab = makeLab(30, 20, makeRng(7), false);
+        const result = walk(lab, "corner", undefined, walkerOrder(pid));
+        assert.ok(result.solved, `order ${pid}: ${result.why}`);
+        assert.ok(result.steps < 4 * cellCount(lab));
+    }
 });

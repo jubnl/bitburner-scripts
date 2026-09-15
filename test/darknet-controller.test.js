@@ -83,7 +83,7 @@ function makeState(hosts) {
 
 const baseOptions = {
     mode: "balanced", port: 15, interval: 10000, "crack-threads": 6, "realloc-threads": 50,
-    "lab-walkers": 3, "lab-threads": 6, "allow-webstorm": false, "no-promote": false,
+    "lab-walkers": 1, "lab-threads": 6, "allow-webstorm": false, "no-promote": false,
 };
 
 // ------------------------------------------------------------------ buildCmd

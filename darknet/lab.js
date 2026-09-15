@@ -42,6 +42,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 
 const DIRS = { north: [0, -1], east: [1, 0], south: [0, 1], west: [-1, 0] };
 const OPP = { north: "south", south: "north", east: "west", west: "east" };
+const DIR_ORDER = Object.keys(DIRS);   // north, east, south, west: the tie-break order of a lone walker
 const FAR_CORNER = 1e9;         // the exit sits at the bottom-right, up to a small random offset
 const RADAR_EVERY = 5;          // steps between radar sweeps while the exit has not been seen
 const PROGRESS_EVERY = 25;      // steps between progress reports to the controller
@@ -61,6 +62,14 @@ export function cellKey(coords) {
 export function stepTo(coords, direction) {
     const [dx, dy] = DIRS[direction];
     return [coords[0] + dx * 2, coords[1] + dy * 2];
+}
+
+/** A walker's direction preference: DIR_ORDER rotated by `seed % 4`. Every walker of the first three labs
+ * starts at [1,1] in one shared maze (labyrinth.ts getRandomOffset, getLabMaze), so walkers that break ties
+ * the same way walk the same path; seeding the order by pid sends them down different branches (R8). */
+export function walkerOrder(seed) {
+    const shift = (((Number(seed) || 0) % 4) + 4) % 4;
+    return [...DIR_ORDER.slice(shift), ...DIR_ORDER.slice(0, shift)];
 }
 
 /** Manhattan distance from the cell `direction` leads to, to `target` (the far corner when
@@ -87,9 +96,10 @@ function distanceAfter(coords, direction, target) {
  * @param {string[]} stack directions taken to get here, oldest first
  * @param {number[]} coords the walker's current cell
  * @param {{north:boolean,east:boolean,south:boolean,west:boolean}} open which walls are open
- * @param {number[]|null} target the exit's coordinates once radar has shown them */
-export function nextMove(visited, stack, coords, open, target) {
-    const choices = Object.keys(DIRS).filter(dir => open[dir] && !visited.has(cellKey(stepTo(coords, dir))));
+ * @param {number[]|null} target the exit's coordinates once radar has shown them
+ * @param {string[]} [order] direction preference used to break distance ties (walkerOrder) */
+export function nextMove(visited, stack, coords, open, target, order = DIR_ORDER) {
+    const choices = order.filter(dir => open[dir] && !visited.has(cellKey(stepTo(coords, dir))));
     if (choices.length) {
         choices.sort((a, b) => distanceAfter(coords, a, target) - distanceAfter(coords, b, target));
         return { dir: choices[0], push: true };
@@ -166,6 +176,7 @@ export async function main(ns) {
     };
 
     const chaReq = (LABS.find(row => row.host === labHost) ?? {}).cha ?? 0;
+    const order = walkerOrder(ns.pid);
     const visited = new Set();
     const stack = [];
     let steps = 0;
@@ -213,7 +224,7 @@ export async function main(ns) {
         }
         sinceRadar++;
 
-        const move = nextMove(visited, stack, coords, open, target);
+        const move = nextMove(visited, stack, coords, open, target, order);
         if (!move.dir) {
             send({ steps, done: false, reason: "exhausted" });
             return ns.print("giving up: every reachable cell has been visited");

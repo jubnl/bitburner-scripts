@@ -25,7 +25,7 @@ const argsSchema = [
     ["interval", 10000],            // ms between controller loops
     ["crack-threads", 6],           // threads each agent may give one crack.js worker
     ["realloc-threads", 50],        // threads each agent may give one realloc.js worker
-    ["lab-walkers", 3],             // most darknet/lab.js walkers to keep alive on the current lab
+    ["lab-walkers", 1],             // most darknet/lab.js walkers to keep alive on the current lab (one, with all its host's RAM, beats three copies of the same walk)
     ["lab-threads", 0],             // cap on threads per labyrinth walker; 0 = every thread that fits on the walk host
     ["allow-webstorm", false],      // permit unleashStormSeed when the frontier has gone stale
     ["no-promote", false],          // never hand stock symbols to promote.js
