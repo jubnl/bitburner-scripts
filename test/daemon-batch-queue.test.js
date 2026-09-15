@@ -1,7 +1,7 @@
 // HC-1: pure helpers of the just-in-time batch launcher in daemon.js.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { partitionDueTasks, nextRoundStart, canPlanNextRound } from "../daemon.js";
+import { partitionDueTasks, nextRoundStart, canPlanNextRound, withStockManipulationFlag } from "../daemon.js";
 
 test("partitionDueTasks returns due tasks sorted by start and keeps the rest", () => {
     const queue = [{ start: 5000, id: "c" }, { start: 1500, id: "a" }, { start: 2200, id: "b" }, { start: 900, id: "z" }];
@@ -23,6 +23,25 @@ test("nextRoundStart continues the previous cadence when it is still in the futu
 test("nextRoundStart falls back to now + queueDelay when the cadence is in the past or unknown", () => {
     assert.equal(nextRoundStart(50000, 1000, 10000, 2000), 51000);
     assert.equal(nextRoundStart(50000, 1000, undefined, 2000), 51000);
+});
+
+test("withStockManipulationFlag rewrites the flag of hack/grow tasks only, without mutating the input", () => {
+    // Args spec: [0: Target, 1: DesiredStartTime, 2: Duration, 3: Description, 4: DoStockManipulation, 5: DisableWarnings, 6: LoopingMode]
+    const hackArgs = ["joesguns", 1000, 500, "Batch 0-hack", 1, 0, 0];
+    assert.deepEqual(withStockManipulationFlag("hack", hackArgs, false), ["joesguns", 1000, 500, "Batch 0-hack", 0, 0, 0]);
+    assert.equal(hackArgs[4], 1, "input is not mutated");
+    assert.equal(withStockManipulationFlag("grow", hackArgs, true)[4], 1);
+    assert.equal(withStockManipulationFlag("manualhack", hackArgs, false)[4], 0, "the -i manual hack tool carries the same flag");
+});
+
+test("withStockManipulationFlag leaves args that carry no stock flag untouched", () => {
+    // A weaken task has no stock flag: its args[4] is the "disable warnings" flag and must not be overwritten
+    const weakenArgs = ["joesguns", 1000, 500, "Batch 0-weak1", 1, 0];
+    assert.equal(withStockManipulationFlag("weak", weakenArgs, false), weakenArgs, "the same array is returned");
+    assert.deepEqual(weakenArgs, ["joesguns", 1000, 500, "Batch 0-weak1", 1, 0]);
+    // Defensive: args too short to carry the flag are returned as-is
+    const shortArgs = ["joesguns", 1000, 500, "prep"];
+    assert.equal(withStockManipulationFlag("hack", shortArgs, true), shortArgs);
 });
 
 test("canPlanNextRound is true once the last batch's first task is due to launch", () => {

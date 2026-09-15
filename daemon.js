@@ -119,6 +119,22 @@ export function canPlanNextRound(roundInfo, now, leadMs) {
     return roundInfo != null && now >= roundInfo.readyAt - leadMs;
 }
 
+// The tools whose remote scripts take a "manipulate the stock market" argument, and where that argument sits in their args
+// (see getFlagsArgs: the flags follow [0: Target, 1: DesiredStartTime, 2: Duration, 3: Description]).
+const stockManipulatingTools = ["hack", "manualhack", "grow"];
+const stockManipulationArgIndex = 4;
+
+/** HC-1: a queued task's stock-manipulation flag was decided when it was planned, but our position may have reversed before it launches.
+ * Returns a copy of `args` with the flag set to `manipulate`, or `args` itself for tools that carry no such flag (a weaken task's
+ * args[4] is its "disable warnings" flag, which must not be overwritten).
+ * @param {string} toolShortName @param {any[]} args @param {boolean} manipulate */
+export function withStockManipulationFlag(toolShortName, args, manipulate) {
+    if (!stockManipulatingTools.includes(toolShortName) || args.length <= stockManipulationArgIndex) return args;
+    const updated = args.slice();
+    updated[stockManipulationArgIndex] = manipulate ? 1 : 0;
+    return updated;
+}
+
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
@@ -764,7 +780,10 @@ export async function main(ns) {
         batchQueue = pending;
         let failures = 0;
         for (const task of due) {
-            const ok = await arbitraryExecution(ns, getTool(task.toolShortName), task.threads, task.args, undefined, undefined, task.allowSplit, task.threadsByCores);
+            // HC-1: our stock position may have reversed since this task was planned. Running scripts can only be killed for that
+            // (see terminateScriptsManipulatingStock); a task that has not launched yet we simply re-flag from the current position.
+            const args = withStockManipulationFlag(task.toolShortName, task.args, shouldManipulateStock(task.toolShortName, task.target.name));
+            const ok = await arbitraryExecution(ns, getTool(task.toolShortName), task.threads, args, undefined, undefined, task.allowSplit, task.threadsByCores);
             if (ok == false) {
                 failures++;
                 if (verbose || failures == 1)
@@ -1632,6 +1651,13 @@ export async function main(ns) {
             `\n  Grow - End: ${formatDateTime(schedule.growEnd)}  Start: ${formatDateTime(schedule.growStart)}  Time: ${formatDuration(currentTarget.timeToGrow())}` +
             `\n  Weak2- End: ${formatDateTime(schedule.secondWeakenEnd)}  Start: ${formatDateTime(schedule.secondWeakenStart)}  Time: ${formatDuration(currentTarget.timeToWeaken())}`);
 
+    /** Whether a hack/grow task against this target should currently manipulate the stock market (a live read of our positions,
+     * which updateStockPositions refreshes once per loop).
+     * @param {string} toolName @param {string} target */
+    function shouldManipulateStock(toolName, target) {
+        return stockMode && (["hack", "manualhack"].includes(toolName) && shouldManipulateHack[target] || toolName == "grow" && shouldManipulateGrow[target]);
+    }
+
     /** Produce additional args based on the hack tool name and command line flags set */
     function getFlagsArgs(toolName, target, allowLooping = true, overrideSilentMisfires = undefined) {
         const args = []
@@ -1639,7 +1665,7 @@ export async function main(ns) {
             // Must disable misfire alerts in BNs where hack income is disabled because the money gained will always return 0
             (toolName == "hack" && (bitNodeMults.ScriptHackMoneyGain * bitNodeMults.ScriptHackMoney == 0));
         if (["hack", "grow"].includes(toolName)) // Push an arg used by remote hack/grow tools to determine whether it should manipulate the stock market
-            args.push(stockMode && (toolName == "hack" && shouldManipulateHack[target] || toolName == "grow" && shouldManipulateGrow[target]) ? 1 : 0);
+            args.push(shouldManipulateStock(toolName, target) ? 1 : 0);
         args.push(overrideSilentMisfires ?? (silentMisfires ? 1 : 0)); // Optional arg to disable toast warnings about e.g. a failed hack or early grow/weaken
         args.push(allowLooping && loopingMode ? 1 : 0); // Argument to indicate whether the cycle should loop perpetually
         return args;
@@ -2265,9 +2291,10 @@ export async function main(ns) {
     }
 
     // Kills all scripts running the specified tool and targeting one of the specified servers if stock market manipulation is enabled
+    // (HC-1: only *running* scripts need killing - queued tasks are re-flagged from the current position when launchDueTasks execs them)
     async function terminateScriptsManipulatingStock(ns, servers, toolName) {
         const processes = await Promise.all(allHostNames.flatMap(hostname => processList(ns, hostname, false)));
-        const stockManipArgIdx = 4; // TODO: This is unmaintanable AF
+        const stockManipArgIdx = stockManipulationArgIndex; // TODO: This is unmaintanable AF
         const problematicProcesses = processes.filter(process => servers.includes(process.args[0]) &&
             (loopingMode || toolName == process.filename && process.args.length > stockManipArgIdx && process.args[stockManipArgIdx]));
         const problematicProcessesIds = problematicProcesses.map(process => process.pid);
