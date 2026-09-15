@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseCmd, emptyState, encodeMsg, WORKER_RAM } from "../darknet/lib.js";
 import {
-    applyMessage, assignStasis, buildCmd, currentLab, drainPort, launchWalkers,
+    applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
     loadState, planLabyrinth, planLoot, planPromotions, saveState,
 } from "../darknet.js";
 
@@ -373,4 +373,37 @@ test("loot mode pins the biggest host first, then the deepest ones", () => {
         shallowFat: { depth: 2, maxRam: 128 },
     });
     assert.deepEqual(planLoot(ns, state, baseOptions, 10).stasisTargets, ["base", "deep", "mid"]);
+});
+
+// DN-F4: a completed migration re-places the server in [difficulty - 2, difficulty + 4]
+// (effects.ts induceServerMigration -> moveDarknetServer(server, 2, 4), whose startingDepth
+// defaults to server.difficulty), wherever it currently sits. So the air-gap candidates are
+// the hosts whose difficulty reaches past the gap, not the ones sitting just above it.
+test("planLabyrinth picks air-gap migration targets by difficulty, strongest first", () => {
+    const ns = makeNs({ charisma: 600, details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
+    const state = makeState({
+        shallow: { depth: 7, difficulty: 3, neighbours: ["charger"] },   // depth 7 but 3 + 4 = 7 never reaches row 9
+        deep: { depth: 6, difficulty: 5, neighbours: ["charger"] },      // 5 + 4 = 9 > 8: can land past the gap
+        best: { depth: 5, difficulty: 7, neighbours: ["charger"] },      // reaches row 11
+        charger: { depth: 6, difficulty: 4, neighbours: ["shallow", "deep", "best"] },
+    });
+    state.labs.completed = ["th3_l4byr1nth"];
+    assert.equal(currentLab(ns, state).host, "cru3l_l4byr1nth");
+
+    const plan = planLabyrinth(ns, state, baseOptions, 600);
+    assert.deepEqual(Object.keys(plan.migrationTargets), ["best", "deep"], "ordered by difficulty so the chargers go to the best candidate first");
+    assert.deepEqual(plan.migrationTargets.best, ["charger"]);
+    assert.equal(buildCmd(state, plan, "charger").migrateTarget, "best");
+});
+
+test("chooseMode counts a charging migration by the same difficulty rule", () => {
+    const ns = makeNs({ charisma: 600, details: { cru3l_l4byr1nth: { isOnline: true, depth: 12 } } });
+    const state = makeState({ deep: { depth: 5, difficulty: 5, neighbours: [] } });
+    state.labs.completed = ["th3_l4byr1nth"];
+    const options = { ...baseOptions, mode: "balanced" };
+    assert.equal(chooseMode(ns, state, options, 600), "loot");
+    state.servers.deep.migrationCharge = 0.5; state.servers.deep.migrationChargeAt = Date.now();
+    assert.equal(chooseMode(ns, state, options, 600), "labyrinth");
+    state.servers.deep.difficulty = 3;
+    assert.equal(chooseMode(ns, state, options, 600), "loot", "a charge that cannot cross the gap does not count");
 });

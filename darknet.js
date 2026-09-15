@@ -650,6 +650,15 @@ export function currentLab(ns, state) {
     return { host: lab.host, cha: lab.cha, depth };
 }
 
+/** A completed migration re-places the server anywhere in [difficulty - 2, difficulty + 4]
+ * (src/DarkNet/effects/effects.ts induceServerMigration -> moveDarknetServer(server, 2, 4), whose
+ * startingDepth defaults to server.difficulty), whatever depth it currently sits at. So a host
+ * can only ever land past an air-gap row if its difficulty reaches beyond that row. */
+const MIGRATION_MAX_DEPTH_INCREASE = 4;
+function canCrossAirGap(entry, row) {
+    return (Number(entry.difficulty) || 0) + MIGRATION_MAX_DEPTH_INCREASE > row;
+}
+
 /** Labyrinth mode: pin the chain next to the lab and push migrations across the air gaps.
  * @param {NS} ns */
 export function planLabyrinth(ns, state, options, charisma = 0) {
@@ -684,8 +693,10 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     for (const row of AIR_GAP_ROWS) {
         if (row >= lab.depth) continue;
         if (online.some(([, entry]) => (Number(entry.depth) || 0) > row)) continue;   // gap already crossed
-        for (const [name, entry] of online) {
-            if ((Number(entry.depth) || 0) !== row - 1) continue;
+        // Strongest candidate first: buildCmd gives a charger to the first target that lists it.
+        const candidates = online.filter(([, entry]) => canCrossAirGap(entry, row))
+            .sort((a, b) => (Number(b[1].difficulty) || 0) - (Number(a[1].difficulty) || 0));
+        for (const [name, entry] of candidates) {
             const chargers = (entry.neighbours ?? []).filter(charger => reachable.includes(charger));
             if (chargers.length) plan.migrationTargets[name] = chargers;
         }
@@ -715,7 +726,7 @@ export function chooseMode(ns, state, options, charisma = 0) {
     const charging = Object.entries(state.servers).some(([name, entry]) => entry.online && !isLabHost(name)
         && (Number(entry.migrationCharge) || 0) > 0
         && now - (Number(entry.migrationChargeAt) || 0) < MIGRATION_CHARGE_TTL
-        && AIR_GAP_ROWS.some(row => row < lab.depth && (Number(entry.depth) || 0) === row - 1));
+        && AIR_GAP_ROWS.some(row => row < lab.depth && canCrossAirGap(entry, row)));
     return charging ? "labyrinth" : "loot";
 }
 
