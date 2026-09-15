@@ -105,6 +105,7 @@ export async function main(ns) {
             plan.stormHost = planStorm(state, options, plan);
 
             state.plan.stasisTargets = plan.stasisTargets;
+            state.plan.stasisRelease = plan.stasisRelease;
             state.plan.migrationTargets = plan.migrationTargets;
             state.plan.promoteSymbols = plan.promoteSymbols;
             state.plan.charismaGoal = plan.charismaGoal;
@@ -130,11 +131,17 @@ export async function main(ns) {
 
 // ---------------------------------------------------------------- state
 
-/** Read `state.txt`, falling back to `state.bak.txt`, then to a fresh state.
- * `resetTime` is `ns.getResetInfo().lastAugReset`; a mismatch means a prestige wiped the darknet.
+/** Read `state.txt`, falling back to `state.bak.txt`, then to `state.tmp.txt`, then to a fresh
+ * state. `resetTime` is `ns.getResetInfo().lastAugReset`; a mismatch means a prestige wiped the
+ * darknet.
+ *
+ * `state.tmp.txt` is the first of the three files `saveState` writes, so it is the newest copy
+ * on disk and the only one that survives a crash between the tmp write and the live write. It
+ * is read last because it is also the one most likely to be a partial write -- `safeParse` plus
+ * the `version` check below is what rejects that case.
  * @param {NS} ns */
 export function loadState(ns, resetTime) {
-    for (const path of [FILES.state, FILES.stateBak]) {
+    for (const path of [FILES.state, FILES.stateBak, FILES.stateTmp]) {
         const parsed = safeParse(ns.read(path), null);
         if (!parsed || typeof parsed !== "object" || parsed.version !== 1) continue;
         if (parsed.resetTime !== resetTime) {
@@ -160,6 +167,7 @@ function fillState(parsed, resetTime) {
     merged.plan = { ...fresh.plan, ...(parsed.plan ?? {}) };
     merged.stats = { ...fresh.stats, ...(parsed.stats ?? {}) };
     if (!merged.stats.cracks || typeof merged.stats.cracks !== "object") merged.stats.cracks = {};
+    if (!merged.stats.sessionFailures || typeof merged.stats.sessionFailures !== "object") merged.stats.sessionFailures = {};
     return merged;
 }
 
@@ -224,7 +232,7 @@ function bumpCrackStats(state, modelId, won, attempts) {
     state.stats.cracks[key] = row;
 }
 
-function applyMessage(state, msg) {
+export function applyMessage(state, msg) {
     const ts = Number(msg.ts) || Date.now();
     const host = msg.host ?? msg.from;
     switch (msg.type) {
@@ -288,8 +296,20 @@ function applyMessage(state, msg) {
             } else if (msg.stale && state.passwords[host]) {
                 state.passwords[host].stale = true;
             }
-            if (String(msg.reason ?? "").includes("charisma") && msg.chaReq !== undefined) entry.chaReq = msg.chaReq;
-            bumpCrackStats(state, msg.modelId ?? entry.modelId, !!msg.success, msg.attempts);
+            const reason = String(msg.reason ?? "");
+            if (reason.includes("charisma") && msg.chaReq !== undefined) entry.chaReq = msg.chaReq;
+            // Why the last attempt on this host ended, whatever kind of attempt it was. Without
+            // it a host that never gets cracked gives the player nothing to go on.
+            if (reason) entry.lastReason = reason;
+            else if (msg.success) entry.lastReason = "solved";
+            // A refused connectToSession says nothing about the model's solver, so it must not
+            // pollute the per-model crack scoreboard (it would show every model as failing on
+            // any host whose password went stale). It gets its own per-host counter instead.
+            if (reason.startsWith("session:")) {
+                state.stats.sessionFailures[host] = (Number(state.stats.sessionFailures[host]) || 0) + 1;
+            } else {
+                bumpCrackStats(state, msg.modelId ?? entry.modelId, !!msg.success, msg.attempts);
+            }
             break;
         }
         case "freed": {
@@ -459,7 +479,7 @@ function commandable(state) {
 }
 
 /** Up to 3 held stock symbols to promote, strongest forecast first. Empty when nothing is held. */
-function planPromotions(ns, options) {
+export function planPromotions(ns, options) {
     if (options["no-promote"]) return [];
     const parsed = safeParse(ns.read(STOCK_PROBABILITIES), null);
     if (!parsed || typeof parsed !== "object") return [];
@@ -489,21 +509,29 @@ function planCharismaGoal(state, charisma, lab) {
     return goal;
 }
 
-/** Keep existing stasis links where they are still wanted, then fill the remaining slots. */
-function assignStasis(ns, candidates) {
+/** Keep existing stasis links where they are still wanted, then fill the remaining slots, and
+ * record the links this plan gives up in `plan.stasisRelease`.
+ *
+ * The budget counts only the links we intend to KEEP. Every other link the game still holds is
+ * one this plan releases -- `buildCmd` sends those hosts `stasis: false` and their agent runs
+ * `stasis.js --unlink` (spec section 7) -- so reserving slots for them would permanently shrink
+ * the plan down to whatever stale links happened to exist. */
+export function assignStasis(ns, plan, candidates) {
     const limit = ns.dnet.getStasisLinkLimit();
     const linked = ns.dnet.getStasisLinkedServers().filter(name => !isLabHost(name));
     const kept = linked.filter(name => candidates.includes(name));
-    const wasted = linked.length - kept.length;    // links the game still holds on servers we no longer want
-    const budget = Math.max(0, limit - wasted);
+    const budget = Math.max(0, limit - kept.length);
     const rest = candidates.filter(name => !kept.includes(name));
-    return [...kept, ...rest].slice(0, budget);
+    const targets = [...kept, ...rest.slice(0, budget)];
+    plan.stasisRelease = linked.filter(name => !targets.includes(name));
+    return targets;
 }
 
 function basePlan(ns, state, options, charisma) {
     return {
         mode: "loot",
         stasisTargets: [],
+        stasisRelease: [],          // hosts holding a link this plan no longer wants (stasis: false)
         migrationTargets: {},
         promoteSymbols: planPromotions(ns, options),
         charismaGoal: 0,
@@ -535,7 +563,7 @@ export function planLoot(ns, state, options, charisma = 0) {
             && entry.isStationary !== true && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
-    plan.stasisTargets = assignStasis(ns, freed);
+    plan.stasisTargets = assignStasis(ns, plan, freed);
 
     const reachable = commandable(state);
     for (const [name, entry] of Object.entries(state.servers)) {
@@ -645,7 +673,7 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
         .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && reachable.includes(name))
         .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
         .map(([name]) => name);
-    plan.stasisTargets = assignStasis(ns, adjacent.length ? adjacent : deepest);
+    plan.stasisTargets = assignStasis(ns, plan, adjacent.length ? adjacent : deepest);
 
     for (const row of AIR_GAP_ROWS) {
         if (row >= lab.depth) continue;
@@ -732,6 +760,9 @@ export function buildCmd(state, plan, host) {
         },
         migrateTarget,
         promoteSymbols: plan.promoteSymbols,
+        // Two-way (spec section 7): true keeps/creates the link on a host the plan still wants,
+        // false tells a host that holds a link the plan no longer wants to release it. The
+        // agent only acts on a change, so a host that is neither linked nor wanted does nothing.
         stasis: plan.stasisTargets.includes(host),
         "share": walking ? false : plan.shareActive,
         storm: plan.stormHost === host,
@@ -990,7 +1021,9 @@ export function printStatus(ns, state, options) {
         `phish successes: ${formatNumberShort(state.stats.phishSuccesses ?? 0, 6, 0)}  |  promote calls: ${formatNumberShort(state.stats.promoteCalls ?? 0, 6, 0)}`,
         `lab: ${lab ? `${lab.host} (depth ${lab.depth}, cha ${lab.cha})` : "none"}  |  completed ${state.labs.completed.length}  |  walkers ${state.labs.walkers.map(walker => `${walker.host}@${walker.steps ?? 0}`).join(", ") || "(none)"}`,
         `lab reward queued: ${state.labs.rewardQueuedAt ? new Date(state.labs.rewardQueuedAt).toLocaleTimeString() : "no"}  |  lab password: ${lab && state.passwords[lab.host] ? "known" : "unknown"}  |  charisma gate: ${state.labs.charismaBlocked ? `${state.labs.charismaBlocked.chaReq ?? "?"} reported` : "clear"}`,
-        `stasis links: ${linked.join(", ") || "(none)"}  (planned: ${state.plan.stasisTargets.join(", ") || "none"})`,
+        `stasis links: ${linked.join(", ") || "(none)"}  (planned: ${state.plan.stasisTargets.join(", ") || "none"}, releasing: ${(state.plan.stasisRelease ?? []).join(", ") || "none"})`,
+        `session failures: ${Object.entries(state.stats.sessionFailures ?? {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => `${name}x${count}`).join(" ") || "(none)"}`,
+        `last failures: ${names.filter(name => state.servers[name].lastReason).slice(0, 5).map(name => `${name}:${state.servers[name].lastReason}`).join("  ") || "(none)"}`,
         `migration targets: ${Object.entries(state.plan.migrationTargets ?? {}).map(([name, chargers]) => `${name}<-${chargers.length}`).join(" ") || "(none)"}`,
         `promote symbols: ${state.plan.promoteSymbols.join(", ") || "(none)"}  |  share active: ${state.plan.shareActive}`,
         `charisma goal: ${state.plan.charismaGoal || "(none)"}`,

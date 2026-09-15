@@ -136,7 +136,7 @@ export async function main(ns) {
     ns.disableLog("ALL");
     const options = getConfiguration(ns, argsSchema);
     if (!options) return;
-    const labHost = String(ns.args[0] ?? "");
+    const labHost = String(options._[0] ?? "");
     if (!labHost) return ns.tprint("ERROR: darknet/lab.js needs a labyrinth hostname as its first argument.");
     const me = ns.getHostname();
     const port = options.port;

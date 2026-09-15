@@ -14,6 +14,10 @@ export const FILES = {
     stateBak: "darknet/state.bak.txt",
     passwords: "darknet/passwords.txt",
     cmd: "darknet/cmd.txt",
+    // Written by the agent on its own server: "1" while this host holds a stasis link, "0"
+    // once it has released one. A content marker, not an existence marker, because the
+    // controller can command both directions (see darknet/agent.js).
+    stasisMark: "darknet/stasis-done.txt",
     charismaGoal: "/Temp/darknet-charisma-goal.txt",
     shareActive: "/Temp/share-active.txt",
 };
@@ -103,7 +107,9 @@ export function emptyState(resetTime) {
         version: 1, resetTime, mode: "balanced", passwords: {}, servers: {},
         labs: { current: null, walkers: [], rewardQueuedAt: null, completed: [] },
         plan: { stasisTargets: [], migrationTargets: {}, promoteSymbols: [], charismaGoal: 0, shareActive: false },
-        stats: { cracks: {}, ramFreed: 0, cachesOpened: 0, moneyFromCaches: 0, phishMoney: 0 },
+        // `cracks` counts real crack.js outcomes per model; `sessionFailures` counts
+        // connectToSession refusals per host, which say nothing about a model's solver.
+        stats: { cracks: {}, sessionFailures: {}, ramFreed: 0, cachesOpened: 0, moneyFromCaches: 0 },
     };
 }
 

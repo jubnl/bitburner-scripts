@@ -960,7 +960,7 @@ export async function main(ns) {
                 const shouldShare = failed.length <= 0 && utilizationPercent < maxShareUtilization && // Only share RAM if we have succeeded in all hack cycle scheduling and have RAM to space
                     (Date.now() - lastShareTime) > options['share-cooldown'] && // Respect the share rate-limit if configured to leave gaps for scheduling
                     options['share'] !== false && options['no-share'] !== true &&
-                    (options['share'] === true || network.totalMaxRam > 1024) // If not explicitly enabled or disabled, auto-enable share at 1TB of network RAM
+                    (options['share'] === true || network.totalMaxRam > 1024); // If not explicitly enabled or disabled, auto-enable share at 1TB of network RAM
                 // Let other scripts (e.g. darknet.js) know whether we're currently sharing spare RAM, so they can decide whether to share their own spare RAM too.
                 ns.write("/Temp/share-active.txt", String(shouldShare), "w");
                 if (shouldShare) {

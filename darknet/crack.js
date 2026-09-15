@@ -8,7 +8,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 /** @param {NS} ns */
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
-    const target = String(ns.args[0] ?? ""); if (!target) return ns.tprint("crack.js: missing target host");
+    const target = String(options._[0] ?? ""); if (!target) return ns.tprint("crack.js: missing target host");
     const me = ns.getHostname(), pid = ns.pid;
     const send = (payload) => { const line = encodeMsg("crack", me, pid, payload); if (!ns.tryWritePort(options.port, line)) ns.print(`WARN: port full, dropped: ${line}`); };
     const details = ns.dnet.getServerDetails(target);

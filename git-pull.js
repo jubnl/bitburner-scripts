@@ -7,7 +7,7 @@ const argsSchema = [
     ['new-file', []], // If a repository listing fails, only files returned by ns.ls() will be downloaded. You can add additional files to seek out here.
     ['subfolder', ''], // Can be set to download to a sub-folder that is not part of the remote repository structure
     ['extension', ['.js', '.ns', '.txt', '.script']], // Files to download by extension
-    ['omit-folder', ['Temp/']], // Folders to omit when getting a list of files to update (TODO: This may be obsolete now that we get a list of files from github itself.)
+    ['omit-folder', ['Temp/', 'test/']], // Folders to omit when getting a list of files to update (TODO: This may be obsolete now that we get a list of files from github itself.) 'test/' holds Node-only test files that the game never runs.
 ];
 
 export function autocomplete(data, args) {

@@ -7,7 +7,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 /** @param {NS} ns */
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
-    const me = ns.getHostname(), target = String(ns.args[0] ?? me) === "self" ? me : String(ns.args[0] ?? me);
+    const me = ns.getHostname(), asked = String(options._[0] ?? me), target = asked === "self" ? me : asked;
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("freed", me, ns.pid, p));
     let calls = 0, freed = 0, before = ns.dnet.getBlockedRam(target);
     while (ns.dnet.getBlockedRam(target) > 0) {

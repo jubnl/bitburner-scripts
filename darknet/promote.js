@@ -9,7 +9,12 @@ export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
     const me = ns.getHostname();
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("worker", me, ns.pid, p));
-    const symbols = ns.args.map(s => String(s));
+    // Positional args only: ns.args still contains the flags (ns.flags does not consume them),
+    // so ns.args.map(String) would hand promoteStock("--port") and crash the worker on its
+    // first call. getConfiguration returns ns.flags' output, whose `_` holds exactly the
+    // positional arguments the controller's agent passed (the stock symbols).
+    const symbols = (options._ ?? []).map(s => String(s));
+    if (!symbols.length) return ns.print("promote.js: no symbols given, nothing to promote");
     let calls = 0;
     let idx = 0;
     while (true) {

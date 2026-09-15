@@ -8,7 +8,7 @@ export function autocomplete(data) { data.flags(argsSchema); return []; }
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema); if (!options) return;
     const me = ns.getHostname();
-    const target = String(ns.args[0] ?? me);
+    const target = String(options._[0] ?? me);
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("worker", me, ns.pid, p));
     let calls = 0;
     while (true) {
