@@ -1,4 +1,4 @@
-import { log, getConfiguration, instanceCount, disableLogs, getActiveSourceFiles, getNsDataThroughFile, runCommand, formatMoney, formatDuration } from './helpers.js'
+import { log, getConfiguration, instanceCount, disableLogs, getActiveSourceFiles, getNsDataThroughFile, runCommand, formatMoney, formatDuration, getErrorInfo } from './helpers.js'
 
 const argsSchema = [
     ['min-shock-recovery', 97], // Minimum shock recovery before attempting to train or do crime (Set to 100 to disable, 0 to recover fully)
@@ -51,6 +51,7 @@ let task, lastStatusUpdateTime, lastPurchaseTime, lastPurchaseStatusUpdate, avai
 let numSleeves, ownedSourceFiles, playerInGang, playerGangFaction, playerInBladeburner, bladeburnerCityChaos, bladeburnerContractChances, bladeburnerContractCounts, followPlayerSleeve;
 let sleeveExpDisabled = false; // bitNodeOptions.disableSleeveExpAndAugmentation: sleeves gain no exp and cannot buy augs
 let factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = []; // Factions other sleeves can work for (item 9)
+let factionBySleeve = {}; // Sleeve index -> faction it was last successfully set to work for (setToFactionWork throws if another sleeve still works there)
 const factionWorkRefreshInterval = 5 * 60 * 1000; // How often to recompute which factions still need rep
 let options;
 // Sleeve -> bladeburner contract assignment (each contract type can only be performed by one sleeve at a time)
@@ -71,7 +72,7 @@ export async function main(ns) {
     task = [], lastStatusUpdateTime = [], lastPurchaseTime = [], lastPurchaseStatusUpdate = [], availableAugs = [],
         cacheExpiry = [], shockChance = [], lastRerollTime = [], bladeburnerCooldown = [], lastSleeveHp = [], lastSleeveShock = [];
     workByFaction = {}, cachedCrimeStats = {}, factionWorkUnsupported = {};
-    factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = [];
+    factionWorkCandidates = [], factionWorkCandidatesExpiry = 0, factionsTakenThisLoop = [], factionBySleeve = {};
     playerInGang = playerInBladeburner = false;
     playerGangFaction = null;
     // Ensure we have access to sleeves
@@ -416,7 +417,14 @@ async function pickSleeveTask(ns, playerInfo, playerWorkInfo, i, sleeve, canTrai
     // Each faction accepts one sleeve (src/NetscriptFunctions/Sleeve.ts setToFactionWork), so up to --max-faction-sleeves sleeves can each work
     // for a different joined faction that still needs rep for augmentations (lowest rep first). Rep earned is scaled by (100 - shock)%.
     if (sleeve.shock <= options['faction-work-max-shock'] && factionsTakenThisLoop.length < options['max-faction-sleeves']) {
-        const faction = factionWorkCandidates.find(f => !factionsTakenThisLoop.includes(f) && !factionWorkUnsupported[f]);
+        // Keep a sleeve on the faction it already works for, and never hand another sleeve's current faction to this one: the game throws
+        // (src/NetscriptFunctions/Sleeve.ts setToFactionWork "Sleeve X cannot work for faction F because Sleeve Y is already working for them")
+        // and the candidate list is re-sorted by rep every refresh, so a naive "first free candidate" pick can swap two sleeves' factions
+        // and make both assignments fail (which setSleeveTask would otherwise misread as the work type being unsupported).
+        const isFree = f => !factionsTakenThisLoop.includes(f) && !factionWorkUnsupported[f] &&
+            !Object.entries(factionBySleeve).some(([j, held]) => Number(j) != i && held == f);
+        const current = factionBySleeve[i];
+        const faction = (current && factionWorkCandidates.includes(current) && isFree(current)) ? current : factionWorkCandidates.find(isFree);
         if (faction) {
             factionsTakenThisLoop.push(faction);
             return factionWorkTask(i, faction);
@@ -489,18 +497,27 @@ async function crimeTask(ns, crime, i, sleeve, reason) {
  * */
 async function setSleeveTask(ns, i, designatedTask, command, args) {
     let strAction = `Set sleeve ${i} to ${designatedTask}`;
+    let failureReason = '';
     try { // Assigning a task can throw an error rather than simply returning false. We must suppress this
         if (await getNsDataThroughFile(ns, command, `/Temp/sleeve-${command.slice(10, command.indexOf("("))}.txt`, args)) {
             task[i] = designatedTask;
+            if (designatedTask.startsWith('work for faction')) factionBySleeve[i] = args[1]; else delete factionBySleeve[i];
             log(ns, `SUCCESS: ${strAction}`);
             return true;
         }
-    } catch { }
+    } catch (err) { failureReason = getErrorInfo(err); }
     // If assigning the task failed...
     lastRerollTime[i] = 0;
     // If working for a faction, it's possible he current work isn't supported, so try the next one.
     if (designatedTask.startsWith('work for faction')) {
         const faction = args[1]; // Hack: Not obvious, but the second argument will be the faction name in this case.
+        delete factionBySleeve[i]; // Whatever the reason, this sleeve is not working for the faction
+        // A faction only accepts one sleeve at a time (src/NetscriptFunctions/Sleeve.ts setToFactionWork). That failure is transient
+        // (e.g. this script was restarted while another sleeve still works there) and says nothing about the work type, so don't blacklist.
+        if (failureReason.includes('is already working for them')) {
+            log(ns, `INFO: Failed to ${strAction} because another sleeve is still working for ${faction}. Will retry once it has been reassigned.`);
+            return false;
+        }
         let nextWorkIndex = (workByFaction[faction] || 0) + 1;
         if (nextWorkIndex >= works.length) {
             log(ns, `WARN: Failed to ${strAction}. None of the ${works.length} work types appear to be supported. ` +
