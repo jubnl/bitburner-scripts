@@ -380,7 +380,7 @@ export async function main(ns) {
             { name: "gangs.js", shouldRun: () => reqRam(64) && 2 in dictSourceFiles }, // Script to create manage our gang for us
             {
                 name: "work-for-factions.js", args: ['--fast-crimes-only', '--no-coding-contracts'],  // Singularity script to manage how we use our "focus" work.
-                shouldRun: () => 4 in dictSourceFiles && reqRam(256 / (2 ** dictSourceFiles[4]) && !studying) // Higher SF4 levels result in lower RAM requirements
+                shouldRun: () => 4 in dictSourceFiles && reqRam(256 / (2 ** dictSourceFiles[4])) && !studying // Higher SF4 levels result in lower RAM requirements
             },
             {
                 name: "bladeburner.js", // Script to manage bladeburner for us. Run automatically if not disabled and bladeburner API is available
