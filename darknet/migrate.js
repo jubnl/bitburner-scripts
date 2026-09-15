@@ -18,5 +18,5 @@ export async function main(ns) {
         if (result.code !== 200) break;
         calls++;
     }
-    send({ type: "migrate", host: target, calls });
+    send({ kind: "migrate", host: target, calls });
 }

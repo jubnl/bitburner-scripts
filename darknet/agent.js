@@ -35,7 +35,7 @@ export async function main(ns) {
             if (!d.isOnline || passwords[h] !== undefined || cmd.claimed.includes(h) || isLabHost(h)) continue;
             if (ns.isRunning("darknet/crack.js", me, h, "--port", port)) continue;
             const threads = Math.min(cmd.threads.crack || 6, Math.floor(freeRam(ns, me) / WORKER_RAM.crack));
-            if (threads >= 1) { const pid = ns.exec("darknet/crack.js", me, { threads, preventDuplicates: true }, h, "--port", port); dispatch("worker", { type: "crack", host: h, threads, pid }); }
+            if (threads >= 1) { const pid = ns.exec("darknet/crack.js", me, { threads, preventDuplicates: true }, h, "--port", port); dispatch("worker", { kind: "crack", host: h, threads, workerPid: pid }); }
         }
         // 3. spread to known neighbours without an agent
         for (const h of neighbours) {
@@ -47,7 +47,7 @@ export async function main(ns) {
             if (freeRam(ns, h) < 5) { if (d.blockedRam > 0 && !ns.isRunning("darknet/realloc.js", me, h, "--port", port)) spawnRealloc(ns, me, h, cmd, port); continue; }
             ns.scp(AGENT_FILES, h, me); ns.scp([FILES.passwords, FILES.cmd], h, me);
             const pid = ns.exec("darknet/agent.js", h, { threads: 1, preventDuplicates: true }, "--port", port);
-            dispatch("worker", { type: "agent", host: h, pid });
+            dispatch("worker", { kind: "agent", host: h, workerPid: pid });
         }
         // 4. spend free RAM: realloc self, migrate, promote, share, phish
         if (ns.dnet.getBlockedRam(me) > 0 && !ns.isRunning("darknet/realloc.js", me, "self", "--port", port)) spawnRealloc(ns, me, "self", cmd, port);
@@ -59,7 +59,7 @@ export async function main(ns) {
             const promoteThreads = Math.min(cmd.threads.promote, Math.floor(freeRam(ns, me) / WORKER_RAM.promote));
             if (promoteThreads >= 1) ns.exec("darknet/promote.js", me, { threads: promoteThreads, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port);
         }
-        if (cmd.storm && ns.fileExists("STORM_SEED.exe", me)) { const r = ns.dnet.unleashStormSeed(); dispatch("worker", { type: "storm", host: me, success: r.success, code: r.code }); }
+        if (cmd.storm && ns.fileExists("STORM_SEED.exe", me)) { const r = ns.dnet.unleashStormSeed(); dispatch("worker", { kind: "storm", host: me, success: r.success, code: r.code }); }
         if (cmd.stasis && !ns.fileExists("darknet/stasis-done.txt", me) && freeRam(ns, me) >= WORKER_RAM.stasis) { ns.exec("darknet/stasis.js", me, 1, "--port", port); ns.write("darknet/stasis-done.txt", "1", "w"); }
         const spare = Math.floor(freeRam(ns, me) / (cmd["share"] ? WORKER_RAM["share"] : WORKER_RAM.phish));
         if (cmd["share"]) { if (spare > 0 && !ns.isRunning("Remote/share.js", me)) ns.exec("Remote/share.js", me, { threads: spare, preventDuplicates: true }); }

@@ -16,6 +16,6 @@ export async function main(ns) {
         const result = await ns.dnet.phishingAttack();
         if (result.success) successes++;
         calls++;
-        if (calls % 20 === 0) send({ type: "phish", host: me, successes });
+        if (calls % 20 === 0) send({ kind: "phish", host: me, successes });
     }
 }

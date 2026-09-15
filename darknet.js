@@ -45,6 +45,7 @@ const PROMOTE_THREADS = 8;
 const MAX_PROMOTE_SYMBOLS = 3;
 const LAB_DEPTH_SLACK = 6;          // balanced mode flips to labyrinth within this many rows of the lab
 const MIGRATION_CHARGE_TTL = 600000; // a migration charge counts as "in flight" for 10 minutes
+const SERVER_TTL = 300000;          // a known server nothing has confirmed for 5 minutes is presumed gone
 const MAX_PORT_DRAIN = 5000;        // hard stop so a flooded port cannot hang the loop
 const MONEY_PATTERN = /\$([\d.]+)([kmbtq]?)/i;
 
@@ -243,16 +244,8 @@ function applyMessage(state, msg) {
             break;
         }
         case "crack": {
-            // Two different senders land here. agent.js announces a claim with
-            // dispatch("worker", {type:"crack", host, threads, pid}) -- encodeMsg spreads the
-            // payload last, so its `type` wins -- while crack.js reports a result, which always
-            // carries `success`. `threads` without `success` therefore means "claim".
-            if (msg.success === undefined && msg.threads !== undefined) {
-                const claimed = upsertServer(state, host, {}, ts);
-                claimed.crackClaimBy = msg.from;
-                claimed.crackClaimAt = ts;
-                break;
-            }
+            // Always a crack.js result (or agent.js's session failure). A claim is a worker
+            // message with kind "crack"; the envelope keeps the two apart.
             const entry = upsertServer(state, host, {
                 modelId: msg.modelId, difficulty: msg.difficulty, chaReq: msg.chaReq,
             }, ts);
@@ -299,11 +292,41 @@ function applyMessage(state, msg) {
             }
             break;
         }
-        // Worker reports. All of them are dispatched as "worker" but override `type` from their
-        // payload (see the note in the "crack" case), so they arrive under their own names.
+        case "worker": {
+            applyWorkerMessage(state, msg, ts, host);
+            break;
+        }
+        case "walker": {
+            // Task 9 owns the walker logic; the controller only records what arrives.
+            const walkers = (state.labs.walkers ?? []).filter(w => w.pid !== msg.pid);
+            if (!msg.done) walkers.push({ host: msg.from, pid: msg.pid, startedAt: ts, lab: msg.lab, steps: msg.steps });
+            state.labs.walkers = walkers;
+            if (msg.done) {
+                state.labs.rewardQueuedAt = ts;
+                if (msg.lab && !state.labs.completed.includes(msg.lab)) state.labs.completed.push(msg.lab);
+                if (msg.lab && msg.password !== undefined) {
+                    state.passwords[msg.lab] = { password: msg.password, modelId: "labyrinth", solvedAt: ts };
+                }
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+/** Worker reports: one envelope type, the worker's own name in `kind`. */
+function applyWorkerMessage(state, msg, ts, host) {
+    switch (msg.kind) {
         case "agent": {
             const entry = upsertServer(state, host, { online: true }, ts);
-            if (msg.pid) entry.agentPid = msg.pid;
+            if (msg.workerPid) entry.agentPid = msg.workerPid;
+            break;
+        }
+        case "crack": {
+            // A claim: this agent has started cracking `host`, so nobody else should.
+            const entry = upsertServer(state, host, {}, ts);
+            entry.crackClaimBy = msg.from;
+            entry.crackClaimAt = ts;
             break;
         }
         case "stasis": {
@@ -338,35 +361,27 @@ function applyMessage(state, msg) {
             if (msg.success) state.plan.lastStormAt = ts;
             break;
         }
-        case "worker": {
-            // A worker report that did not override its type: nothing specific to record.
+        default: {
             upsertServer(state, host, {}, ts);
             break;
         }
-        case "walker": {
-            // Task 9 owns the walker logic; the controller only records what arrives.
-            const walkers = (state.labs.walkers ?? []).filter(w => w.pid !== msg.pid);
-            if (!msg.done) walkers.push({ host: msg.from, pid: msg.pid, startedAt: ts, lab: msg.lab, steps: msg.steps });
-            state.labs.walkers = walkers;
-            if (msg.done) {
-                state.labs.rewardQueuedAt = ts;
-                if (msg.lab && !state.labs.completed.includes(msg.lab)) state.labs.completed.push(msg.lab);
-                if (msg.lab && msg.password !== undefined) {
-                    state.passwords[msg.lab] = { password: msg.password, modelId: "labyrinth", solvedAt: ts };
-                }
-            }
-            break;
-        }
-        default: break;
     }
 }
 
 // ---------------------------------------------------------------- planning
 
+/** Darknet servers vanish silently: the agent only reports hosts `probe` still returns, so a
+ * deleted server keeps its last `online: true`. Anything unconfirmed for SERVER_TTL is presumed
+ * gone; `pushFiles` refreshes `lastSeen` whenever a session proves a host is still there. */
+function isLive(entry, now) {
+    return !!entry && entry.online && now - (Number(entry.lastSeen) || 0) <= SERVER_TTL;
+}
+
 function frontierDepth(state) {
     let deepest = 0;
+    const now = Date.now();
     for (const [name, entry] of Object.entries(state.servers)) {
-        if (!entry.online || isLabHost(name)) continue;
+        if (!isLive(entry, now) || isLabHost(name)) continue;
         deepest = Math.max(deepest, Number(entry.depth) || 0);
     }
     return deepest;
@@ -375,8 +390,9 @@ function frontierDepth(state) {
 /** Hosts we can actually deliver a command file to (online, non-lab, live password). */
 function commandable(state) {
     const out = [];
+    const now = Date.now();
     for (const [name, entry] of Object.entries(state.servers)) {
-        if (!entry.online || isLabHost(name)) continue;
+        if (!isLive(entry, now) || isLabHost(name)) continue;
         const known = state.passwords[name];
         if (!known || known.stale || known.password === undefined) continue;
         out.push(name);
@@ -384,7 +400,7 @@ function commandable(state) {
     return out;
 }
 
-/** Up to 3 stock symbols to promote, preferring positions the player actually holds. */
+/** Up to 3 held stock symbols to promote, strongest forecast first. Empty when nothing is held. */
 function planPromotions(ns, options) {
     if (options["no-promote"]) return [];
     const parsed = safeParse(ns.read(STOCK_PROBABILITIES), null);
@@ -393,8 +409,9 @@ function planPromotions(ns, options) {
     const rows = Array.isArray(parsed)
         ? parsed.map(row => ({ sym: row?.sym, prob: row?.prob, held: (row?.sharesLong ?? 0) + (row?.sharesShort ?? 0) }))
         : Object.entries(parsed).map(([sym, row]) => ({ sym, prob: row?.prob, held: (row?.sharesLong ?? 0) + (row?.sharesShort ?? 0) }));
-    const usable = rows.filter(row => typeof row.sym === "string" && row.sym && Number.isFinite(row.prob));
-    usable.sort((a, b) => (b.held > 0) - (a.held > 0) || Math.abs(b.prob - 0.5) - Math.abs(a.prob - 0.5));
+    // Only symbols the player actually holds: promoting a stock we own nothing of pays nothing.
+    const usable = rows.filter(row => typeof row.sym === "string" && row.sym && Number.isFinite(row.prob) && row.held > 0);
+    usable.sort((a, b) => Math.abs(b.prob - 0.5) - Math.abs(a.prob - 0.5));
     return usable.slice(0, MAX_PROMOTE_SYMBOLS).map(row => row.sym);
 }
 
@@ -448,8 +465,9 @@ export function planLoot(ns, state, options, charisma = 0) {
     const plan = basePlan(ns, state, options, charisma);
     plan.mode = "loot";
 
+    const liveNow = Date.now();
     const freed = Object.entries(state.servers)
-        .filter(([name, entry]) => entry.online && !isLabHost(name) && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
+        .filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name) && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
     plan.stasisTargets = assignStasis(ns, freed);
@@ -468,7 +486,9 @@ export function planLoot(ns, state, options, charisma = 0) {
         if (usable.length) plan.migrationTargets[name] = usable;
     }
 
-    plan.charismaGoal = planCharismaGoal(state, charisma, null);
+    // The charisma goal is "the lowest charisma that unlocks the next blocked action" (spec
+    // section 7), so the lab gate counts even while we are looting.
+    plan.charismaGoal = planCharismaGoal(state, charisma, currentLab(ns, state));
     return plan;
 }
 
@@ -496,7 +516,8 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
         return plan;
     }
 
-    const online = Object.entries(state.servers).filter(([name, entry]) => entry.online && !isLabHost(name));
+    const liveNow = Date.now();
+    const online = Object.entries(state.servers).filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name));
     const adjacent = online
         .filter(([, entry]) => (entry.neighbours ?? []).includes(lab.host))
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
@@ -646,9 +667,14 @@ export function pushFiles(ns, state, plan) {
             if (secret === undefined) continue;
             const session = ns.dnet.connectToSession(host, secret);
             if (!session.success) {
+                // 401: the password no longer works (the server was replaced). 503: the server
+                // is gone entirely -- nothing else ever tells us that, since a deleted host
+                // simply stops appearing in its neighbours' probes.
                 if (session.code === 401 && state.passwords[host]) state.passwords[host].stale = true;
+                if (session.code === 503) { entry.online = false; entry.lastSeen = Date.now(); }
                 continue;
             }
+            entry.lastSeen = Date.now();   // a live session is proof the host still exists
         }
         ns.write(FILES.cmd, JSON.stringify(buildCmd(state, plan, host)), "w");
         if (ns.scp([FILES.passwords, FILES.cmd], host, "home")) delivered++;
@@ -710,7 +736,11 @@ async function stopEverything(ns, state, options) {
             const entry = state.servers[host];
             const secret = state.passwords[host];
             if (!entry || !entry.online || !secret || secret.stale || secret.password === undefined) continue;
-            if (!ns.dnet.connectToSession(host, secret.password).success) continue;
+            const session = ns.dnet.connectToSession(host, secret.password);
+            if (!session.success) {
+                if (session.code === 503) { entry.online = false; entry.lastSeen = Date.now(); }
+                continue;
+            }
         }
         if (ns.scp([FILES.cmd], host, "home")) reached.push(host);
     }
@@ -719,10 +749,9 @@ async function stopEverything(ns, state, options) {
 
     let stopped = 0;
     for (const host of reached) {
-        const agentPid = state.servers[host]?.agentPid;
-        if (!agentPid) continue;
-        if (!ns.isRunning("darknet/agent.js", host, "--port", options.port)) continue;
-        if (ns.kill(agentPid)) stopped++;
+        // By name and args, not by a stored pid: the agent may have been restarted (or the
+        // server bounced) since we recorded it.
+        if (ns.kill("darknet/agent.js", host, "--port", options.port)) stopped++;
     }
     log(ns, `SUCCESS: darknet --kill finished; ${stopped} agent(s) killed after the grace period.`, true, "success");
 }

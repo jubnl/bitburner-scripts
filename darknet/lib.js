@@ -63,8 +63,11 @@ export function isLabHost(host) {
     return host.endsWith("_l4byr1nth");
 }
 
+// The envelope always wins: `type`, `from`, `pid` and `ts` are spread last so a payload key
+// can never shadow them. Worker subtypes therefore travel as `kind`, never as `type`, and a
+// spawned worker's pid travels as `workerPid` (`pid` is always the sender's).
 export function encodeMsg(type, from, pid, payload) {
-    return JSON.stringify({ type, from, pid, ts: Date.now(), ...payload });
+    return JSON.stringify({ ...payload, type, from, pid, ts: Date.now() });
 }
 
 export function decodeMsg(line) {

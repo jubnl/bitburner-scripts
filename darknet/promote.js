@@ -21,6 +21,6 @@ export async function main(ns) {
         await ns.dnet.promoteStock(sym);
         calls++;
         idx++;
-        if (calls % 20 === 0) send({ type: "promote", host: me, calls });
+        if (calls % 20 === 0) send({ kind: "promote", host: me, calls });
     }
 }

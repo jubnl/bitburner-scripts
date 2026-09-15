@@ -10,5 +10,5 @@ export async function main(ns) {
     const me = ns.getHostname();
     const send = (p) => ns.tryWritePort(options.port, encodeMsg("worker", me, ns.pid, p));
     const result = await ns.dnet.setStasisLink(!options.unlink);
-    send({ type: "stasis", host: me, success: result.success, code: result.code });
+    send({ kind: "stasis", host: me, success: result.success, code: result.code });
 }
