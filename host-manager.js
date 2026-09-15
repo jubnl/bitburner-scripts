@@ -224,7 +224,21 @@ async function tryToBuyBestServerPossible(ns) {
                 `and all have the maximum possible RAM (${formatRam(maxPurchasableServerRam)}).`);
         }
 
-        cost -= costByRamExponent[Math.log2(worstServerRam)]
+        // An upgrade only costs the difference between the two sizes (src/Server/ServerPurchases.ts getCloudServerUpgradeCost:
+        // getCloudServerCost(ram) - getCloudServerCost(server.maxRam)), so re-derive the largest size whose *upgrade* price fits the
+        // budget rather than the largest size whose full purchase price does. The game also throws (upgradeServer returns false)
+        // unless the new size is strictly bigger than the current one.
+        const worstExponent = Math.log2(worstServerRam);
+        const upgradeCost = (exponent) => costByRamExponent[exponent] - costByRamExponent[worstExponent];
+        exponentLevel = worstExponent + 1;
+        if (upgradeCost(exponentLevel) > spendableMoney)
+            return setStatus(ns, `${prefix}Upgrading our worst server ${worstServerName} from ${formatRam(worstServerRam)} to ` +
+                `${formatRam(2 ** exponentLevel)} would cost ${formatMoney(upgradeCost(exponentLevel))}, more than our budget of ${formatMoney(spendableMoney)}.`);
+        for (; exponentLevel < maxPurchasableServerRamExponent; exponentLevel++)
+            if (upgradeCost(exponentLevel + 1) > spendableMoney)
+                break;
+        cost = upgradeCost(exponentLevel);
+        maxRamPossibleToBuy = Math.pow(2, exponentLevel);
         isUpgrade = true
         purchasedServer = (await getNsDataThroughFile(ns, `ns.cloud.upgradeServer(ns.args[0], ns.args[1])`, null,
             [worstServerName, maxRamPossibleToBuy])) ? worstServerName : "";
