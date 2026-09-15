@@ -305,6 +305,7 @@ export async function main(ns) {
     let highUtilizationIterations = 0;
     let lastShareTime = 0; // Tracks when share was last invoked so we can respect the configured share-cooldown
     let isDoingFactionWork = true; // HC-4: refreshed every 60 loops from getCurrentWork (share is useless otherwise). Assumed true without SF4.
+    let maxRamRefreshDueAt = 0; // HC-10: when > 0, re-read every server's max RAM at this time (set after ram-manager / host-manager are launched)
     let allTargetsPrepped = false;
 
     /** Ram-dodge getting updated player info.
@@ -738,8 +739,11 @@ export async function main(ns) {
             const timeSinceLastRun = Date.now() - (script.lastRun || 0);
             if (timeSinceLastRun <= script.interval) continue;
             script.lastRun = Date.now(); // Update the last run date whether we successfully ran it or not           
-            if (await tryRunTool(ns, getTool(script))) // Try to run the task
+            if (await tryRunTool(ns, getTool(script))) { // Try to run the task
                 if (++launched > 1) await ns.sleep(1); // If we successfully launch more than 1 script at a time, yeild execution a moment to give them a chance to complete, so many aren't all fighting for temp RAM at the same time.
+                if (script.name.includes('ram-manager.js') || script.name.includes('host-manager.js'))
+                    maxRamRefreshDueAt = Date.now() + 15000; // HC-10: these may upgrade home / a purchased server; pick the new size up shortly after
+            }
         }
 
         // Hack: this doesn't really belong here, but is essentially a "temp script" we periodically run when needed
@@ -914,7 +918,10 @@ export async function main(ns) {
                 for (const server of getAllServers()) server.refreshUsedRam(); // HC-6: one used-RAM snapshot per loop; kept current locally by noteRamUsed
                 await launchDueTasks(ns); // HC-1: exec batch/prep tasks that are due, before any of the slower bookkeeping below
                 await buildServerList(ns, true); // Check if any new servers have been purchased by the external host_manager process
-                await updateCachedServerData(ns); // Update server data that only needs to be refreshed once per loop
+                if (maxRamRefreshDueAt && Date.now() >= maxRamRefreshDueAt) { // HC-10: ram-manager / host-manager ran a moment ago, sizes may have changed
+                    maxRamRefreshDueAt = 0;
+                    await updateCachedServerData(ns);
+                }
                 await updatePortCrackers(ns); // Check if any new port crackers have been purchased
                 await getPlayerInfo(ns); // Force an update of _cachedPlayerInfo               
                 if (!allHelpersRunning && loops % 60 == 0) // If we have not yet launched all helpers see if any are now ready to be run (launch may have been postponed while e.g. awaiting more home ram, or TIX API to be purchased)
@@ -939,6 +946,7 @@ export async function main(ns) {
 
                 if (loops % 60 == 0) { // For more expensive updates, only do these every so often
                     // Pull additional data about servers that infrequently changes
+                    await updateCachedServerData(ns); // HC-10: max RAM (was every loop; it only changes via purchases we trigger, see maxRamRefreshDueAt)
                     await refreshDynamicServerData(ns);
                     // Occassionally print our current targetting order (todo, make this controllable with a flag or custom UI?)
                     if (verbose || loops % 600 == 0) {
@@ -1328,11 +1336,13 @@ export async function main(ns) {
         await refreshDynamicServerData(ns);
     }
 
-    /** Refresh information about servers that should be updated once per loop, but doesn't need to be up-to-the-second.
+    /** Refresh every server's max RAM (one temp script). HC-10: called when a host is added, every 60 loops, and ~15 s after ram-manager.js or
+     * host-manager.js is launched - max RAM only changes through those purchases (src/Server/ServerPurchases.ts, src/NetscriptFunctions/Singularity.ts upgradeHomeRam).
      * @param {NS} ns */
     async function updateCachedServerData(ns) {
         //if (verbose) log(ns, `updateCachedServerData`);
         dictServerMaxRam = await getServersDict(ns, 'getServerMaxRam');
+        resetServerSortCache(); // Sizes may have changed: re-sort by max / free RAM on next use
     }
 
     /** Refresh data that might change rarely over time, but for which having precice up-to-the-minute information isn't critical.
