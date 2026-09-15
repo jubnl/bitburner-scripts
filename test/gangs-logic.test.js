@@ -1,7 +1,7 @@
 // Pure decision helpers of gangs.js (lib/gang-logic.js) checked against the task weights and formulas of src/Gang.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask } from "../lib/gang-logic.js";
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedStat, weightedAscensionGain, pickTrainingTask, referenceTask } from "../lib/gang-logic.js";
 
 // src/Gang/data/tasks.ts:317-332 and :295-311 (no agiWeight on either)
 const terrorism = { hackWeight: 20, strWeight: 20, defWeight: 20, dexWeight: 20, chaWeight: 20, difficulty: 36 };
@@ -65,4 +65,29 @@ test("GG-1: training task follows the weight mass (Terrorism: 60 % combat, 20 % 
     assert.equal(pickTrainingTask(w, 0.81), "Train Charisma");
     assert.equal(pickTrainingTask(taskStatWeights({ hackWeight: 80, chaWeight: 20 })), "Train Hacking"); // Cyberterrorism
     assert.equal(pickTrainingTask(taskStatWeights({ hackWeight: 80, chaWeight: 20 }), 0.9), "Train Charisma");
+});
+
+test("GG-1: referenceTask picks the member's own crime if it is one, else the gang's most common crime (ties broken by first occurrence), else the fallback", () => {
+    const crimes = ["Terrorism", "Human Trafficking"];
+    // Path 1 (a single-member memberNames list is how gangs.js's referenceTaskFor asks "is this member's own task a crime?"):
+    // the member's own crime wins even though the fallback differs from it.
+    assert.equal(referenceTask({ Thug1: "Terrorism" }, ["Thug1"], crimes, "Human Trafficking"), "Terrorism");
+    // ...and if that member isn't on a crime (training, Unassigned, or no entry at all), the fallback is returned.
+    assert.equal(referenceTask({ Thug1: "Train Combat" }, ["Thug1"], crimes, "Human Trafficking"), "Human Trafficking");
+    assert.equal(referenceTask({}, ["Thug1"], crimes, "Human Trafficking"), "Human Trafficking");
+
+    // Path 2 (memberName == null in gangs.js: consider the whole roster, no member's task takes priority): a clear
+    // majority wins regardless of order.
+    const assignedTasks = { Thug1: "Terrorism", Thug2: "Terrorism", Thug3: "Human Trafficking" };
+    assert.equal(referenceTask(assignedTasks, ["Thug1", "Thug2", "Thug3"], crimes, "Terrorism"), "Terrorism");
+
+    // Path 3 (tie-break): with equal counts, the crime whose first occurrence comes first in memberNames order wins,
+    // regardless of which member name happens to be assigned which crime.
+    const tied = { Thug1: "Terrorism", Thug2: "Human Trafficking", Thug3: "Terrorism", Thug4: "Human Trafficking" };
+    assert.equal(referenceTask(tied, ["Thug1", "Thug2", "Thug3", "Thug4"], crimes, "Terrorism"), "Terrorism"); // Terrorism (via Thug1) is seen first
+    assert.equal(referenceTask(tied, ["Thug2", "Thug1", "Thug3", "Thug4"], crimes, "Terrorism"), "Human Trafficking"); // now Human Trafficking (via Thug2) is seen first
+
+    // Path 4 (bootstrap fallback): nobody in the pool is on a crime yet (everyone training or Unassigned).
+    const noCrimes = { Thug1: "Train Combat", Thug2: "Unassigned", Thug3: "Train Hacking" };
+    assert.equal(referenceTask(noCrimes, ["Thug1", "Thug2", "Thug3"], crimes, "Terrorism"), "Terrorism");
 });

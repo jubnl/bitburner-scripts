@@ -2,7 +2,7 @@ import {
     log, getConfiguration, instanceCount, getNsDataThroughFile, getActiveSourceFiles, runCommand, tryGetBitNodeMultipliers,
     formatMoney, formatNumberShort, formatDuration
 } from './helpers.js'
-import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask } from './lib/gang-logic.js'
+import { gangStatKeys, taskStatWeights, equipmentScore, rankEquipment, weightedAscensionGain, pickTrainingTask, referenceTask } from './lib/gang-logic.js'
 
 // Global config
 const updateInterval = 200; // We can improve our timing by updating more often than gang stats do (which is every 2 seconds for stats, every 20 seconds for territory)
@@ -488,14 +488,12 @@ function isNearAscension(memberIndex, memberInfo) {
 
 /** @param {string|null} memberName
  * @returns {string} The crime whose stat weights steer this member's equipment, ascension and training: its own assigned crime, else the gang's
- * most common assigned crime, else the top task of this gang type (nobody is on crime yet, e.g. everyone is training). null = the gang as a whole. */
+ * most common assigned crime, else the top task of this gang type (nobody is on crime yet, e.g. everyone is training). null = the gang as a whole.
+ * Thin wrapper over lib/gang-logic.js's referenceTask: a single-member pool asks "is this member's own task a crime?" (fallback null means "no"),
+ * and if not (or memberName is null), the full roster is asked for the gang's consensus crime, falling back to this gang type's top task. */
 function referenceTaskFor(memberName) {
-    if (memberName != null && crimes.includes(assignedTasks[memberName])) return assignedTasks[memberName];
-    const counts = {};
-    for (const m of myGangMembers)
-        if (crimes.includes(assignedTasks[m])) counts[assignedTasks[m]] = (counts[assignedTasks[m]] || 0) + 1;
-    const mostCommon = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-    return mostCommon ? mostCommon[0] : (isHackGang ? "Cyberterrorism" : "Terrorism");
+    const ownTask = memberName != null ? referenceTask(assignedTasks, [memberName], crimes, null) : null;
+    return ownTask ?? referenceTask(assignedTasks, myGangMembers, crimes, isHackGang ? "Cyberterrorism" : "Terrorism");
 }
 
 /** @param {string|null} memberName
