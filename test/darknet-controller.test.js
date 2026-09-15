@@ -349,3 +349,28 @@ test("launchWalkers holds back below the lab's charisma gate and after a win", (
     assert.deepEqual(launchWalkers(ns, state, planLabyrinth(ns, state, options, LAB_CHA), options), [],
         "one win per reset: the reward has to be installed before the next lab exists");
 });
+
+// ------------------------------------------------------------------ stasis candidates
+
+test("stasis candidates need room for the agent plus the stasis worker", () => {
+    const ns = makeNs({ stasisLimit: 2 });
+    const state = makeState({
+        big: { depth: 1, maxRam: 256 },
+        tiny: { depth: 9, maxRam: 16 },                 // deepest, but stasis.js (13.65 GB) can never launch beside the agent
+        clogged: { depth: 8, maxRam: 64, blockedRam: 50 }, // 14 GB usable: same problem
+    });
+    assert.deepEqual(planLoot(ns, state, baseOptions, 10).stasisTargets, ["big"]);
+    const labNs = makeNs({ stasisLimit: 2, details: { [LAB]: { isOnline: true, depth: 7 } } });
+    assert.deepEqual(planLabyrinth(labNs, state, baseOptions, LAB_CHA).stasisTargets, ["big"], "deepest fallback applies the same floor");
+});
+
+test("loot mode pins the biggest host first, then the deepest ones", () => {
+    const ns = makeNs({ stasisLimit: 3 });
+    const state = makeState({
+        base: { depth: 1, maxRam: 256 },
+        deep: { depth: 6, maxRam: 32 },
+        mid: { depth: 4, maxRam: 64 },
+        shallowFat: { depth: 2, maxRam: 128 },
+    });
+    assert.deepEqual(planLoot(ns, state, baseOptions, 10).stasisTargets, ["base", "deep", "mid"]);
+});

@@ -32,6 +32,9 @@ export const FILES = {
     // controller can command both directions (see darknet/agent.js).
     stasisMark: "darknet/stasis-done.txt",
     charismaGoal: "/Temp/darknet-charisma-goal.txt",
+    // Written by the agent on its own server: "1" asks a running phish.js to exit so the agent
+    // can re-size it next tick (see fillerPlan), "0" once a fresh one has been launched.
+    phishResize: "darknet/phish-resize.txt",
     shareActive: "/Temp/share-active.txt",
 };
 
@@ -181,4 +184,28 @@ export function parseClueText(text, knownHosts) {
     }
 
     return { passwords, contains };
+}
+
+// A stasis link is applied by stasis.js running beside the agent on the host itself, so a host
+// whose usable RAM (max minus the owner's blocked RAM) cannot hold both can never be linked;
+// planning a link there only wastes one of the 1-4 slots forever.
+export const STASIS_HOST_MIN_RAM = WORKER_RAM.agent + WORKER_RAM.stasis;
+export function canHoldStasis(entry) {
+    return (Number(entry?.maxRam) || 0) - (Number(entry?.blockedRam) || 0) >= STASIS_HOST_MIN_RAM;
+}
+
+/** Sizing rule for a filler worker (phish.js) that takes all spare RAM and never resizes
+ * itself. `free` is the host's free RAM right now (the running filler counted as used),
+ * `reserve` the RAM higher-priority work needs next tick (pending cracks, walkers, caches,
+ * stasis), `launched` the thread count the agent last exec'd (0 when unknown).
+ * Returns the threads to launch when nothing runs, or whether the running filler must exit so
+ * it can be re-launched at the right size: it yields when the reserved work no longer fits,
+ * and steps aside when a whole extra thread would fit (RAM freed by a finished worker). */
+export function fillerPlan({ free, reserve, unitRam, running, launched }) {
+    const held = running ? (Number(launched) || 0) * unitRam : 0;
+    const want = Math.max(0, Math.floor((free + held - reserve) / unitRam));
+    if (!running) return { launch: want, resize: false };
+    const starved = free < reserve;
+    const canGrow = (Number(launched) || 0) > 0 && want > launched;
+    return { launch: 0, resize: starved || canGrow };
 }

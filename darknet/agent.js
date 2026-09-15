@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg } from "./lib.js";
+import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg, fillerPlan } from "./lib.js";
 
 /* The darknet agent. One per cracked, online darknet server. It never plans: it executes the
  * command file the controller pushes, reports what it sees, and spreads itself to neighbours.
@@ -33,6 +33,7 @@ export async function main(ns) {
     const sessionFailed = {};                 // host -> the stored password whose session failed, to report it once
     let selfReportedAt = 0;                   // last time we force-reported ourselves regardless of change
     const notifiedFiles = new Set();
+    let phishThreads = 0;                     // threads of the phish.js we last launched (0 = unknown / none)
     const myDetails = ns.dnet.getServerDetails(me);
     dispatch("hello", { host: me, maxRam: ns.getServerMaxRam(me), freeRam: ns.getServerMaxRam(me) - ns.getServerUsedRam(me), depth: myDetails.depth, difficulty: myDetails.difficulty, exes: ns.ls(me, ".exe") });
     while (true) {
@@ -62,7 +63,8 @@ export async function main(ns) {
         let needsCrack = false;
         for (const h of neighbours) {
             const d = detailsByHost[h];
-            if (d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)) { needsCrack = true; break; }
+            if (d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)
+                && !ns.isRunning("darknet/crack.js", me, hostArg(h), "--port", port)) { needsCrack = true; break; }
         }
         // NOTE: `reserve` is deliberately only subtracted from promote/phish/share below.
         // realloc and migrate outrank the crack reservation on purpose: that is the spending
@@ -74,6 +76,14 @@ export async function main(ns) {
         // promote/phish/share so it has somewhere to land once buildCmd's threads.phish = 0 /
         // threads.promote = 0 / share = false empty the host out (may take a loop or two).
         if (cmd.walk && (cmd.walkThreads || 0) >= 1) reserve += cmd.walkThreads * WORKER_RAM.lab;
+        // A cache waiting to be opened and a pending stasis change (either direction) also
+        // outrank filler work: cache.js needs 3.85 GB and stasis.js 13.65 GB beside the agent,
+        // and a phish.js that already took the spare RAM would otherwise block them forever.
+        const hasCache = ns.ls(me, ".cache").length > 0;
+        if (hasCache && !ns.isRunning("darknet/cache.js", me, "--port", port)) reserve += WORKER_RAM.cache;
+        const stasisMark = ns.read(FILES.stasisMark);
+        const stasisPending = (cmd.stasis && stasisMark !== "1") || (!cmd.stasis && stasisMark === "1");
+        if (stasisPending && !ns.isRunning("darknet/stasis.js", me, "--port", port) && !ns.isRunning("darknet/stasis.js", me, "--unlink", "--port", port)) reserve += WORKER_RAM.stasis;
         // 2. crack unknown neighbours
         for (const h of neighbours) {
             const d = detailsByHost[h];
@@ -132,7 +142,6 @@ export async function main(ns) {
         // cmd.stasis to false (a file-*existence* marker could never express that). It is only
         // written after ns.exec actually returned a pid, so a launch that failed for want of
         // RAM is retried next loop instead of being remembered as done.
-        const stasisMark = ns.read(FILES.stasisMark);
         if (freeRam(ns, me) >= WORKER_RAM.stasis) {
             if (cmd.stasis && stasisMark !== "1") {
                 if (ns.exec("darknet/stasis.js", me, { threads: 1, preventDuplicates: true }, "--port", port)) ns.write(FILES.stasisMark, "1", "w");
@@ -141,18 +150,27 @@ export async function main(ns) {
             }
         }
         const spare = Math.floor((freeRam(ns, me) - reserve) / (cmd["share"] ? WORKER_RAM["share"] : WORKER_RAM.phish));
+        const phishRunning = ns.isRunning("darknet/phish.js", me, "--port", port);
+        if (!phishRunning) phishThreads = 0;
         // Both branches are explicitly gated on the command file: share only when the
         // controller says to share, phish only when it actually allotted phish threads. A walk
         // host gets threads.phish = 0 and share = false, so it spawns neither and its spare RAM
         // stays free for the walker.
         if (cmd["share"]) {
             if (spare > 0 && !ns.isRunning("Remote/share.js", me)) ns.exec("Remote/share.js", me, { threads: spare, preventDuplicates: true });
-        } else if (spare > 0 && (cmd.threads.phish || 0) > 0 && !ns.isRunning("darknet/phish.js", me, "--port", port)) {
-            ns.exec("darknet/phish.js", me, { threads: spare, preventDuplicates: true }, "--port", port);
+        } else if ((cmd.threads.phish || 0) > 0) {
+            // share.js exits on its own every 10 s, so the reserve alone re-sizes it; phish.js
+            // runs until told to stop, so the agent asks it to exit whenever it is the wrong size.
+            const sizing = fillerPlan({ free: freeRam(ns, me), reserve, unitRam: WORKER_RAM.phish, running: phishRunning, launched: phishThreads });
+            if (sizing.resize) ns.write(FILES.phishResize, "1", "w");
+            else if (!phishRunning && sizing.launch > 0) {
+                ns.write(FILES.phishResize, "0", "w");
+                if (ns.exec("darknet/phish.js", me, { threads: sizing.launch, preventDuplicates: true }, "--port", port)) phishThreads = sizing.launch;
+            }
         }
         // NOTE: no ns.scriptKill here; phish.js exits on its own once cmd["share"] becomes true.
         // 5. caches and clues
-        if (ns.ls(me, ".cache").length && !ns.isRunning("darknet/cache.js", me, "--port", port) && freeRam(ns, me) >= WORKER_RAM.cache) ns.exec("darknet/cache.js", me, { threads: 1, preventDuplicates: true }, "--port", port);
+        if (hasCache && !ns.isRunning("darknet/cache.js", me, "--port", port) && freeRam(ns, me) >= WORKER_RAM.cache) ns.exec("darknet/cache.js", me, { threads: 1, preventDuplicates: true }, "--port", port);
         for (const f of [...ns.ls(me, ".data.txt"), ...ns.ls(me, ".lit")]) {
             if (notifiedFiles.has(f)) continue; notifiedFiles.add(f);
             const c = parseClueText(ns.read(f), neighbours); dispatch("clue", { host: me, file: f, passwords: c.passwords, contains: c.contains });

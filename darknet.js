@@ -1,5 +1,5 @@
 import { log, getConfiguration, formatMoney, formatRam, formatNumberShort, parseShortNumber, getErrorInfo } from "./helpers.js";
-import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse, hostArg } from "./darknet/lib.js";
+import { AGENT_FILES, AIR_GAP_ROWS, FILES, LABS, PORT_DEFAULT, WORKER_RAM, decodeMsg, emptyState, isLabHost, safeParse, hostArg, canHoldStasis } from "./darknet/lib.js";
 
 /* The darknet controller. Runs on home, owns `darknet/state.txt`, drains the report port,
  * plans loot / labyrinth work and pushes `darknet/passwords.txt` + `darknet/cmd.txt` to every
@@ -549,7 +549,9 @@ function basePlan(ns, state, options, charisma) {
     };
 }
 
-/** Loot mode: stasis-pin the biggest freed servers, migrate only stranded islands, phish the rest.
+/** Loot mode: stasis-pin the biggest host as the phishing base and the deepest others as
+ * permanent footholds (a linked server is backdoored and immune to mutation, so agents can
+ * re-enter the frontier from home after a disconnect), migrate only stranded islands, phish the rest.
  * @param {NS} ns */
 export function planLoot(ns, state, options, charisma = 0) {
     const plan = basePlan(ns, state, options, charisma);
@@ -558,12 +560,16 @@ export function planLoot(ns, state, options, charisma = 0) {
     const liveNow = Date.now();
     // darkweb (the stationary root) and lab hosts are never valid stasis targets, and neither is
     // any host the game itself reports as isStationary (fixed/story servers cannot be moved).
-    const freed = Object.entries(state.servers)
+    // Only hosts that can actually run stasis.js beside the agent (see canHoldStasis).
+    const roomy = Object.entries(state.servers)
         .filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name) && name !== "darkweb"
-            && entry.isStationary !== true && (Number(entry.blockedRam) || 0) === 0 && (Number(entry.maxRam) || 0) > 0)
-        .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
-        .map(([name]) => name);
-    plan.stasisTargets = assignStasis(ns, plan, freed);
+            && entry.isStationary !== true && canHoldStasis(entry));
+    const byRam = [...roomy].sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0));
+    const byDepth = [...roomy].sort((a, b) => ((Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
+        || ((Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0)));
+    const anchor = byRam.length ? byRam[0][0] : null;
+    const candidates = anchor ? [anchor, ...byDepth.map(([name]) => name).filter(name => name !== anchor)] : [];
+    plan.stasisTargets = assignStasis(ns, plan, candidates);
 
     const reachable = commandable(state);
     for (const [name, entry] of Object.entries(state.servers)) {
@@ -665,12 +671,12 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
     // darkweb and any isStationary host are never valid stasis targets (see planLoot); lab hosts
     // are already excluded from `online` above.
     const adjacent = online
-        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry)
             && reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
     const deepest = online
-        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && reachable.includes(name))
+        .filter(([name, entry]) => name !== "darkweb" && entry.isStationary !== true && canHoldStasis(entry) && reachable.includes(name))
         .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
         .map(([name]) => name);
     plan.stasisTargets = assignStasis(ns, plan, adjacent.length ? adjacent : deepest);
