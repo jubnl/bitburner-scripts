@@ -210,9 +210,9 @@ export async function main(ns) {
                     // If pre-4s, do not purchase any stock whose last inversion was too recent, or whose probability is too close to 0.5
                     if (pre4s && (stk.lastInversion < minTickHistory || Math.abs(stk.prob - 0.5) < pre4sBuyThresholdProbability)) continue;
 
-                    // Enforce diversification: Don't hold more than x% of our portfolio as a single stock (as corpus increases, this naturally stops being a limiter)
+                    // Enforce diversification pre-4S only (SM-3): Don't hold more than x% of our portfolio as a single stock (as corpus increases, this naturally stops being a limiter)
                     // Inflate our budget / current position value by a factor of stk.spread_pct to avoid repeated micro-buys of a stock due to the buy/ask spread making holdings appear more diversified after purchase
-                    let budget = Math.min(cash, maxHoldings * (diversification + stk.spread_pct) - stk.positionValue() * (1.01 + stk.spread_pct))
+                    let budget = purchaseBudget(pre4s, cash, maxHoldings, diversification, stk.spread_pct, stk.positionValue());
                     let purchasePrice = stk.bullish() ? stk.ask_price : stk.bid_price; // Depends on whether we will be buying a long or short position
                     let affordableShares = Math.floor((budget - commission) / purchasePrice);
                     let numShares = Math.min(stk.maxShares - stk.ownedShares(), affordableShares);
@@ -224,7 +224,7 @@ export async function main(ns) {
                     let owned = stk.ownedShares() > 0;
                     if (estEndOfCycleValue <= 2 * commission)
                         log(ns, (owned ? '' : `We currently have ${formatNumberShort(stk.ownedShares(), 3, 1)} shares in ${stk.sym} valued at ${formatMoney(stk.positionValue())} ` +
-                            `(${(100 * stk.positionValue() / maxHoldings).toFixed(1)}% of corpus, capped at ${(diversification * 100).toFixed(1)}% by --diversification).\n`) +
+                            `(${(100 * stk.positionValue() / maxHoldings).toFixed(1)}% of corpus${pre4s ? `, capped at ${(diversification * 100).toFixed(1)}% by --diversification` : ''}).\n`) +
                             `Despite attractive ER of ${formatBP(stk.absReturn())}, ${owned ? 'more ' : ''}${stk.sym} was not bought. ` +
                             `\nBudget: ${formatMoney(budget)} can only buy ${numShares.toLocaleString('en')} ${owned ? 'more ' : ''}shares @ ${formatMoney(purchasePrice)}. ` +
                             `\nGiven an estimated ${marketCycleLength - estTick} ticks left in market cycle, less ${stk.timeToCoverTheSpread().toFixed(1)} ticks to cover the spread (${(stk.spread_pct * 100).toFixed(2)}%), ` +
@@ -262,6 +262,15 @@ function getTimeInBitnode() { return Date.now() - resetInfo.lastNodeReset; }
 export function canAffordToBuy(pre4s, money, reserve, corpus, fracB, fracH, commissionCost) {
     if (pre4s) return money / corpus > fracB;
     return money - reserve > fracH * corpus + 2 * commissionCost;
+}
+
+/** SM-3: how much of `cash` may go into one stock this loop. Pre-4S: the --diversification cap (with the spread inflation that avoids
+ * repeated micro-buys). Post-4S the forecast is the exact otlkMag (src/NetscriptFunctions/StockMarket.ts getForecast), so no cap: the
+ * game's maxShares (applied by the caller) is the only position limit.
+ * @param {boolean} pre4s @param {number} cash @param {number} maxHoldings @param {number} diversification @param {number} spreadPct @param {number} positionValue */
+export function purchaseBudget(pre4s, cash, maxHoldings, diversification, spreadPct, positionValue) {
+    if (!pre4s) return cash;
+    return Math.min(cash, maxHoldings * (diversification + spreadPct) - positionValue * (1.01 + spreadPct));
 }
 
 /* A sorting function to put stocks in the order we should prioritize investing in them */
