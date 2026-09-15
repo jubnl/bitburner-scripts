@@ -26,7 +26,7 @@ const argsSchema = [
     ["crack-threads", 6],           // threads each agent may give one crack.js worker
     ["realloc-threads", 50],        // threads each agent may give one realloc.js worker
     ["lab-walkers", 3],             // most darknet/lab.js walkers to keep alive on the current lab
-    ["lab-threads", 6],             // threads per labyrinth walker (threads shorten the auth delay)
+    ["lab-threads", 0],             // cap on threads per labyrinth walker; 0 = every thread that fits on the walk host
     ["allow-webstorm", false],      // permit unleashStormSeed when the frontier has gone stale
     ["no-promote", false],          // never hand stock symbols to promote.js
     ["status", false],              // print a summary and exit
@@ -974,14 +974,19 @@ export function launchWalkers(ns, state, plan, options) {
 
     const wanted = Math.max(0, Math.floor(Number(options["lab-walkers"]) || 0));
     plan.walkLab = lab.host;
-    plan.walkThreads = Math.max(1, Math.floor(Number(options["lab-threads"]) || 1));
+    plan.walkThreads = Math.max(0, Math.floor(Number(options["lab-threads"]) || 0));
+    const cap = plan.walkThreads > 0 ? plan.walkThreads : Infinity;   // 0 = every thread that fits (R7)
     plan.walkHosts = alive.map(walker => walker.host);
     // Max-RAM-based clamp, never the host's current free RAM: a walk host's spare-RAM workers
     // (phish/promote/share) are told to stop in buildCmd and take a loop or two to exit, so free
-    // RAM right now understates what the host will actually have once they do.
+    // RAM right now understates what the host will actually have once they do. A host this plan
+    // pins keeps room for stasis.js (a moved walk host loses the lab), unless that would leave the
+    // walker no thread at all -- then the walk matters more than the link.
     const threadsForHost = (host) => {
         const maxRam = Number(state.servers[host]?.maxRam) || 0;
-        return Math.max(0, Math.min(plan.walkThreads, Math.floor((maxRam - WORKER_RAM.agent - 0.5) / WORKER_RAM.lab)));
+        const fits = (held) => Math.max(0, Math.min(cap, Math.floor((maxRam - WORKER_RAM.agent - 0.5 - held) / WORKER_RAM.lab)));
+        const withStasis = (plan.stasisTargets ?? []).includes(host) ? fits(WORKER_RAM.stasis) : 0;
+        return withStasis >= 1 ? withStasis : fits(0);
     };
     for (const host of plan.walkHosts) plan.walkThreadsByHost[host] = threadsForHost(host);
     if (plan.walkHosts.length >= wanted) return plan.walkHosts;

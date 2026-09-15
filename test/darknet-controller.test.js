@@ -663,3 +663,33 @@ test("a renewed crack claim keeps the host claimed past CLAIM_LIFETIME", () => {
     assert.deepEqual(buildCmd(state, plan, "beta").claimed, ["gamma"], "150 s after launch, renewed 30 s ago");
     assert.deepEqual(buildCmd(state, plan, "alpha").claimed, [], "the claimant itself is never blocked");
 });
+
+// R7: the controller evicts every filler from a walk host but capped the walker at --lab-threads 6, leaving a
+// 128 GB lab-adjacent host ~100 GB idle although threadsFactor = 1/(1+0.2(t-1)) keeps shrinking the lab delay.
+test("launchWalkers gives the walker every thread that fits unless --lab-threads caps it", () => {
+    const ns = makeNs({ charisma: LAB_CHA + 1, stasisLimit: 1, details: { [LAB]: { isOnline: true, depth: 7 } }, maxRam: { fat: 128 } });
+    const state = makeState({ fat: { depth: 6, maxRam: 128, neighbours: [LAB] } });
+    const uncapped = { ...baseOptions, "lab-walkers": 1, "lab-threads": 0 };
+    const plan = planLabyrinth(ns, state, uncapped, LAB_CHA + 1);
+    assert.deepEqual(plan.stasisTargets, ["fat"], "the lab-adjacent host is pinned so the game cannot move it mid-walk");
+    assert.deepEqual(launchWalkers(ns, state, plan, uncapped), ["fat"]);
+    const expected = Math.floor((128 - WORKER_RAM.agent - 0.5 - WORKER_RAM.stasis) / WORKER_RAM.lab);
+    assert.equal(expected, 27);
+    assert.equal(plan.walkThreadsByHost.fat, expected, "everything but the agent, the stasis worker and the slack");
+    assert.equal(buildCmd(state, plan, "fat").walkThreads, expected);
+
+    const capped = { ...baseOptions, "lab-walkers": 1, "lab-threads": 6 };
+    const plan2 = planLabyrinth(ns, state, capped, LAB_CHA + 1);
+    launchWalkers(ns, state, plan2, capped);
+    assert.equal(plan2.walkThreadsByHost.fat, 6, "a positive --lab-threads is a cap");
+});
+
+test("launchWalkers lets the walker win over the stasis hold on a host too small for both", () => {
+    const ns = makeNs({ charisma: LAB_CHA + 1, stasisLimit: 1, details: { [LAB]: { isOnline: true, depth: 7 } }, maxRam: { near: 20 } });
+    const state = makeState({ near: { depth: 6, maxRam: 20, neighbours: [LAB] } });
+    const options = { ...baseOptions, "lab-walkers": 1, "lab-threads": 0 };
+    const plan = planLabyrinth(ns, state, options, LAB_CHA + 1);
+    assert.deepEqual(plan.stasisTargets, ["near"]);
+    launchWalkers(ns, state, plan, options);
+    assert.equal(plan.walkThreadsByHost.near, 3, "20 GB: agent 4.5 + 3 x 3.95; holding 13.65 for stasis would leave 0 threads");
+});
