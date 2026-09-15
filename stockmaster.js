@@ -192,7 +192,9 @@ export async function main(ns) {
             // If we haven't gone above a certain liquidity threshold, don't attempt to buy more stock
             // Avoids death-by-a-thousand-commissions before we get super-rich, stocks are capped, and this is no longer an issue
             // BUT may mean we miss striking while the iron is hot while waiting to build up more funds.
-            if (playerStats.money / corpus > fracB) {
+            // SM-1: post-4S the cash freed by cycle reversals (src/StockMarket/StockMarket.ts: 45% of stocks flip every 75 ticks) must be
+            // redeployed at once, because the freshly reversed stocks have the largest known |p-0.5|; so --fracB only applies pre-4S.
+            if (canAffordToBuy(pre4s, playerStats.money, reserve, corpus, fracB, fracH, commission)) {
                 // Compute the cash we have to spend (such that spending it all on stock would bring us down to a liquidity of fracH)
                 let cash = Math.min(playerStats.money - reserve, maxHoldings - holdings);
                 // If we haven't detected the market cycle (or haven't detected it reliably), assume it might be quite soon and restrict bets to those that can turn a profit in the very-near term.
@@ -248,6 +250,17 @@ async function getPlayerInfo(ns) {
 }
 
 function getTimeInBitnode() { return Date.now() - resetInfo.lastNodeReset; }
+
+/** SM-1: whether the cash on hand justifies a round of purchases this loop.
+ * Pre-4S: the upstream --fracB liquidity gate (cash must be at least fracB of corpus). Post-4S: buy whenever the spendable cash
+ * (money - reserve) exceeds the --fracH cash floor by more than two commissions; the per-stock estEndOfCycleValue check in the
+ * main loop already prevents micro-buys, and a 100k commission is irrelevant once the corpus is in the billions.
+ * @param {boolean} pre4s @param {number} money @param {number} reserve @param {number} corpus
+ * @param {number} fracB @param {number} fracH @param {number} commissionCost */
+export function canAffordToBuy(pre4s, money, reserve, corpus, fracB, fracH, commissionCost) {
+    if (pre4s) return money / corpus > fracB;
+    return money - reserve > fracH * corpus + 2 * commissionCost;
+}
 
 /* A sorting function to put stocks in the order we should prioritize investing in them */
 let purchaseOrder = (a, b) => (Math.ceil(a.timeToCoverTheSpread()) - Math.ceil(b.timeToCoverTheSpread())) || (b.absReturn() - a.absReturn());
