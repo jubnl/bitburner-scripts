@@ -57,6 +57,9 @@ let factionBySleeve = {}; // Sleeve index -> faction it was last successfully se
 const factionWorkRefreshInterval = 5 * 60 * 1000; // How often to recompute which factions still need rep
 const darknetCharismaMinSync = 50; // Minimum sleeve sync% for the --darknet-charisma study task to be worth its tuition (see pickSleeveTask)
 let options;
+let resetInfo; // ns.getResetInfo(): lastNodeReset / bitNodeOptions never change within a BitNode (this script is restarted on a new one), so it is fetched once in main()
+let numSleevesExpiry = 0; // The sleeve count only changes on a Covenant purchase (BN10), so it is refreshed every numSleevesRefreshInterval
+const numSleevesRefreshInterval = 60 * 1000;
 // Sleeve -> bladeburner contract assignment (each contract type can only be performed by one sleeve at a time)
 const sleeveBbContractBySleeve = { 1: "Retirement", 2: "Bounty Hunter", 3: "Tracking" };
 
@@ -82,6 +85,10 @@ export async function main(ns) {
     ownedSourceFiles = await getActiveSourceFiles(ns);
     if (!(10 in ownedSourceFiles))
         return ns.tprint("WARNING: You cannot run sleeve.js until you do BN10.");
+    resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
+    // Honour the "disableSleeveExpAndAugmentation" bitnode option (sleeves gain no exp and cannot buy augs, so training/aug-buying is pointless)
+    sleeveExpDisabled = resetInfo.bitNodeOptions?.disableSleeveExpAndAugmentation ?? false;
+    numSleevesExpiry = 0;
     // Start the main loop
     while (true) {
         try { await mainLoop(ns); }
@@ -184,7 +191,10 @@ async function getAllSleeves(ns, numSleeves) {
  * Main loop that gathers data, checks on all sleeves, and manages them. */
 async function mainLoop(ns) {
     // Update info
-    numSleeves = await getNsDataThroughFile(ns, `ns.sleeve.getNumSleeves()`);
+    if (Date.now() >= numSleevesExpiry) {
+        numSleeves = await getNsDataThroughFile(ns, `ns.sleeve.getNumSleeves()`);
+        numSleevesExpiry = Date.now() + numSleevesRefreshInterval;
+    }
     const playerInfo = await getPlayerInfo(ns);
     // If we have not yet detected that we are in bladeburner, do that now (unless disabled)
     if (!options['disable-bladeburner'] && !playerInBladeburner)
@@ -195,11 +205,8 @@ async function mainLoop(ns) {
     let budget = (playerInfo.money - (options['reserve'] || globalReserve)) * options['aug-budget'];
     // Estimate the cost of sleeves training over the next time interval to see if (ignoring income) we would drop below our reserve.
     const costByNextLoop = interval / 1000 * task.filter(t => t.startsWith("train")).length * 12000; // TODO: Training cost/sec seems to be a bug. Should be 1/5 this ($2400/sec)
-    // Get time in current bitnode (to cap how long we'll train sleeves)
-    const resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
+    // Get time in current bitnode (to cap how long we'll train sleeves); resetInfo is fetched once in main()
     const timeInBitnode = Date.now() - resetInfo.lastNodeReset;
-    // Honour the "disableSleeveExpAndAugmentation" bitnode option (sleeves gain no exp and cannot buy augs, so training/aug-buying is pointless)
-    sleeveExpDisabled = resetInfo.bitNodeOptions?.disableSleeveExpAndAugmentation ?? false;
     // Look up our gang's faction (once), since sleeves cannot work for it (src/NetscriptFunctions/Sleeve.ts setToFactionWork)
     if (playerInGang && playerGangFaction == null)
         playerGangFaction = (await getNsDataThroughFile(ns, 'ns.gang.getGangInformation()'))?.faction ?? null;
