@@ -964,6 +964,7 @@ Findings: 2 high, 2 medium, 3 low.
   casino run never happens, and augmentations are never installed — the BN stalls completely.
 - Severity: **high** (kills the hacking daemon in a loop, no casino money, no automatic ascension)
 - Suggested fix: drop the `_ = ` (just `await getNsDataThroughFile(...)`), or declare a local variable.
+- Status: fixed — commit `f881e4d` (removed the `_ = ` prefix; the value was never used).
 
 ### SG-F2: `crime.js` crashes on its first loop — `work-for-factions.js` module globals are `undefined` when imported
 - Script: `/home/jubnl/dev/bitburner/bitburner-scripts/crime.js:2,15` imports and calls

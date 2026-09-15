@@ -832,7 +832,7 @@ export async function main(ns) {
         await killScript(ns, 'daemon.js'); // We also have to kill daemon which can make us study.
         // Kill any action, in case we are studying or working out, as it might steal focus or funds before we can bet it at the casino.
         if (4 in unlockedSFs) // No big deal if we can't, casino.js has logic to find the stop button and click it.
-            _ = await getNsDataThroughFile(ns, `ns.singularity.stopAction()`);
+            await getNsDataThroughFile(ns, `ns.singularity.stopAction()`);
 
         const pid = launchScriptHelper(ns, 'casino.js', ['--kill-all-scripts', true, '--on-completion-script', ns.getScriptName()]);
         if (pid) {
