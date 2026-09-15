@@ -273,6 +273,19 @@ export function purchaseBudget(pre4s, cash, maxHoldings, diversification, spread
     return Math.min(cash, maxHoldings * (diversification + spreadPct) - positionValue * (1.01 + spreadPct));
 }
 
+/** SM-4: pre-4S volatility estimate: the largest single-tick move (|newer - older| / older, i.e. the game's `av`) over the most recent
+ * `windowLength` ticks of a newest-first price history, scaled by (n+1)/n because the expected max of n draws of av ~ U(0, mv) is n/(n+1)*mv.
+ * A cycle-long window would keep a darknet-promoted stock's peak volatility for two cycles after its x0.4 per-cycle decay.
+ * @param {number[]} priceHistory @param {number} windowLength */
+export function estimateVolatility(priceHistory, windowLength) {
+    const n = Math.min(windowLength, priceHistory.length - 1);
+    if (n <= 0) return 0;
+    let maxMove = 0;
+    for (let idx = 1; idx <= n; idx++)
+        maxMove = Math.max(maxMove, Math.abs(priceHistory[idx - 1] - priceHistory[idx]) / priceHistory[idx]);
+    return maxMove * (n + 1) / n;
+}
+
 /* A sorting function to put stocks in the order we should prioritize investing in them */
 let purchaseOrder = (a, b) => (Math.ceil(a.timeToCoverTheSpread()) - Math.ceil(b.timeToCoverTheSpread())) || (b.absReturn() - a.absReturn());
 
@@ -400,8 +413,9 @@ async function updateForecast(ns, allStocks, has4s) {
         stk.priceHistory.unshift(stk.price);
         if (stk.priceHistory.length > maxTickHistory) // Limit the rolling window size
             stk.priceHistory.splice(maxTickHistory, 1);
-        // Volatility is easy - the largest observed % movement in a single tick
-        if (!has4s) stk.vol = stk.priceHistory.reduce((max, price, idx) => Math.max(max, idx == 0 ? 0 : Math.abs(stk.priceHistory[idx - 1] - price) / price), 0);
+        // Volatility is easy - the largest observed % movement in a single tick. SM-4: only over the near-term window, because a darknet-promoted
+        // stock's volatility decays x0.4 at every market cycle and the full 151-tick history would keep its peak for two cycles.
+        if (!has4s) stk.vol = estimateVolatility(stk.priceHistory, nearTermForecastWindowLength);
         // We want stocks that have the best expected return, averaged over a long window for greater precision, but the game will occasionally invert probabilities
         // (45% chance every 75 updates), so we also compute a near-term forecast window to allow for early-detection of inversions so we can ditch our position.
         stk.nearTermForecast = forecast(stk.priceHistory.slice(0, nearTermForecastWindowLength));
