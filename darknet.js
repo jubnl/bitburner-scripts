@@ -514,7 +514,8 @@ function basePlan(ns, state, options, charisma) {
         lab: null,
         walkLab: null,              // the labyrinth `walkHosts` should be sent into
         walkHosts: [],              // hosts whose command file asks their agent to start a walker
-        walkThreads: 0,
+        walkThreads: 0,             // requested thread cap (--lab-threads), before any per-host clamp
+        walkThreadsByHost: {},      // host -> threads that actually fit on that host's max RAM
         charisma,
         frontierDepth: frontierDepth(state),
     };
@@ -723,17 +724,19 @@ export function buildCmd(state, plan, host) {
         threads: {
             crack: plan.crackThreads,
             realloc: plan.reallocThreads,
-            phish: plan.shareActive ? 0 : 1,
+            // A walk host gives its spare RAM to the walker: phish/promote/share are told to
+            // stop (and exit on their own -- see darknet/agent.js) so the walker can claim it.
+            phish: walking ? 0 : (plan.shareActive ? 0 : 1),
             migrate: migrateTarget ? MIGRATE_THREADS : 0,
-            promote: (plan.promoteSymbols.length && hostMaxRam >= MIN_PROMOTE_RAM) ? PROMOTE_THREADS : 0,
+            promote: walking ? 0 : ((plan.promoteSymbols.length && hostMaxRam >= MIN_PROMOTE_RAM) ? PROMOTE_THREADS : 0),
         },
         migrateTarget,
         promoteSymbols: plan.promoteSymbols,
         stasis: plan.stasisTargets.includes(host),
-        "share": plan.shareActive,
+        "share": walking ? false : plan.shareActive,
         storm: plan.stormHost === host,
         walk: walking ? plan.walkLab : null,
-        walkThreads: walking ? plan.walkThreads : 0,
+        walkThreads: walking ? (plan.walkThreadsByHost?.[host] ?? 0) : 0,
         stop: false,
     };
 }
@@ -894,35 +897,50 @@ export function launchWalkers(ns, state, plan, options) {
     plan.walkLab = lab.host;
     plan.walkThreads = Math.max(1, Math.floor(Number(options["lab-threads"]) || 1));
     plan.walkHosts = alive.map(walker => walker.host);
+    // Max-RAM-based clamp, never the host's current free RAM: a walk host's spare-RAM workers
+    // (phish/promote/share) are told to stop in buildCmd and take a loop or two to exit, so free
+    // RAM right now understates what the host will actually have once they do.
+    const threadsForHost = (host) => {
+        const maxRam = Number(state.servers[host]?.maxRam) || 0;
+        return Math.max(0, Math.min(plan.walkThreads, Math.floor((maxRam - WORKER_RAM.agent - 0.5) / WORKER_RAM.lab)));
+    };
+    for (const host of plan.walkHosts) plan.walkThreadsByHost[host] = threadsForHost(host);
     if (plan.walkHosts.length >= wanted) return plan.walkHosts;
 
-    const needed = plan.walkThreads * WORKER_RAM.lab;
     const busy = new Set(plan.walkHosts);
     const reachable = commandable(state);
     const candidates = Object.entries(state.servers)
         .filter(([name, entry]) => isLive(entry, now) && !isLabHost(name) && !busy.has(name)
             && reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
-        .map(([name]) => name)
-        .sort((a, b) => freeRam(ns, b) - freeRam(ns, a));
+        .map(([name, entry]) => ({ name, maxRam: Number(entry.maxRam) || 0, walkThreads: threadsForHost(name) }))
+        .sort((a, b) => b.maxRam - a.maxRam);
 
-    for (const host of candidates) {
+    for (const cand of candidates) {
         if (plan.walkHosts.length >= wanted) break;
-        if (freeRam(ns, host) < needed) {
-            announceOnce(ns, `ram:${host}`, `INFO: ${host} neighbours ${lab.host} but has under ${formatRam(needed, true)} free, so it cannot host a ${plan.walkThreads}-thread walker.`);
+        const host = cand.name;
+        if (cand.walkThreads < 1) {
+            announceOnce(ns, `ram:${host}`, `INFO: ${host} neighbours ${lab.host} but has only ${formatRam(cand.maxRam, true)} max RAM, too small to host even 1 walker thread (needs agent ${formatRam(WORKER_RAM.agent, true)} + ${formatRam(WORKER_RAM.lab, true)} per thread).`);
             continue;
         }
         forgetAnnouncement(`ram:${host}`);
         plan.walkHosts.push(host);
+        plan.walkThreadsByHost[host] = cand.walkThreads;
         // darkweb is home's only direct darknet connection, so it is the one host the
         // controller can start a walker on itself -- useful before its agent comes up.
         if (host === "darkweb" && !ns.isRunning("darknet/lab.js", host, lab.host, "--port", port)) {
             const files = agentPayload(ns);
             if (files.includes("darknet/lab.js")) {
                 ns.scp(files, host, "home");
-                const pid = ns.exec("darknet/lab.js", host, { threads: plan.walkThreads, preventDuplicates: true }, lab.host, "--port", port);
-                if (pid) {
-                    state.labs.walkers.push({ host, pid, lab: lab.host, startedAt: Date.now(), lastSeen: Date.now(), steps: 0 });
-                    log(ns, `SUCCESS: darknet sent a walker into ${lab.host} from darkweb (pid ${pid}, ${plan.walkThreads} threads).`, false, "success");
+                // Clamp further by the host's actual free RAM right now: darkweb's own agent may
+                // not be up yet to evict spare-RAM workers on its behalf (see buildCmd), so the
+                // max-RAM-based thread count can outrun what is free at this exact instant.
+                const threads = Math.min(cand.walkThreads, Math.floor(freeRam(ns, host) / WORKER_RAM.lab));
+                if (threads >= 1) {
+                    const pid = ns.exec("darknet/lab.js", host, { threads, preventDuplicates: true }, lab.host, "--port", port);
+                    if (pid) {
+                        state.labs.walkers.push({ host, pid, lab: lab.host, startedAt: Date.now(), lastSeen: Date.now(), steps: 0 });
+                        log(ns, `SUCCESS: darknet sent a walker into ${lab.host} from darkweb (pid ${pid}, ${threads} threads).`, false, "success");
+                    }
                 }
             }
         }

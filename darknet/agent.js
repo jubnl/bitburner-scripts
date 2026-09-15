@@ -46,7 +46,11 @@ export async function main(ns) {
             const d = detailsByHost[h];
             if (d.isOnline && passwords[h] === undefined && !cmd.claimed.includes(h) && !isLabHost(h)) { needsCrack = true; break; }
         }
-        const reserve = needsCrack ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
+        let reserve = needsCrack ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
+        // A commanded labyrinth walker outranks spare-RAM work too: hold its RAM back from
+        // promote/phish/share so it has somewhere to land once buildCmd's threads.phish = 0 /
+        // threads.promote = 0 / share = false empty the host out (may take a loop or two).
+        if (cmd.walk && (cmd.walkThreads || 0) >= 1) reserve += cmd.walkThreads * WORKER_RAM.lab;
         // 2. crack unknown neighbours
         for (const h of neighbours) {
             const d = detailsByHost[h];

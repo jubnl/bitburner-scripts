@@ -46,6 +46,12 @@ export const WORKER_RAM = {
     // lab.js = 1.6 base + dnet.authenticate 0.4 + scp 0.6 + exec 1.3 + getHostname 0.05.
     lab: 3.95,
     "share": 4.0,
+    // darknet/agent.js's own footprint (base 1.6 + exec 1.3 + scp 0.6 + dnet.probe 0.2 + ls 0.2 +
+    // dnet.getServerDetails 0.1 + isRunning 0.1 + fileExists 0.1 + dnet.unleashStormSeed 0.1 +
+    // getServerMaxRam 0.05 + getServerUsedRam 0.05 + dnet.connectToSession 0.05 + getHostname
+    // 0.05 = 4.50). Used by the controller to size labyrinth walkers so agent + walker(s) both
+    // fit on the host's known max RAM.
+    agent: 4.5,
 };
 
 export const LABS = [
