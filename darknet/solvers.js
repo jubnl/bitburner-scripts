@@ -29,6 +29,20 @@ export const EU_COUNTRIES = [
     "Malta", "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden",
 ];
 
+// Prime lists used by Factori-Os, copied verbatim from ServerGenerator.ts's
+// smallPrimes/largePrimes (getLargestPrimeFactorPassword / getPasswordMadeUpOfPrimesProduct),
+// NOT from test/darknet-mock.js.
+export const SMALL_PRIMES = [
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+];
+export const LARGE_PRIMES = [
+    1069, 1409, 1471, 1567, 1597, 1601, 1697, 1747, 1801, 1889, 1979, 1999, 2063, 2207, 2371, 2503, 2539, 2693, 2741,
+    2753, 2801, 2819, 2837, 2909, 2939, 3169, 3389, 3571, 3761, 3881, 4217, 4289, 4547, 4729, 4789, 4877, 4943, 4951,
+    4957, 5393, 5417, 5419, 5441, 5519, 5527, 5647, 5779, 5881, 6007, 6089, 6133, 6389, 6451, 6469, 6547, 6661, 6719,
+    6841, 7103, 7549, 7559, 7573, 7691, 7753, 7867, 8053, 8081, 8221, 8329, 8599, 8677, 8761, 8839, 8963, 9103, 9199,
+    9343, 9467, 9551, 9601, 9739, 9749, 9859,
+];
+
 // ---- budget-exceeded sentinel, thrown by solve()'s attempt wrapper and caught by solve() ----
 class BudgetExceeded extends Error {}
 
@@ -170,6 +184,194 @@ export function evalArithmetic(expr) {
     return result;
 }
 
+// ---- Task 3: oracle-driven solver helpers ----
+
+const NUMERIC_CHARS = "0123456789";
+const ALPHA_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+// Numeric charset is "0123456789"; alphanumeric adds lowercase then uppercase (matches the
+// game's `letters` = lowercase + uppercase, ServerGenerator.ts's `numbers + letters`).
+function charset(d) {
+    return d.passwordFormat === "alphanumeric" ? NUMERIC_CHARS + ALPHA_CHARS : NUMERIC_CHARS;
+}
+
+// All length-L strings over charset cs, in charset order. Only used when cs.length**L is
+// small enough to enumerate (DeepGreen's exact-search branch).
+function allStrings(cs, L) {
+    let result = [""];
+    for (let i = 0; i < L; i++) {
+        const next = [];
+        for (const prefix of result) for (const c of cs) next.push(prefix + c);
+        result = next;
+    }
+    return result;
+}
+
+// Ported verbatim from DarkNet/utils/darknetAuthUtils.ts.
+function getExactCorrectCharsCount(password, attempted) {
+    let count = 0;
+    for (let i = 0; i < password.length; i++) if (password[i] === attempted[i]) count += 1;
+    return count;
+}
+function getMisplacedCorrectCharsCount(password, attempted) {
+    const remainingPasswordChars = password.split("").filter((digit, i) => digit !== attempted[i]);
+    const remainingAttemptedChars = attempted.split("").filter((digit, i) => digit !== password[i]);
+    return remainingAttemptedChars.filter((digit, i) => {
+        const isPresentInPassword = remainingPasswordChars.includes(digit);
+        const countInAttemptedThusFar = remainingAttemptedChars.slice(0, i).filter((prevDigit) => prevDigit === digit).length;
+        const countInPassword = remainingPasswordChars.filter((prevDigit) => prevDigit === digit).length;
+        return isPresentInPassword && countInAttemptedThusFar < countInPassword;
+    }).length;
+}
+// score(candidate, guess): as if `candidate` were the true password and `guess` the attempt,
+// returns [exact, misplaced] with the game's duplicate-aware counting.
+function score(password, attempted) {
+    return [getExactCorrectCharsCount(password, attempted), getMisplacedCorrectCharsCount(password, attempted)];
+}
+
+// Submits mid = floor((lo+hi)/2); returns on success; moves lo = mid+1 when tooLow(feedback)
+// is true, else hi = mid-1. Returns null if the range is exhausted without a match.
+async function binarySearch(a, lo, hi, tooLow) {
+    while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const r = await a(String(mid));
+        if (r.success) return String(mid);
+        if (tooLow(r.feedback)) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return null;
+}
+
+// Standard extended-Euclidean-based modular inverse and CRT (moduli must be pairwise coprime).
+function egcd(a, b) {
+    let [oldR, r] = [a, b];
+    let [oldS, s] = [1n, 0n];
+    while (r !== 0n) {
+        const q = oldR / r;
+        [oldR, r] = [r, oldR - q * r];
+        [oldS, s] = [s, oldS - q * s];
+    }
+    return [oldR, oldS];
+}
+function modInverse(a, m) {
+    const [g, x] = egcd(((a % m) + m) % m, m);
+    if (g !== 1n) throw new Error("modInverse: moduli not coprime");
+    return ((x % m) + m) % m;
+}
+function crt(mods, residues) {
+    let modulus = 1n;
+    for (const m of mods) modulus *= m;
+    let result = 0n;
+    for (let i = 0; i < mods.length; i++) {
+        const partial = modulus / mods[i];
+        const inv = modInverse(partial, mods[i]);
+        result = (result + ((residues[i] * partial * inv) % modulus)) % modulus;
+    }
+    return ((result % modulus) + modulus) % modulus;
+}
+
+// Distinct (multiset-aware) permutations of a string, e.g. "112" -> ["112","121","211"].
+function uniquePermutations(str) {
+    const chars = str.split("").sort();
+    const used = Array(chars.length).fill(false);
+    const current = [];
+    const results = [];
+    (function backtrack() {
+        if (current.length === chars.length) {
+            results.push(current.join(""));
+            return;
+        }
+        for (let i = 0; i < chars.length; i++) {
+            if (used[i]) continue;
+            if (i > 0 && chars[i] === chars[i - 1] && !used[i - 1]) continue;
+            used[i] = true;
+            current.push(chars[i]);
+            backtrack();
+            current.pop();
+            used[i] = false;
+        }
+    })();
+    return results;
+}
+
+// Parses "RMS Deviation:(\d+\.\d+)" out of a SortedEchoVuln (PHP 5.4) feedback object
+// (f = r.feedback, so this reads f.data). Returns Infinity if absent (e.g. the probe's
+// length didn't match, or the model's password is under 5 chars).
+function rmsd(f) {
+    const m = /RMS Deviation:(\d+\.\d+)/.exec(f.data ?? "");
+    return m ? Number(m[1]) : Infinity;
+}
+
+function escapeRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function substrings(str, len) {
+    const result = [];
+    for (let i = 0; i + len <= str.length; i++) result.push(str.slice(i, i + len));
+    return result;
+}
+
+// Shared oracle-driven positional solver used by DeepGreen and RateMyPix.Auth once their
+// guess space (cs.length ** L) is too large to enumerate or to brute-force scan
+// position-by-position (a blind O(L * cs.length) scan). Both models' feedback reduces, for a
+// guess made of a single repeated character c, to "how many positions equal c" (DeepGreen:
+// the exact component of [exact,misplaced] -- a uniform guess always yields misplaced===0
+// per getMisplacedCorrectCharsCount, since no character can be "remaining" at a position
+// where the uniform guess didn't already match it there or nowhere; RateMyPix.Auth: the
+// pepper count). `exactCount(feedback)` extracts that number from a model's own feedback
+// shape. Strategy: (1) learn each charset symbol's total occurrence count via one
+// "c repeated L times" query per symbol (skip the last, infer its count from the rest --
+// this alone identifies the full multiset in cs.length-1 queries, independent of L); (2)
+// resolve each position via isolated single-character probes drawn only from symbols still
+// remaining in the multiset (all other positions filled with a filler character guaranteed
+// absent from any charset password), removing a resolved symbol from the pool once its count
+// is exhausted so later positions have fewer candidates left to try. Total queries are
+// bounded by roughly cs.length + L*(L-1)/2 instead of L*cs.length.
+const FILLER = "_";
+async function solveByExactCount(L, cs, a, exactCount) {
+    const remaining = new Map();
+    let accounted = 0;
+    for (let i = 0; i < cs.length - 1; i++) {
+        const c = cs[i];
+        const guess = c.repeat(L);
+        const r = await a(guess);
+        if (r.success) return guess;
+        const n = exactCount(r.feedback);
+        if (n > 0) remaining.set(c, n);
+        accounted += n;
+    }
+    const lastCount = L - accounted;
+    if (lastCount > 0) remaining.set(cs[cs.length - 1], lastCount);
+
+    const pw = Array(L).fill(null);
+    for (let i = 0; i < L; i++) {
+        const candidates = [...remaining.keys()];
+        if (candidates.length === 0) return null;
+        let found = null;
+        for (let ci = 0; ci < candidates.length; ci++) {
+            const c = candidates[ci];
+            if (ci === candidates.length - 1) {
+                found = c;
+                break;
+            }
+            const guess = FILLER.repeat(i) + c + FILLER.repeat(L - i - 1);
+            const r = await a(guess);
+            if (r.success) return guess;
+            if (exactCount(r.feedback) === 1) {
+                found = c;
+                break;
+            }
+        }
+        pw[i] = found;
+        const cnt = remaining.get(found) - 1;
+        if (cnt <= 0) remaining.delete(found);
+        else remaining.set(found, cnt);
+    }
+    const final = pw.join("");
+    return (await a(final)).success ? final : null;
+}
+
 // ---- direct-decode and dictionary solvers, one per crackable model ----
 export const SOLVERS = {
     ZeroLogon: async (d, tryPw) => (await tryPw("")).success ? "" : null,
@@ -221,6 +423,245 @@ export const SOLVERS = {
     MathML: async (d, tryPw) => {
         const pw = String(evalArithmetic(cleanExpression(d.data)));
         return (await tryPw(pw)).success ? pw : null;
+    },
+
+    // ---- Task 3: oracle-driven solvers ----
+
+    // Per-position yes/yesn't oracle: guessing c.repeat(L) reveals, per position, whether
+    // that position's character is c (via the "yes"/"yesn't" CSV in feedback.data).
+    NIL: async (d, tryPw) => {
+        const L = d.passwordLength, cs = charset(d), known = Array(L).fill(null);
+        for (const c of cs) {
+            const r = await tryPw(c.repeat(L));
+            if (r.success) return c.repeat(L);
+            r.feedback.data.split(",").forEach((v, i) => {
+                if (v === "yes") known[i] = c;
+            });
+            if (known.every((k) => k !== null)) {
+                const pw = known.join("");
+                return (await tryPw(pw)).success ? pw : null;
+            }
+        }
+        return null;
+    },
+
+    // Prefix oracle: "Found a mismatch while checking each character (i)" -- i counts
+    // leading matching characters, so extending the confirmed prefix by one correct
+    // character always pushes the mismatch index strictly past the prefix's old length.
+    "2G_cellular": async (d, tryPw) => {
+        const L = d.passwordLength, cs = charset(d);
+        let prefix = "";
+        while (prefix.length < L) {
+            let found = false;
+            for (const c of cs) {
+                const guess = (prefix + c).padEnd(L, cs[0]);
+                const r = await tryPw(guess);
+                if (r.success) return guess;
+                const m = /\((\d+)\)/.exec(r.feedback.message);
+                const idx = m ? Number(m[1]) : -1;
+                if (idx > prefix.length) {
+                    prefix += c;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return null;
+        }
+        return null;
+    },
+
+    // Higher/lower guessing game: feedback.data is "Higher" when the guess was too low
+    // (go higher), "Lower" when it was too high.
+    "AccountsManager_4.2": async (d, tryPw) => binarySearch(tryPw, 0, 10 ** d.passwordLength - 1, (f) => f.data === "Higher"),
+
+    // Roman-numeral clue. Below difficulty 8 the hint is a single exact value (no comma);
+    // otherwise it's a "min,max" range and the failure data says ALTUS NIMIS (too high) or
+    // PARUM BREVIS (too low).
+    BellaCuore: async (d, tryPw) => {
+        if (!d.data.includes(",")) {
+            const pw = String(romanToInt(d.data.trim()));
+            return (await tryPw(pw)).success ? pw : null;
+        }
+        const [lo, hi] = d.data.split(",").map((s) => romanToInt(s.trim()));
+        return binarySearch(tryPw, lo, hi, (f) => f.data === "PARUM BREVIS");
+    },
+
+    // CRT: probing n = 10^15 + r for r in a set of pairwise-coprime moduli < 32 gives back
+    // P mod r directly, because n > P (so P % n === P) and (n-1)%32+1 === r (10^15 is a
+    // multiple of 32, so (n-1)%32 === (r-1)%32 === r-1 for every r below). Once every
+    // residue is known, CRT reconstructs P mod (product of moduli), which comfortably
+    // exceeds any password this model can generate. Uses 10^15 rather than the more obvious
+    // 10^16: checkPassword computes `Number(attempt)` internally, and 10^16-plus-a-few is
+    // already past Number.MAX_SAFE_INTEGER (~9.007e15), so different residues r collide onto
+    // the same rounded double and the oracle answers get corrupted. 10^15 keeps every probe
+    // exactly representable as a double while still comfortably exceeding any password this
+    // model generates (at most 9-10 digits).
+    "BigMo%od": async (d, tryPw) => {
+        const mods = [31, 29, 27, 25, 23, 19, 17, 13, 11];
+        const res = [];
+        for (const r of mods) {
+            const n = 10n ** 15n + BigInt(r);
+            const f = await tryPw(n.toString());
+            if (f.success) return n.toString();
+            res.push(BigInt(f.feedback.data));
+        }
+        const pw = crt(mods.map(BigInt), res).toString();
+        return (await tryPw(pw)).success ? pw : null;
+    },
+
+    // Divisibility oracle over the game's own prime lists -- every Factori-Os password is
+    // built exclusively as a product of small/large primes (getPasswordMadeUpOfPrimesProduct),
+    // so no other prime can ever divide it. For each prime p, test p, p^2, p^3, ... while the
+    // oracle reports divisible, then move to the next prime.
+    "Factori-Os": async (d, tryPw) => {
+        let product = 1n;
+        const limit = 10n ** BigInt(d.passwordLength);
+        for (const p of [...SMALL_PRIMES, ...LARGE_PRIMES]) {
+            let q = BigInt(p);
+            while (q <= limit) {
+                const f = await tryPw(q.toString());
+                if (f.success) return q.toString();
+                if (f.feedback.data !== "true") break;
+                product *= BigInt(p);
+                q *= BigInt(p);
+            }
+        }
+        const pw = product.toString();
+        return (await tryPw(pw)).success ? pw : null;
+    },
+
+    // Mastermind with duplicate-aware exact/misplaced feedback. When the guess space
+    // (cs.length ** L) is small enough to enumerate, this is a textbook consistency-filtered
+    // search: keep only candidates whose score() against each guess matches the observed
+    // feedback, and always guess the first surviving candidate.
+    //
+    // When the space is too large to enumerate, blindly sampling a fixed pool of random
+    // candidate strings and filtering by consistency is *not* reliable here: the true
+    // password essentially never lands in a 200,000-string sample out of a space that can
+    // exceed 10^8-10^9 strings, so the "consistent" pool can shrink to candidates that were
+    // never actually the answer (or to empty), i.e. the model would fail unpredictably no
+    // matter the budget. Instead this falls back to solveByExactCount, which is still driven
+    // entirely by the model's own consistency feedback (the exact-match component of
+    // [exact,misplaced]) but determines the true password deterministically rather than by
+    // sampling. See BUDGETS.DeepGreen for the measured attempt counts this requires.
+    DeepGreen: async (d, tryPw) => {
+        const L = d.passwordLength, cs = charset(d);
+        if (cs.length ** L > 200000) {
+            return solveByExactCount(L, cs, tryPw, (fb) => Number(fb.data.split(",")[0]));
+        }
+        let candidates = allStrings(cs, L);
+        let guess = candidates[0];
+        while (true) {
+            const r = await tryPw(guess);
+            if (r.success) return guess;
+            const [ex, mis] = r.feedback.data.split(",").map(Number);
+            candidates = candidates.filter((c) => {
+                const s = score(c, guess);
+                return s[0] === ex && s[1] === mis;
+            });
+            if (!candidates.length) return null;
+            guess = candidates[0];
+        }
+    },
+
+    // Exact-count oracle (the pepper string only ever encodes a total count, not which
+    // positions matched -- see darknet-mock.js's SpiceLevel branch). Delegates straight to
+    // solveByExactCount: the naive "one baseline + linear scan per position" strategy is
+    // O(L * cs.length), which blows past any reasonable budget once the model goes
+    // alphanumeric at higher difficulty (L up to 12, cs.length 62); solveByExactCount's
+    // multiset-then-elimination approach stays close to O(cs.length + L^2).
+    "RateMyPix.Auth": async (d, tryPw) => {
+        const L = d.passwordLength, cs = charset(d);
+        return solveByExactCount(L, cs, tryPw, (fb) => (fb.data.match(/🌶️/g) || []).length);
+    },
+
+    // Sorted multiset (the digits, pre-sorted) is given directly; below 5 digits the model
+    // never reports an RMS deviation (checkPassword's SortedEchoVuln branch bails out for
+    // password.length < 5), so brute-force the (few) distinct permutations. At 5+ digits,
+    // probing "0..0 9 0..0" (a single 9 at position i, zero elsewhere) isolates position i:
+    // squaredError = S + 81 - 18*actual_i where S = sum of the known digits squared, so
+    // actual_i is recovered exactly from the reported RMS deviation.
+    "PHP 5.4": async (d, tryPw) => {
+        const m = /(\d+)\s*$/.exec(d.passwordHint) || /(\d+)/.exec(d.data || "");
+        if (!m) return null;
+        const sorted = m[1], L = sorted.length;
+        if (L < 5) {
+            for (const p of uniquePermutations(sorted)) {
+                if ((await tryPw(p)).success) return p;
+            }
+            return null;
+        }
+        const S = [...sorted].reduce((acc, c) => acc + Number(c) ** 2, 0);
+        const pw = [];
+        for (let i = 0; i < L; i++) {
+            const trial = "0".repeat(i) + "9" + "0".repeat(L - i - 1);
+            const r = await tryPw(trial);
+            if (r.success) return trial;
+            const dev = rmsd(r.feedback);
+            if (!Number.isFinite(dev)) return null;
+            pw.push(String(Math.max(0, Math.min(9, Math.round((S + 81 - L * dev * dev) / 18)))));
+        }
+        const final = pw.join("");
+        return (await tryPw(final)).success ? final : null;
+    },
+
+    // Altitude oracle over a landscape of decoy hills plus one main peak at the password.
+    // Scan at one-width steps (a sample within width/2 of P reads >= 10000*e^-0.25 ~= 7788,
+    // above any decoy peak's contribution at that range), then solve the Gaussian for the
+    // peak's exact location analytically from the best sample found.
+    KingOfTheHill: async (d, tryPw) => {
+        const L = d.passwordLength, max = 10 ** L - 1, width = 10 ** Math.max(L - 2, 0) + 1;
+        let solved = null;
+        const alt = async (x) => {
+            x = Math.max(0, Math.min(max, Math.round(x)));
+            const r = await tryPw(String(x));
+            if (r.success) {
+                solved = String(x);
+                return Infinity;
+            }
+            return Number(r.feedback.data);
+        };
+        let best = 0, bestAlt = -1;
+        for (let x = 0; x <= max && solved === null; x += width) {
+            const h = await alt(x);
+            if (h > bestAlt) {
+                bestAlt = h;
+                best = x;
+            }
+        }
+        if (solved) return solved;
+        const delta = width * Math.sqrt(Math.log(10000 / bestAlt));
+        for (const c of [best + delta, best - delta, best + delta + 1, best - delta - 1, best + delta - 1, best - delta + 1]) {
+            await alt(c);
+            if (solved) return solved;
+        }
+        return null;
+    },
+
+    // Packet capture oracle. Below difficulty 17 the capture wraps the password as
+    // " hostname:password " (the only spaces anywhere in the noise -- see darknet-mock.js's
+    // capturePackets -- so the regex finds it in one extra call). Above that threshold the
+    // password is embedded in raw noise with no delimiter, so instead take several fresh
+    // captures (each redrawn with new random noise around the same password) and intersect
+    // their length-L substrings: the password is the only substring guaranteed to recur in
+    // every capture.
+    OpenWebAccessPoint: async (d, tryPw) => {
+        const first = await tryPw("0");
+        if (first.success) return "0";
+        const m = new RegExp(`\\s${escapeRe(d.hostname)}:(\\S+)\\s`).exec(first.feedback.data);
+        if (m) return (await tryPw(m[1])).success ? m[1] : null;
+        let common = null;
+        for (let i = 0; i < 7; i++) {
+            const r = await tryPw(String(i + 1));
+            if (r.success) return String(i + 1);
+            const subs = new Set(substrings(r.feedback.data, d.passwordLength));
+            common = common ? new Set([...common].filter((s) => subs.has(s))) : subs;
+            if (common.size === 1) break;
+        }
+        for (const pw of common ?? []) {
+            if ((await tryPw(pw)).success) return pw;
+        }
+        return null;
     },
 };
 

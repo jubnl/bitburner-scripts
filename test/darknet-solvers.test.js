@@ -46,6 +46,17 @@ test("solves Pr0verFl0 within budget (buffer-overflow exploit accepts any double
         assert.ok(attempts <= BUDGETS.Pr0verFl0, `Pr0verFl0 used ${attempts} > ${BUDGETS.Pr0verFl0}`);
     }
 });
+const ORACLE = ["NIL", "2G_cellular", "AccountsManager_4.2", "BellaCuore", "BigMo%od", "Factori-Os", "DeepGreen",
+    "RateMyPix.Auth", "PHP 5.4", "KingOfTheHill", "OpenWebAccessPoint"];
+for (const modelId of ORACLE) {
+    test(`solves ${modelId} within budget`, async () => {
+        for (const seed of [1, 2, 3, 4, 5]) for (const difficulty of [2, 9, 17, 26]) {
+            const { r, attempts, s } = await runModel(modelId, difficulty, seed);
+            assert.equal(r.password, s.password, `${modelId} seed ${seed} d${difficulty}`);
+            assert.ok(attempts <= BUDGETS[modelId], `${modelId} seed ${seed} d${difficulty} used ${attempts} > ${BUDGETS[modelId]}`);
+        }
+    });
+}
 test("clues are tried first", async () => {
     const s = makeServer("TopPass", 10, makeRng(9));
     let attempts = 0;
