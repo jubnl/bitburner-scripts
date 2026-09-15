@@ -27,7 +27,7 @@ const argsSchema = [
     ['enable-bladeburner-team-building', false], // Set to true to have one sleeve support the main sleeve, and another do recruitment. Otherwise, they will just do more "Infiltrate Synthoids"
     ['disable-bladeburner', false], // Set to true to disable having sleeves workout at the gym (costs money)
     ['failed-bladeburner-contract-cooldown', 30 * 60 * 1000], // Default 30 minutes: time to wait after failing a bladeburner contract before we try again
-    ['sync-first', false], // Set to true to always synchronize sleeves to 100% before doing anything else (legacy behaviour). By default we only sync when the sleeve's next job is crime for karma.
+    ['sync-first', false], // Set to true to always synchronize sleeves to 100% before doing anything else (legacy behaviour). By default sleeves never sync: synchronization takes ~27 hours and only scales karma earned from crime and exp copied to the player / other sleeves; the sleeve's own stats and recovery are unaffected.
     ['train-max-cost-per-exp', 2500], // Only train (gym/university) sleeves while a point of exp costs at most this much. Class exp is multiplied by (100 - shock)% but the fee is not, so 2500 admits shock <= 90 (lib/sleeve-logic.js trainingCostPerExp)
     ['train-with-pending-augs', false], // Set to true to train sleeves even when they still have purchasable augmentations (installing an aug resets all sleeve exp)
     ['max-faction-sleeves', 8], // Up to this many sleeves may work for (distinct) joined factions that still have unowned augmentations we need rep for. 0 to disable.
