@@ -14,6 +14,30 @@ let minRamExponent;
 let absReservedMoney;
 let pctReservedMoney;
 let budget;
+let resetKey; // ns.getResetInfo().lastAugReset - the spend record only counts within one augmentation install
+// HC-2: running total of what this script paid for purchased servers this install. daemon.js reads it for host-manager's budget instead of
+// ns.getMoneySources().sinceInstall.servers, which the game also debits for home RAM/core upgrades (src/NetscriptFunctions/Singularity.ts
+// upgradeHomeRam / upgradeHomeCores: Player.loseMoney(cost, "servers"); src/utils/MoneySourceTracker.ts has a single `servers` bucket).
+const SPEND_RECORD_FILE = '/Temp/host-manager-spend.txt';
+
+/** Parses the spend record file. Returns the money spent on purchased servers while `resetKey` matches, else 0 (an install deletes purchased servers).
+ * @param {string} text contents of SPEND_RECORD_FILE
+ * @param {number} resetKey ns.getResetInfo().lastAugReset
+ * @returns {number} */
+export function readSpendRecord(text, resetKey) {
+    try {
+        const record = JSON.parse(text || 'null');
+        const spent = Number(record?.spent);
+        return record?.resetKey === resetKey && Number.isFinite(spent) ? Math.max(0, spent) : 0;
+    } catch { return 0; }
+}
+
+/** Adds a purchase to the spend record (HC-2)
+ * @param {NS} ns */
+function recordSpend(ns, cost) {
+    const spent = readSpendRecord(ns.read(SPEND_RECORD_FILE), resetKey) + cost;
+    ns.write(SPEND_RECORD_FILE, JSON.stringify({ resetKey, spent }), 'w');
+}
 
 let options;
 const argsSchema = [
@@ -59,6 +83,7 @@ export async function main(ns) {
 
     // Gather one-time info in advance about how much RAM each size of server costs (Up to 2^30 to be future-proof, but we expect everything above 2^20 to be Infinity)
     costByRamExponent = await getNsDataThroughFile(ns, 'Object.fromEntries([...Array(30).keys()].map(i => [i, ns.cloud.getServerCost(2**i)]))', '/Temp/host-costs.txt');
+    resetKey = (await getNsDataThroughFile(ns, 'ns.getResetInfo()')).lastAugReset; // HC-2: keys the purchased-server spend record
 
     keepRunning = options.c || options['run-continuously'];
     pctReservedMoney = options['reserve-percent'];
@@ -145,7 +170,7 @@ async function tryToBuyBestServerPossible(ns) {
         // Decay factor of 0.2 = Starts willing to spend 95% of our money, backing down to ~75% at 1 hour, ~60% at 2 hours, ~25% at 6 hours, and ~10% at 10 hours.
         // Decay factor of 0.3 = Starts willing to spend 95% of our money, backing down to ~66% at 1 hour, ~45% at 2 hours, ~23% at 4 hours, ~10% at 6 hours
         // Decay factor of 0.5 = Starts willing to spend 95% of our money, then halving every hour (to ~48% at 1 hour, ~24% at 2 hours, ~12% at 3 hours, etc)
-        const timeSinceLastAug = Date.now() - (await getNsDataThroughFile(ns, 'ns.getResetInfo()')).lastAugReset;
+        const timeSinceLastAug = Date.now() - resetKey; // (fetched once in main)
         const t = timeSinceLastAug / (60 * 60 * 1000); // Time since last aug, in hours.
         const decayFactor = options['reserve-by-time-decay-factor'];
         pctReservedMoney = 1.0 - (1.0 - options['reserve-percent']) * Math.pow(1 - decayFactor, t);
@@ -253,5 +278,6 @@ async function tryToBuyBestServerPossible(ns) {
         log(ns, `SUCCESS: ${isUpgrade ? 'Upgraded' : 'Purchased'} server ${purchasedServer} with ${formatRam(maxRamPossibleToBuy)} ` +
             `RAM for ${formatMoney(cost)} (budget was ${formatMoney(spendableMoney)})`, true, 'success');
         budget -= cost;
+        recordSpend(ns, cost); // HC-2: daemon.js debits its host-manager budget by this record, not by the game's "servers" money source
     }
 }

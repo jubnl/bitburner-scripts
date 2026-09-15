@@ -168,6 +168,24 @@ export function withStockManipulationFlag(toolShortName, args, manipulate) {
     return updated;
 }
 
+// --- HC-2: host-manager budget helpers (pure) ---
+
+/** Mirror of host-manager.js readSpendRecord (duplicated so daemon.js's RAM calculation never walks host-manager.js):
+ * money host-manager.js spent on purchased servers while `resetKey` (ns.getResetInfo().lastAugReset) matches, else 0. */
+export function parseSpendRecord(text, resetKey) {
+    try {
+        const record = JSON.parse(text || 'null');
+        const spent = Number(record?.spent);
+        return record?.resetKey === resetKey && Number.isFinite(spent) ? Math.max(0, spent) : 0;
+    } catch { return 0; }
+}
+
+/** How much host-manager.js may still spend on purchased servers this install: the larger of `maxSpendFraction` of hack income and 0.1% of all
+ * income (for BNs where hack income is crippled but hack exp still matters), minus what it already spent on purchased servers, floored at 0. */
+export function computeHostManagerBudget(maxSpendFraction, hackingIncome, totalIncome, purchasedServerSpend) {
+    return Math.max(0, maxSpendFraction * hackingIncome - purchasedServerSpend, totalIncome * 0.001 - purchasedServerSpend);
+}
+
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
@@ -244,6 +262,7 @@ export async function main(ns) {
     let dictSourceFiles = (/**@returns{{[bitNode: number]: number;}}*/() => undefined)(); // Available source files
     let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)();
     let bitNodeN = 1; // The bitnode we're in
+    let lastAugReset = 0; // ns.getResetInfo().lastAugReset - keys host-manager.js's purchased-server spend record (HC-2)
     let haveTixApi = false, have4sApi = false; // Whether we have WSE API accesses
     let _cachedPlayerInfo = (/**@returns{Player}*/() => undefined)(); // stores multipliers for player abilities and other player info
     let moneySources = (/**@returns{MoneySources}*/() => undefined)(); // Cache of player income/expenses by category
@@ -391,6 +410,7 @@ export async function main(ns) {
             resetInfo = { currentNode: 1, lastAugReset: Date.now() };
         }
         bitNodeN = resetInfo.currentNode;
+        lastAugReset = resetInfo.lastAugReset;
         dictSourceFiles = await getActiveSourceFiles_Custom(ns, getNsDataThroughFile);
         log(ns, "The following source files are active: " + JSON.stringify(dictSourceFiles));
 
@@ -569,18 +589,14 @@ export async function main(ns) {
             bitNodeN === 8 // The exception is in BN8, we still want lots of hacking to take place to manipulate stocks, which requires this infrastructure (TODO: Strike a balance between spending on this stuff and leaving money for stockmaster.js)
     }
 
-    /** Periodic scripts helper function: Get how much we're willing to spend on new servers (host-manager.js budget) */
+    /** Periodic scripts helper function: Get how much we're willing to spend on new servers (host-manager.js budget).
+     * HC-2: debited only by what host-manager.js itself paid for purchased servers this install (its /Temp/host-manager-spend.txt record).
+     * ns.getMoneySources().sinceInstall.servers is NOT used: the game books home RAM and core upgrades under that same "servers" source
+     * (src/NetscriptFunctions/Singularity.ts upgradeHomeRam/upgradeHomeCores -> Player.loseMoney(cost, "servers")), so ram-manager.js's home
+     * purchases (9-140x more expensive per GB than purchased servers) used to consume this budget and veto server purchases. */
     function getHostManagerBudget() {
-        const serverSpend = -(moneySources?.sinceInstall?.servers ?? 0); // This is given as a negative number (profit), we invert it to get it as a positive expense amount
-        const budget = Math.max(0,
-            // Ensure the total amount of money spent on new servers is less than the configured max spend amount
-            options['max-purchased-server-spend'] * (moneySources?.sinceInstall?.hacking ?? 0) - serverSpend,
-            // Special-case support: In some BNs hack income is severely penalized (or zero) but earning hack exp is still useful.
-            // To support these, always allow a small percentage (0.1%) of our total earnings (including other income sources) to be spent on servers
-            (moneySources?.sinceInstall?.total ?? 0) * 0.001 - serverSpend);
-        //log(ns, `Math.max(0, ${options['max-purchased-server-spend']} * (${formatMoney(moneySources?.sinceInstall?.hacking)} ?? 0) - ${formatMoney(serverSpend)}, ` +
-        //    `(${formatMoney(moneySources?.sinceInstall?.total)} ?? 0) * 0.001 - ${formatMoney(serverSpend)}) = ${formatMoney(budget)}`);
-        return budget;
+        const serverSpend = parseSpendRecord(ns.read('/Temp/host-manager-spend.txt'), lastAugReset); // ns.read is free
+        return computeHostManagerBudget(options['max-purchased-server-spend'], moneySources?.sinceInstall?.hacking ?? 0, moneySources?.sinceInstall?.total ?? 0, serverSpend);
     }
 
     /** @param {NS} ns
