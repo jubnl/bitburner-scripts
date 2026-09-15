@@ -1768,7 +1768,8 @@ export async function main(ns) {
                 if (verbose)
                     log(ns, `Copying ${tool.name} and ${missing_scripts.length - 1} dependencies from ${daemonHost} to ${targetServer.name} so that it can be executed remotely.`);
                 await getNsDataThroughFile(ns, `ns.scp(ns.args.slice(2), ns.args[0], ns.args[1])`, '/Temp/copy-scripts.txt', [targetServer.name, daemonHost, ...missing_scripts])
-                missing_scripts.forEach(s => targetServer._files[s] = true); // Make note that these files now exist on the target server
+                // Make note that these files now exist on the target server. _files is a Set of ns.ls names (no leading slash, see hasFile)
+                missing_scripts.forEach(s => targetServer._files?.add(s.startsWith('/') ? s.substring(1) : s));
                 //await ns.sleep(5); // Workaround for Bitburner bug https://github.com/danielyxie/bitburner/issues/1714 - newly created/copied files sometimes need a bit more time, even if awaited
             }
             // By default, tools executed in this way will be marked as "temporary" (not to be included in the save file or recent scripts history)
