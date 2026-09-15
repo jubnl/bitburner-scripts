@@ -267,9 +267,6 @@ export function applyMessage(state, msg) {
             // neighbour carry `neighbours: null`, so an untouched [] means "never scanned", not
             // "island". `neighboursAt` is what tells the two apart.
             if (Array.isArray(msg.neighbours)) {
-                // Keep the last non-empty list: an island reports no neighbours, but migration
-                // still needs the hosts that used to sit next to it (design doc section 7).
-                if (msg.neighbours.length === 0 && entry.neighbours.length > 0) entry.prevNeighbours = entry.neighbours;
                 entry.neighbours = msg.neighbours;
                 entry.neighboursAt = ts;
                 // A host the agent's probe still returns is provably alive right now, even
@@ -610,7 +607,7 @@ function basePlan(ns, state, options, charisma) {
 
 /** Loot mode: stasis-pin the biggest host as the phishing base and the deepest others as
  * permanent footholds (a linked server is backdoored and immune to mutation, so agents can
- * re-enter the frontier from home after a disconnect), migrate only stranded islands, phish the rest.
+ * re-enter the frontier from home after a disconnect), leave islands to the game's own island mover, fill the rest.
  * @param {NS} ns */
 export function planLoot(ns, state, options, charisma = 0) {
     const plan = basePlan(ns, state, options, charisma);
@@ -630,19 +627,11 @@ export function planLoot(ns, state, options, charisma = 0) {
     const candidates = anchor ? [anchor, ...byDepth.map(([name]) => name).filter(name => name !== anchor)] : [];
     plan.stasisTargets = assignStasis(ns, plan, candidates);
 
-    const reachable = commandable(state);
-    for (const [name, entry] of Object.entries(state.servers)) {
-        if (!entry.online || isLabHost(name)) continue;
-        if (!entry.neighboursAt) continue;                                   // never scanned itself
-        if (!Array.isArray(entry.neighbours) || entry.neighbours.length > 0) continue;
-        // An island: it scanned itself and found nothing. Charge from whoever last saw it.
-        const chargers = new Set(entry.prevNeighbours ?? []);
-        for (const [other, row] of Object.entries(state.servers)) {
-            if (other !== name && row.online && (row.neighbours ?? []).includes(name)) chargers.add(other);
-        }
-        const usable = [...chargers].filter(charger => reachable.includes(charger));
-        if (usable.length) plan.migrationTargets[name] = usable;
-    }
+    // Islands (a host whose own probe returns nothing) are left alone: induceServerMigration needs a direct
+    // connection to its target (Darknet.ts requireDirectConnection), which no charger has to a host nothing
+    // connects to, and it refuses the island's own agent ("Cannot induce migration on a script's own
+    // server"). The game moves a random island itself on 30 % of mutations (NetworkMovement.ts:64-70) and
+    // the island's agent survives that move and re-probes, so waiting is the whole plan (R10).
 
     // The charisma goal is "the lowest charisma that unlocks the next blocked action" (spec
     // section 7), so the lab gate counts even while we are looting.
@@ -805,7 +794,7 @@ export function chooseMode(ns, state, options, charisma = 0) {
     // the gap migrations planLabyrinth plans. Slack does not matter here (R2).
     if (AIR_GAP_ROWS.some(row => row < lab.depth && frontier === row - 1)) return "labyrinth";
     // "a migration toward it is charging": a recently charged server sitting just above an air
-    // gap that still separates us from the lab. Island migrations in loot mode do not qualify.
+    // gap that still separates us from the lab (the only migrations planned since R10).
     const now = Date.now();
     const charging = Object.entries(state.servers).some(([name, entry]) => entry.online && !isLabHost(name)
         && (Number(entry.migrationCharge) || 0) > 0

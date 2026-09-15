@@ -728,3 +728,31 @@ test("launchWalkers lets the walker win over the stasis hold on a host too small
     launchWalkers(ns, state, plan, options);
     assert.equal(plan.walkThreadsByHost.near, 3, "20 GB: agent 4.5 + 3 x 3.95; holding 13.65 for stasis would leave 0 threads");
 });
+
+// ------------------------------------------------------------------ R10: islands
+
+// induceServerMigration needs a direct connection to the target (Darknet.ts requireDirectConnection) and refuses
+// the target's own agent ("Cannot induce migration on a script's own server"), so nothing can ever charge an
+// island. The game moves a random island itself on 30 % of mutations (NetworkMovement.ts:64-70) and the island's
+// agent survives that move, so the right plan is to wait.
+test("planLoot no longer plans a migration for an island", () => {
+    const ns = makeNs({});
+    const state = makeState({
+        island: { depth: 4, neighbours: [] },
+        charger: { depth: 3, neighbours: ["island"] },
+    });
+    state.servers.island.prevNeighbours = ["charger"];   // what an older state file may still carry
+    const plan = planLoot(ns, state, baseOptions, 10);
+    assert.deepEqual(plan.migrationTargets, {}, "no charger can reach an island; the game moves islands itself");
+    assert.equal(buildCmd(state, plan, "charger").migrateTarget, null);
+    assert.equal(buildCmd(state, plan, "charger").threads.migrate, 0);
+});
+
+test("applyMessage no longer keeps prevNeighbours when a host's neighbour list empties", () => {
+    const state = emptyState(1000);
+    const ts = Date.now();
+    applyMessage(state, { type: "server", from: "alpha", host: "alpha", pid: 7, ts, details: { isOnline: true, depth: 4 }, neighbours: ["beta"] });
+    applyMessage(state, { type: "server", from: "alpha", host: "alpha", pid: 7, ts: ts + 1, details: { isOnline: true, depth: 4 }, neighbours: [] });
+    assert.deepEqual(state.servers.alpha.neighbours, []);
+    assert.equal(state.servers.alpha.prevNeighbours, undefined, "the only reader of prevNeighbours was the island block");
+});
