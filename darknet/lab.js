@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES } from "./lib.js";
+import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES, LABS } from "./lib.js";
 
 /* The labyrinth walker. Runs on a darknet server that is directly connected to the current
  * labyrinth (that is the game's requirement for labreport/labradar/authenticate) and walks
@@ -30,6 +30,9 @@ import { encodeMsg, PORT_DEFAULT, AGENT_FILES, FILES } from "./lib.js";
  *   - Each pid gets its own start position, so several walkers on different hosts explore
  *     independently; once any of them wins, every other walker's next authenticate succeeds
  *     immediately ("You have discovered the end of the labyrinth.") with the same password.
+ *   - A page reload regenerates the maze and drops every walker at a fresh start position, so
+ *     coordinates can jump for no reason the walker caused. Spec section 8 calls for a restart
+ *     in that case: everything learned describes a maze that no longer exists.
  */
 
 const argsSchema = [["port", PORT_DEFAULT]];
@@ -41,6 +44,7 @@ const FAR_CORNER = 1e9;         // the exit sits at the bottom-right, up to a sm
 const RADAR_EVERY = 5;          // steps between radar sweeps while the exit has not been seen
 const PROGRESS_EVERY = 25;      // steps between progress reports to the controller
 const RETRY_DELAY = 5000;       // ms to wait when labreport says we are lost or disconnected
+const HEARTBEAT = 60000;        // ms: report at least this often so the controller can tell we live
 const MAX_LOST = 12;            // give up after this many consecutive failed labreports
 const CHARISMA_PATTERN = /charismatic|charming|charisma|moxie/i;
 const BLOCKED_PATTERN = /cannot go that way/i;
@@ -91,6 +95,20 @@ export function nextMove(visited, stack, coords, open, target) {
     return { dir: null, push: false };
 }
 
+/** True when a labreport's coordinates cannot be explained by the move we just made.
+ *
+ * `expected` is where the move should have put us and `previous` is where we were before it
+ * (a blocked move or a timeout leaves us there). Anything else means the maze was regenerated
+ * under us and the walker was teleported to a fresh start, so `visited` and the backtrack
+ * stack now describe a maze that no longer exists and have to be thrown away.
+ *
+ * `expected` null (the first report of the run) is never a restart. */
+export function shouldRestart(coords, expected, previous) {
+    if (!expected) return false;
+    const here = cellKey(coords);
+    return here !== cellKey(expected) && here !== cellKey(previous ?? expected);
+}
+
 /** Absolute coordinates of the exit in a labradar window, or null when it is out of range.
  * The window is a square of odd size with '@' on the walker and 'X' on the exit. */
 export function findExit(radar, coords) {
@@ -123,16 +141,21 @@ export async function main(ns) {
     const me = ns.getHostname();
     const port = options.port;
     const send = (payload) => {
+        reportedAt = Date.now();
         const line = encodeMsg("walker", me, ns.pid, { lab: labHost, ...payload });
         if (!ns.tryWritePort(port, line)) ns.print(`WARN: port ${port} full, dropped: ${line}`);
     };
 
+    const chaReq = (LABS.find(row => row.host === labHost) ?? {}).cha ?? 0;
     const visited = new Set();
     const stack = [];
     let steps = 0;
     let sinceRadar = RADAR_EVERY;   // sweep on the very first cell
     let lost = 0;
     let target = null;
+    let expected = null;            // where the last move should have left us
+    let previous = null;            // where we were before the last move
+    let reportedAt = 0;
 
     while (true) {
         const report = await ns.dnet.labreport();
@@ -147,6 +170,16 @@ export async function main(ns) {
         }
         lost = 0;
         const coords = report.coords;
+        if (shouldRestart(coords, expected, previous)) {
+            ns.print(`WARN: expected to be at ${cellKey(expected)} but labreport says ${cellKey(coords)}; the maze was regenerated, restarting the walk`);
+            send({ steps, done: false, reason: "restart" });
+            visited.clear();
+            stack.length = 0;
+            target = null;              // the exit moved with the maze
+            sinceRadar = RADAR_EVERY;   // so the next loop sweeps immediately
+        }
+        expected = null;
+        previous = coords;
         visited.add(cellKey(coords));
 
         if (target === null && sinceRadar >= RADAR_EVERY) {
@@ -165,6 +198,7 @@ export async function main(ns) {
         if (move.push) stack.push(move.dir); else stack.pop();
 
         const outcome = await ns.dnet.authenticate(labHost, move.dir);
+        expected = coords;              // unless the move landed, we are still where we were
         if (outcome.code === 408) {
             // A network timeout says nothing about the move; undo the bookkeeping and retry.
             if (move.push) stack.pop(); else stack.push(OPP[move.dir]);
@@ -177,7 +211,7 @@ export async function main(ns) {
         }
         const message = String(outcome.message ?? "");
         if (outcome.code === 451 || CHARISMA_PATTERN.test(message)) {
-            send({ steps, done: false, reason: "charisma" });
+            send({ steps, done: false, reason: "charisma", chaReq });
             return ns.print(`giving up: charisma is too low for ${labHost}`);
         }
         if (BLOCKED_PATTERN.test(message)) {
@@ -191,8 +225,11 @@ export async function main(ns) {
             if (move.push) stack.pop();
             continue;
         }
+        expected = stepTo(coords, move.dir);
         steps++;
-        if (steps % PROGRESS_EVERY === 0) send({ steps, done: false });
+        // Also report on a timer: the controller treats a walker that has been silent for five
+        // minutes as dead, and 25 moves through a deep lab can take longer than that.
+        if (steps % PROGRESS_EVERY === 0 || Date.now() - reportedAt >= HEARTBEAT) send({ steps, done: false });
     }
 }
 

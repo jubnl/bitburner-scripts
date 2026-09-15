@@ -1,6 +1,16 @@
 import { getConfiguration } from "../helpers.js";
 import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText } from "./lib.js";
 
+/* The darknet agent. One per cracked, online darknet server. It never plans: it executes the
+ * command file the controller pushes, reports what it sees, and spreads itself to neighbours.
+ *
+ * Static RAM budget (target: under 5 GB):
+ *   base 1.60 | exec 1.30 | scp 0.60 | dnet.probe 0.20 | ls 0.20 | dnet.getServerDetails 0.10
+ *   isRunning 0.10 | fileExists 0.10 | dnet.unleashStormSeed 0.10 | getServerMaxRam 0.05
+ *   getServerUsedRam 0.05 | dnet.connectToSession 0.05 | getHostname 0.05
+ *   dnet.getBlockedRam 0 | read/write/tryWritePort/print/disableLog/flags/sleep 0  => 4.50 GB
+ */
+
 const argsSchema = [["port", PORT_DEFAULT], ["interval", 4000]];
 export function autocomplete(data) { data.flags(argsSchema); return []; }
 
@@ -58,6 +68,16 @@ export async function main(ns) {
         if (cmd.promoteSymbols.length && !ns.isRunning("darknet/promote.js", me, ...cmd.promoteSymbols, "--port", port) && (cmd.threads.promote || 0) > 0) {
             const promoteThreads = Math.min(cmd.threads.promote, Math.floor(freeRam(ns, me) / WORKER_RAM.promote));
             if (promoteThreads >= 1) ns.exec("darknet/promote.js", me, { threads: promoteThreads, preventDuplicates: true }, ...cmd.promoteSymbols, "--port", port);
+        }
+        // The labyrinth walker has to run on a host directly connected to the lab, and ns.exec
+        // needs a direct connection to its target, so only this agent can start it -- the
+        // controller just names the host in the command file.
+        if (cmd.walk && neighbours.includes(cmd.walk) && (cmd.walkThreads || 0) >= 1 && !ns.isRunning("darknet/lab.js", me, cmd.walk, "--port", port)) {
+            const walkThreads = Math.min(cmd.walkThreads, Math.floor(freeRam(ns, me) / WORKER_RAM.lab));
+            if (walkThreads >= 1) {
+                const pid = ns.exec("darknet/lab.js", me, { threads: walkThreads, preventDuplicates: true }, cmd.walk, "--port", port);
+                dispatch("worker", { kind: "walker-launch", host: me, lab: cmd.walk, threads: walkThreads, workerPid: pid });
+            }
         }
         if (cmd.storm && ns.fileExists("STORM_SEED.exe", me)) { const r = ns.dnet.unleashStormSeed(); dispatch("worker", { kind: "storm", host: me, success: r.success, code: r.code }); }
         if (cmd.stasis && !ns.fileExists("darknet/stasis-done.txt", me) && freeRam(ns, me) >= WORKER_RAM.stasis) { ns.exec("darknet/stasis.js", me, 1, "--port", port); ns.write("darknet/stasis-done.txt", "1", "w"); }

@@ -47,6 +47,7 @@ const MAX_PROMOTE_SYMBOLS = 3;
 const LAB_DEPTH_SLACK = 6;          // balanced mode flips to labyrinth within this many rows of the lab
 const MIGRATION_CHARGE_TTL = 600000; // a migration charge counts as "in flight" for 10 minutes
 const SERVER_TTL = 300000;          // a known server nothing has confirmed for 5 minutes is presumed gone
+const WALKER_TTL = 300000;          // a walker that has not reported for 5 minutes is presumed dead
 const MAX_PORT_DRAIN = 5000;        // hard stop so a flooded port cannot hang the loop
 const MONEY_PATTERN = /\$([\d.]+)([kmbtq]?)/i;
 
@@ -96,13 +97,13 @@ export async function main(ns) {
             state.plan.charismaGoal = plan.charismaGoal;
             state.plan.shareActive = plan.shareActive;
 
+            state.labs.current = plan.lab ? plan.lab.host : null;
+            // Before buildCmd: planning a walker only writes `walk`/`walkThreads` into the
+            // chosen hosts' command files, and the lab-adjacent agent starts it from there.
+            if (mode === "labyrinth") launchWalkers(ns, state, plan, options);
+
             bootstrap(ns, state, plan, options);
             pushFiles(ns, state, plan);
-            state.labs.current = plan.lab ? plan.lab.host : null;
-            // Walkers are launched after pushFiles: a winning walker copies its own host's
-            // passwords.txt and cmd.txt onto the lab so the agent it starts there has a
-            // command file, and those two files only exist on that host once the push ran.
-            if (mode === "labyrinth") launchWalkers(ns, state, plan, options);
             if (plan.stormHost) state.plan.lastStormAt = Date.now();
 
             ns.write(FILES.charismaGoal, String(plan.charismaGoal), "w");
@@ -317,7 +318,9 @@ function applyMessage(state, msg) {
             // dies with its server never gets to send a final message.
             const lab = msg.lab;
             const previous = (state.labs.walkers ?? []).find(row => row.pid === msg.pid);
-            const walkers = (state.labs.walkers ?? []).filter(row => row.pid !== msg.pid);
+            // One walker per host (preventDuplicates plus identical exec args), so a host is as
+            // good a key as a pid -- and it also retires the entry a restarted walker replaces.
+            const walkers = (state.labs.walkers ?? []).filter(row => row.pid !== msg.pid && row.host !== host);
             if (!msg.done) {
                 walkers.push({
                     host: msg.from, pid: msg.pid, lab, steps: Number(msg.steps) || 0,
@@ -385,6 +388,17 @@ function applyWorkerMessage(state, msg, ts, host) {
             const seen = Number(entry.promoteReported) || 0;
             state.stats.promoteCalls = (Number(state.stats.promoteCalls) || 0) + Math.max(0, total >= seen ? total - seen : total);
             entry.promoteReported = total;
+            break;
+        }
+        case "walker-launch": {
+            // The agent on `host` started darknet/lab.js on itself. That is the first proof the
+            // walker exists, so the roster (and therefore the --lab-walkers cap) starts here.
+            upsertServer(state, host, {}, ts);
+            if (msg.workerPid && msg.lab) {
+                const walkers = (state.labs.walkers ?? []).filter(row => row.host !== host);
+                walkers.push({ host, pid: msg.workerPid, lab: msg.lab, startedAt: ts, lastSeen: ts, steps: 0 });
+                state.labs.walkers = walkers;
+            }
             break;
         }
         case "storm": {
@@ -484,6 +498,9 @@ function basePlan(ns, state, options, charisma) {
         reallocThreads: Math.max(1, Math.floor(Number(options["realloc-threads"]) || 1)),
         stormHost: null,
         lab: null,
+        walkLab: null,              // the labyrinth `walkHosts` should be sent into
+        walkHosts: [],              // hosts whose command file asks their agent to start a walker
+        walkThreads: 0,
         charisma,
         frontierDepth: frontierDepth(state),
     };
@@ -595,17 +612,20 @@ export function planLabyrinth(ns, state, options, charisma = 0) {
 
     const liveNow = Date.now();
     const online = Object.entries(state.servers).filter(([name, entry]) => isLive(entry, liveNow) && !isLabHost(name));
+    // Only commandable hosts: a stasis link is applied by stasis.js, which the host's agent only
+    // starts because its command file said so, so pinning a host we cannot reach does nothing
+    // except waste a slot in `assignStasis`'s budget.
+    const reachable = commandable(state);
     const adjacent = online
-        .filter(([, entry]) => (entry.neighbours ?? []).includes(lab.host))
+        .filter(([name, entry]) => reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
         .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
         .map(([name]) => name);
     const deepest = online
-        .slice()
+        .filter(([name]) => reachable.includes(name))
         .sort((a, b) => (Number(b[1].depth) || 0) - (Number(a[1].depth) || 0))
         .map(([name]) => name);
     plan.stasisTargets = assignStasis(ns, adjacent.length ? adjacent : deepest);
 
-    const reachable = commandable(state);
     for (const row of AIR_GAP_ROWS) {
         if (row >= lab.depth) continue;
         if (online.some(([, entry]) => (Number(entry.depth) || 0) > row)) continue;   // gap already crossed
@@ -675,6 +695,7 @@ export function buildCmd(state, plan, host) {
     for (const [name, chargers] of Object.entries(plan.migrationTargets ?? {})) {
         if (chargers.includes(host)) { migrateTarget = name; break; }
     }
+    const walking = (plan.walkHosts ?? []).includes(host);
     return {
         mode: plan.mode,
         claimed,
@@ -690,6 +711,8 @@ export function buildCmd(state, plan, host) {
         stasis: plan.stasisTargets.includes(host),
         "share": plan.shareActive,
         storm: plan.stormHost === host,
+        walk: walking ? plan.walkLab : null,
+        walkThreads: walking ? plan.walkThreads : 0,
         stop: false,
     };
 }
@@ -764,6 +787,22 @@ export function pushFiles(ns, state, plan) {
 
 // ---------------------------------------------------------------- labyrinth walkers
 
+// Reasons already written to the log, so a condition that persists for hours does not write a
+// line every loop. A key is forgotten again as soon as its condition clears, so the message
+// comes back if it recurs. These never toast: none of them needs the player's attention.
+const announced = new Set();
+
+/** @param {NS} ns */
+function announceOnce(ns, key, message) {
+    if (announced.has(key)) return;
+    announced.add(key);
+    log(ns, message);
+}
+
+function forgetAnnouncement(key) {
+    announced.delete(key);
+}
+
 /** @param {NS} ns */
 function freeRam(ns, host) {
     // A darknet server folds its blocked RAM into ramUsed (NetscriptWorker.ts), so this is
@@ -771,93 +810,103 @@ function freeRam(ns, host) {
     return ns.getServerMaxRam(host) - ns.getServerUsedRam(host);
 }
 
-/** Keep up to `--lab-walkers` copies of darknet/lab.js running on servers that neighbour the
- * current labyrinth, and prune the roster of the ones that have stopped.
+/** Plan this loop's labyrinth walkers.
  *
- * Only servers directly connected to the lab qualify: labreport/labradar/authenticate all
- * require it. One walker per host, because `preventDuplicates` plus identical exec args means
- * a second one on the same host could never start anyway -- which is also what makes
- * `ns.isRunning` with those same args an exact aliveness test.
+ * The walker has to run on a host directly connected to the lab (labreport, labradar and
+ * authenticate all require it), and `ns.exec` also demands a direct connection *to its target*
+ * -- which home only has to `darkweb`. So the controller does not start walkers: it names the
+ * chosen hosts in `plan.walkHosts`, `buildCmd` turns that into `walk`/`walkThreads` in each
+ * host's command file, and the agent already running there execs the walker on itself.
+ * `darkweb` is the one exception, kept as a fallback for the case where its agent is not up yet.
  *
- * A candidate must also be somewhere the controller can ns.exec at all. ns.exec on a darknet
- * server demands a direct connection *from home* (NetscriptFunctions.ts), which only darkweb
- * has -- unless the target is backdoored, and setStasisLink sets backdoorInstalled. So the
- * candidates are the stasis-linked lab neighbours, which is exactly what planLabyrinth pins:
- * the first loops in labyrinth mode hand out the links, and walkers follow once they exist.
- * (ns.scp needs no direct connection, only a session, which is why pushFiles reaches everyone.)
+ * The lab itself is never given a session anywhere in this path: connectToSession on a
+ * labyrinth corrupts the walker's tracked position (see darknet/lab.js).
  *
- * The lab itself is never given a session here: connectToSession on a labyrinth corrupts the
- * walker's tracked position (see darknet/lab.js). Sessions are only opened on the *neighbour*
- * the walker runs on, exactly as pushFiles does.
+ * Aliveness comes from the walkers' own reports (a `walker-launch` from the agent, then a
+ * progress report at least once a minute), so a walker silent for WALKER_TTL is presumed dead
+ * and its slot is handed to another host.
  *
  * @param {NS} ns
- * @returns {number} walkers started this loop */
+ * @returns {string[]} the hosts asked to walk this loop */
 export function launchWalkers(ns, state, plan, options) {
     const lab = plan.lab;
-    if (!lab) return 0;
+    if (!lab) return [];
     const port = options.port;
+    const charisma = Number(plan.charisma) || 0;
 
-    // Prune first: a walker that exited (won, gave up, or died with its server) may never
-    // have managed a final report, so the script itself is the only trustworthy signal.
+    // Retire silent walkers first: a walker that won, gave up, or died with its server may
+    // never have managed a final report.
+    const now = Date.now();
     const alive = (state.labs.walkers ?? []).filter(walker => walker.lab === lab.host
         && typeof walker.host === "string"
-        && ns.isRunning("darknet/lab.js", walker.host, lab.host, "--port", port));
+        && now - (Number(walker.lastSeen ?? walker.startedAt) || 0) <= WALKER_TTL);
     state.labs.walkers = alive;
 
     // One win per reset: the reward augmentation has to be installed before the next lab
     // appears, and installing it wipes this state anyway.
-    if (state.labs.rewardQueuedAt) return 0;
-    if (state.labs.completed.includes(lab.host)) return 0;
+    if (state.labs.rewardQueuedAt) return [];
+    if (state.labs.completed.includes(lab.host)) return [];
+
+    // The lab's own charisma gate. Below it every authenticate comes back as the gate message,
+    // so a walker would burn network delays forever without taking a single step.
+    if (charisma < lab.cha) {
+        announceOnce(ns, `cha:${lab.host}`, `INFO: darknet is holding labyrinth walkers back: ${lab.host} needs ${lab.cha} charisma (have ${Math.floor(charisma)}).`);
+        return [];
+    }
+    forgetAnnouncement(`cha:${lab.host}`);
+    // A walker already hit the gate and reported the requirement. Believe it over LABS until
+    // charisma has actually risen to meet what it reported. The game's own test is
+    // `charisma < cha`, so equality is enough to pass and must clear the block.
+    const blocked = state.labs.charismaBlocked;
+    if (blocked && blocked.lab === lab.host) {
+        const required = Number(blocked.chaReq) || lab.cha;
+        if (charisma < required) {
+            const when = new Date(Number(blocked.at) || Date.now()).toLocaleTimeString();
+            announceOnce(ns, `blocked:${lab.host}`, `INFO: a walker reported at ${when} that ${lab.host} needs ${required} charisma (have ${Math.floor(charisma)}); not launching more.`);
+            return [];
+        }
+        state.labs.charismaBlocked = null;
+        forgetAnnouncement(`blocked:${lab.host}`);
+    }
 
     const wanted = Math.max(0, Math.floor(Number(options["lab-walkers"]) || 0));
-    if (alive.length >= wanted) return 0;
-    const threads = Math.max(1, Math.floor(Number(options["lab-threads"]) || 1));
-    const needed = threads * WORKER_RAM.lab;
+    plan.walkLab = lab.host;
+    plan.walkThreads = Math.max(1, Math.floor(Number(options["lab-threads"]) || 1));
+    plan.walkHosts = alive.map(walker => walker.host);
+    if (plan.walkHosts.length >= wanted) return plan.walkHosts;
 
-    const files = agentPayload(ns);
-    if (!files.includes("darknet/lab.js")) {
-        log(ns, "ERROR: darknet/lab.js is missing from home; cannot walk the labyrinth.", true, "error");
-        return 0;
-    }
-    const busy = new Set(alive.map(walker => walker.host));
+    const needed = plan.walkThreads * WORKER_RAM.lab;
+    const busy = new Set(plan.walkHosts);
     const reachable = commandable(state);
-    const executable = new Set([...ns.dnet.getStasisLinkedServers(), "darkweb"]);
-    const now = Date.now();
-    const adjacent = Object.entries(state.servers)
+    const candidates = Object.entries(state.servers)
         .filter(([name, entry]) => isLive(entry, now) && !isLabHost(name) && !busy.has(name)
             && reachable.includes(name) && (entry.neighbours ?? []).includes(lab.host))
-        .sort((a, b) => (Number(b[1].maxRam) || 0) - (Number(a[1].maxRam) || 0))
-        .map(([name]) => name);
-    const candidates = adjacent.filter(name => executable.has(name));
-    if (adjacent.length && !candidates.length) {
-        log(ns, `INFO: ${adjacent.length} server(s) neighbour ${lab.host} but none is stasis-linked yet, so ns.exec cannot reach them.`);
-    }
+        .map(([name]) => name)
+        .sort((a, b) => freeRam(ns, b) - freeRam(ns, a));
 
-    const running = alive.length;
-    let started = 0;
     for (const host of candidates) {
-        if (running + started >= wanted) break;
-        if (freeRam(ns, host) < needed) continue;
-        if (ns.isRunning("darknet/lab.js", host, lab.host, "--port", port)) continue;
-        const entry = state.servers[host];
-        const session = ns.dnet.connectToSession(host, state.passwords[host].password);
-        if (!session.success) {
-            if (session.code === 401 && state.passwords[host]) state.passwords[host].stale = true;
-            if (session.code === 503) { entry.online = false; entry.lastSeen = Date.now(); }
+        if (plan.walkHosts.length >= wanted) break;
+        if (freeRam(ns, host) < needed) {
+            announceOnce(ns, `ram:${host}`, `INFO: ${host} neighbours ${lab.host} but has under ${formatRam(needed, true)} free, so it cannot host a ${plan.walkThreads}-thread walker.`);
             continue;
         }
-        entry.lastSeen = Date.now();
-        ns.scp(files, host, "home");
-        const pid = ns.exec("darknet/lab.js", host, { threads, preventDuplicates: true }, lab.host, "--port", port);
-        if (!pid) {
-            log(ns, `WARN: darknet could not start a labyrinth walker on ${host}.`);
-            continue;
+        forgetAnnouncement(`ram:${host}`);
+        plan.walkHosts.push(host);
+        // darkweb is home's only direct darknet connection, so it is the one host the
+        // controller can start a walker on itself -- useful before its agent comes up.
+        if (host === "darkweb" && !ns.isRunning("darknet/lab.js", host, lab.host, "--port", port)) {
+            const files = agentPayload(ns);
+            if (files.includes("darknet/lab.js")) {
+                ns.scp(files, host, "home");
+                const pid = ns.exec("darknet/lab.js", host, { threads: plan.walkThreads, preventDuplicates: true }, lab.host, "--port", port);
+                if (pid) {
+                    state.labs.walkers.push({ host, pid, lab: lab.host, startedAt: Date.now(), lastSeen: Date.now(), steps: 0 });
+                    log(ns, `SUCCESS: darknet sent a walker into ${lab.host} from darkweb (pid ${pid}, ${plan.walkThreads} threads).`, false, "success");
+                }
+            }
         }
-        state.labs.walkers.push({ host, pid, lab: lab.host, startedAt: Date.now(), steps: 0 });
-        started++;
-        log(ns, `SUCCESS: darknet sent a walker into ${lab.host} from ${host} (pid ${pid}, ${threads} threads).`, false, "success");
     }
-    return started;
+    return plan.walkHosts;
 }
 
 // ---------------------------------------------------------------- status and shutdown
@@ -888,7 +937,7 @@ export function printStatus(ns, state) {
         `RAM freed: ${formatRam(state.stats.ramFreed, true)}  |  caches: ${state.stats.cachesOpened} worth ${formatMoney(state.stats.moneyFromCaches)}`,
         `phish successes: ${formatNumberShort(state.stats.phishSuccesses ?? 0, 6, 0)}  |  promote calls: ${formatNumberShort(state.stats.promoteCalls ?? 0, 6, 0)}`,
         `lab: ${lab ? `${lab.host} (depth ${lab.depth}, cha ${lab.cha})` : "none"}  |  completed ${state.labs.completed.length}  |  walkers ${state.labs.walkers.map(walker => `${walker.host}@${walker.steps ?? 0}`).join(", ") || "(none)"}`,
-        `lab reward queued: ${state.labs.rewardQueuedAt ? new Date(state.labs.rewardQueuedAt).toLocaleTimeString() : "no"}  |  lab password: ${lab && state.passwords[lab.host] ? "known" : "unknown"}`,
+        `lab reward queued: ${state.labs.rewardQueuedAt ? new Date(state.labs.rewardQueuedAt).toLocaleTimeString() : "no"}  |  lab password: ${lab && state.passwords[lab.host] ? "known" : "unknown"}  |  charisma gate: ${state.labs.charismaBlocked ? `${state.labs.charismaBlocked.chaReq ?? "?"} reported` : "clear"}`,
         `stasis links: ${linked.join(", ") || "(none)"}  (planned: ${state.plan.stasisTargets.join(", ") || "none"})`,
         `migration targets: ${Object.entries(state.plan.migrationTargets ?? {}).map(([name, chargers]) => `${name}<-${chargers.length}`).join(" ") || "(none)"}`,
         `promote symbols: ${state.plan.promoteSymbols.join(", ") || "(none)"}  |  share active: ${state.plan.shareActive}`,
@@ -903,7 +952,8 @@ async function stopEverything(ns, state, options) {
     const stopCmd = {
         mode: "loot", claimed: [],
         threads: { crack: 0, realloc: 0, phish: 0, migrate: 0, promote: 0 },
-        migrateTarget: null, promoteSymbols: [], stasis: false, "share": false, storm: false, stop: true,
+        migrateTarget: null, promoteSymbols: [], stasis: false, "share": false, storm: false,
+        walk: null, walkThreads: 0, stop: true,
     };
     ns.write(FILES.cmd, JSON.stringify(stopCmd), "w");
     const reached = [];

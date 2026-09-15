@@ -112,6 +112,11 @@ export function parseCmd(text) {
         stasis: false,
         "share": false,
         storm: false,
+        // The labyrinth this host's agent should send a walker into (null = none) and how many
+        // threads to give it. The controller picks the hosts; only the agent running on one can
+        // ns.exec the walker, because exec needs a direct connection to its target.
+        walk: null,
+        walkThreads: 0,
         stop: false,
     };
     return { ...base, ...(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) };
