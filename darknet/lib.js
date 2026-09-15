@@ -194,6 +194,14 @@ export function canHoldStasis(entry) {
     return (Number(entry?.maxRam) || 0) - (Number(entry?.blockedRam) || 0) >= STASIS_HOST_MIN_RAM;
 }
 
+/** Change key for the agent's report about its own host. `ns.dnet.probe()` shuffles its result
+ * on every call (src/NetscriptFunctions/Darknet.ts `return shuffle(out)`), so the neighbour list
+ * is sorted before it goes into the key; otherwise the key differs almost every loop and the
+ * agent floods the report port with self-reports. */
+export function selfReportKey(d, neighbours) {
+    return JSON.stringify([d.isOnline, d.depth, d.difficulty, d.blockedRam, d.modelId, d.hasSession, [...neighbours].sort()]);
+}
+
 /** Sizing rule for a filler worker (phish.js) that takes all spare RAM and never resizes
  * itself. `free` is the host's free RAM right now (the running filler counted as used),
  * `reserve` the RAM higher-priority work needs next tick (pending cracks, walkers, caches,

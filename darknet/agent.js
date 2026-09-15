@@ -1,5 +1,5 @@
 import { getConfiguration } from "../helpers.js";
-import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg, fillerPlan } from "./lib.js";
+import { FILES, AGENT_FILES, WORKER_RAM, PORT_DEFAULT, parseCmd, parsePasswords, encodeMsg, isLabHost, parseClueText, hostArg, fillerPlan, selfReportKey } from "./lib.js";
 
 /* The darknet agent. One per cracked, online darknet server. It never plans: it executes the
  * command file the controller pushes, reports what it sees, and spreads itself to neighbours.
@@ -53,7 +53,7 @@ export async function main(ns) {
         // (the neighbour list is part of the key), with a forced report every
         // SELF_REPORT_INTERVAL so the controller's SERVER_TTL never expires on a quiet host.
         const mine = ns.dnet.getServerDetails(me);
-        const myKey = JSON.stringify([mine.isOnline, mine.depth, mine.difficulty, mine.blockedRam, mine.modelId, mine.hasSession, neighbours]);
+        const myKey = selfReportKey(mine, neighbours); // sorted: probe() shuffles its result every call
         if (lastSeen[me] !== myKey || Date.now() - selfReportedAt >= SELF_REPORT_INTERVAL) {
             lastSeen[me] = myKey; selfReportedAt = Date.now();
             dispatch("server", { host: me, details: mine, neighbours });

@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { fillerPlan, WORKER_RAM, FILES, STASIS_HOST_MIN_RAM } from "../darknet/lib.js";
+import { fillerPlan, selfReportKey, WORKER_RAM, FILES, STASIS_HOST_MIN_RAM } from "../darknet/lib.js";
 
 const unit = WORKER_RAM.phish;
 const src = (f) => readFileSync(new URL(`../${f}`, import.meta.url), "utf8");
@@ -48,4 +48,17 @@ test("agent.js sizes the phish filler with fillerPlan and holds RAM for pending 
     assert.match(agent, /FILES\.phishResize/);
     assert.match(agent, /reserve \+= WORKER_RAM\.cache/);
     assert.match(agent, /reserve \+= WORKER_RAM\.stasis/);
+});
+
+// DN-F1: ns.dnet.probe() shuffles its result on every call (src/NetscriptFunctions/Darknet.ts
+// `return shuffle(out)`), so a change key built from the raw list changes almost every loop.
+test("selfReportKey ignores the order probe() returns the neighbours in", () => {
+    const d = { isOnline: true, depth: 3, difficulty: 2, blockedRam: 0, modelId: "m", hasSession: false };
+    assert.equal(selfReportKey(d, ["b", "a", "c"]), selfReportKey(d, ["c", "b", "a"]));
+    assert.notEqual(selfReportKey(d, ["a", "b"]), selfReportKey(d, ["a", "b", "c"]), "a new neighbour still changes the key");
+    assert.notEqual(selfReportKey(d, ["a"]), selfReportKey({ ...d, hasSession: true }, ["a"]), "a detail change still changes the key");
+});
+
+test("agent.js keys its own server report with selfReportKey", () => {
+    assert.match(src("darknet/agent.js"), /selfReportKey\(mine, neighbours\)/);
 });
