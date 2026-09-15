@@ -7,7 +7,7 @@ import {
     jobs, executiveJobTitles, silhouetteExecutiveJob, SILHOUETTE_EXECUTIVE_REP, BACKDOOR_REP_MULT,
     pickSilhouetteCompany, jobTierRequirements, cityFactions, filterCityFactionInvites,
     crimeStats, slowCrimes, crimeCombatExpRate, bestCombatExpCrime,
-    endgameInviteRequirements, endgameInviteBlocker,
+    endgameInviteRequirements, endgameInviteBlocker, pickNeurofluxFaction,
 } from "../progression-rules.js";
 
 const SRC = "/home/jubnl/dev/bitburner/bitburner-src/src/";
@@ -154,4 +154,17 @@ test("endgameInviteBlocker: augs first, then money, null when satisfied or not a
     assert.deepEqual(endgameInviteBlocker("Daedalus", 1e12, 29, 25), null); // BN-specific requirement honoured
     assert.deepEqual(endgameInviteBlocker("Illuminati", 149e9, 40, 30), { reason: "money", have: 149e9, need: 150e9 });
     assert.equal(endgameInviteBlocker("Tetrads", 0, 0, 30), null);
+});
+
+test("pickNeurofluxFaction: free rep first (most rep), then donations, else null", () => {
+    const daedalus = { name: "Daedalus", reputation: 2e6, donationsUnlocked: false };
+    const cybersec = { name: "CyberSec", reputation: 100e3, donationsUnlocked: true };
+    const nitesec = { name: "NiteSec", reputation: 500e3, donationsUnlocked: true };
+    const factions = [cybersec, daedalus, nitesec];
+    assert.equal(pickNeurofluxFaction(factions, 94e3), daedalus);   // level 20-40 rep, free from Daedalus although it cannot take donations
+    assert.equal(pickNeurofluxFaction(factions, 400e3), daedalus);
+    assert.equal(pickNeurofluxFaction(factions, 2.5e6), nitesec);   // beyond every faction's rep: cheapest donation = most rep among donation-unlocked
+    assert.equal(pickNeurofluxFaction([daedalus], 2.5e6), null);    // nothing free and no donations possible
+    assert.equal(pickNeurofluxFaction([], 1), null);
+    assert.deepEqual(factions, [cybersec, daedalus, nitesec]);      // not mutated
 });

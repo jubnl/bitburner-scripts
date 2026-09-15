@@ -2,6 +2,7 @@ import {
     log, getConfiguration, instanceCount, formatNumberShort, formatMoney,
     getNsDataThroughFile, getActiveSourceFiles, tryGetBitNodeMultipliers, getStocksValue
 } from './helpers.js'
+import { pickNeurofluxFaction } from './progression-rules.js'
 
 // PLAYER CONFIGURATION CONSTANTS
 // This acts as a list of default "easy" factions to always show even if the user has --hide-locked-factions
@@ -471,14 +472,9 @@ class AugmentationData {
                 augFactions.sort((a, b) => b.reputation - a.reputation)[0] || // Faction we are closest to being able to get it from (most rep)
                 augFactions[0])?.name; // First faction in our faction list order (which should be ordered by priority)
 
-        // The "Neuroflux" augmentation uses a different approach.
-        // Prefer to purchase NF first from whatever joined factions have donations unlocked (allow us to continuously donate for more), next by faction with the most current reputation.
-        return augFactions.sort((a, b) => // This sort order prefers factions that support donations over ones that already have sufficient rep for one or more NF levels.
-            ((b.donationsUnlocked ? 1 : 0) - (a.donationsUnlocked ? 1 : 0)) || (b.reputation - a.reputation))[0]?.name;
-        // This (disabled) sort order prefers factions that already have enough reputation to buy at least one level of NF (whether they support donations or not)
-        // augFactions.sort((a, b) => ((b.reputation >= this.reputation ? 1 : 0) - (a.reputation >= this.reputation ? 1 : 0)) ||
-        //    ((b.donationsUnlocked ? 1 : 0) - (a.donationsUnlocked ? 1 : 0)) || (b.reputation - a.reputation))[0]?.name;
-        // TODO: #145 Is there a way to first buy NF from factions that already have enough rep, before switching to a different faction that supports donations?
+        // The "Neuroflux" augmentation uses a different approach: take the next level from a faction that already has the rep (free), else from one
+        // with donations unlocked, else the one with the most rep. (#145: managePurchaseableAugs re-picks the faction for every level it adds.)
+        return (pickNeurofluxFaction(augFactions, this.reputation) ?? augFactions.sort((a, b) => b.reputation - a.reputation)[0])?.name;
     }
     /** @returns {string} A formatted row of information for this augmentation */
     toString() {
@@ -829,7 +825,8 @@ async function managePurchaseableAugs(ns, outputRows, accessibleAugs) {
         nfAppendPosition--;
     // Start adding as many NeuroFlux levels as we can afford
     let nfPurchased = purchaseableAugs.filter(a => a.name === augNf.name).length;
-    const augNfFaction = factionData[augNf.getFromJoined()];
+    let augNfFaction = factionData[augNf.getFromJoined()]; // Re-picked per level below: free rep first, then a donation faction (#145)
+    const nfFactions = augNf.joinedFactionsWithAug();
     if (augNfFaction && (augNf.canAfford() || augNf.canAffordWithDonation()))
         log(ns, `Getting NF from faction ${augNfFaction.name} (rep: ${formatNumberShort(augNfFaction.reputation)}). Price of next NF (Level ${nextNfLevel}) is ` +
             `${formatMoney(augNf.price)}, requires reputation: ${formatNumberShort(augNf.reputation)} ` +
@@ -838,6 +835,8 @@ async function managePurchaseableAugs(ns, outputRows, accessibleAugs) {
     while (augNfFaction && nfPurchased < 200) { // Limit to 200 to avoid breaking the game if near infinite money.
         const nextNfCost = augNf.price * (nfCountMult ** nfPurchased) * (augCountMult ** purchaseableAugs.length);
         const nextNfRep = augNf.reputation * (nfCountMult ** nfPurchased);
+        // Source this level from a faction that already has the rep (free), else a donation-unlocked one; keep the previous pick if neither exists (the break below fires)
+        augNfFaction = pickNeurofluxFaction(nfFactions, nextNfRep) ?? augNfFaction;
         const currentNfFactionDonation = purchaseFactionDonations[augNfFaction.name] || 0;
         const nextNfTotalRepDonation = (nextNfRep <= augNfFaction.reputation) ? 0 : getReqDonationForRep(nextNfRep, augNfFaction);
         const nextNfRepCost = Math.max(0, nextNfTotalRepDonation - currentNfFactionDonation); // Compute the incremental cost of donating for rep
@@ -855,10 +854,11 @@ async function managePurchaseableAugs(ns, outputRows, accessibleAugs) {
             break; // If we cannot afford the next NF, break
         }
         // Otherwise, add the next NF to our purchase order, and see if we can afford any more.
-        // TODO: #145 Buy NF from different factions as we move from ones with enough rep to ones that support donation
         const nextNfPrice = augNf.price * (nfCountMult ** nfPurchased); // Note this should be the base price, before scaling for number of augs purchased
         const nfClone = new AugmentationData(augNf.name, nextNfRep, nextNfPrice, augNf.stats, augNf.prereqs); // { ...augNf };
         nfClone.displayName += ` Level ${nextNfLevel}`
+        const nfFactionName = augNfFaction.name; // Pin the faction this level is bought from (purchaseDesiredAugs / computeCosts use aug.getFromJoined())
+        nfClone.getFromJoined = () => nfFactionName;
         // Note, insert all NF purchases after the current NF purchase, in front of all augs cheaper than the first NF
         purchaseableAugs.splice(purchaseableAugs.length + nfAppendPosition, 0, nfClone);
         totalAugCost += nextNfCost;

@@ -111,3 +111,12 @@ export function endgameInviteBlocker(factionName, money, installedAugCount, daed
     if (money < req.money) return { reason: "money", have: money, need: req.money };
     return null;
 }
+
+/** Choose the joined faction to buy the next NeuroFlux level from: one that already has the rep (free; the most rep so it keeps covering
+ *  later levels), otherwise one with donations unlocked (most rep = cheapest donation), otherwise null. Rep is not consumed by purchases.
+ * @param {{name: string, reputation: number, donationsUnlocked: boolean}[]} factions joined factions offering NeuroFlux
+ * @param {number} repNeeded reputation requirement of the next NeuroFlux level */
+export function pickNeurofluxFaction(factions, repNeeded) {
+    const byRep = factions.slice().sort((a, b) => b.reputation - a.reputation);
+    return byRep.find(f => f.reputation >= repNeeded) ?? byRep.find(f => f.donationsUnlocked) ?? null;
+}
