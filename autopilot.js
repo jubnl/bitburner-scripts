@@ -949,6 +949,9 @@ export async function main(ns) {
             if (totalCost == 0) totalCost = 1; // Hack, logic below expects some non-zero reserve in preparation for ascending.
         }
 
+        // Local copy of --install-countdown: the quick-install branch below shortens it for this evaluation only (not for the rest of the process)
+        let installCountdownMs = options['install-countdown'];
+
         // Heuristic: if we can afford 4 or more augs in the first ~20 minutes, it's usually worth doing a "quick install"
         // For example, in BN8, we get a big cash influx on each reset and can buy reputation immediately, so it's worth
         //     doing an few immediate installs to purchase upgrades, then reset for more free cash.
@@ -960,8 +963,8 @@ export async function main(ns) {
             (resetInfo.currentNode == 8 && getTimeInBitnode() < 10 * 60 * 1000))) {
             shouldReset = true;
             resetStatus = `We haven't been in this reset for long. We can do a quick reset immediately for a quick stat boost.\n${resetStatus}`;
-            if (options['install-countdown'] > 30 * 1000 && !playerInGang)
-                options['install-countdown'] = 30 * 1000; // Install relatively quickly in this scenario (30s)
+            if (installCountdownMs > 30 * 1000 && !playerInGang)
+                installCountdownMs = 30 * 1000; // Install relatively quickly in this scenario (30s)
         }
 
         // If not ready to reset, set a status with our progress and return
@@ -980,7 +983,7 @@ export async function main(ns) {
         if (reservedPurchase < totalCost) {
             // A countdown is displayed to give the user a heads up, and give us time to potentially earn money for more augmentations
             if (reservedPurchase == 0)
-                installCountdown = Date.now() + options['install-countdown'];
+                installCountdown = Date.now() + installCountdownMs;
             else { // If we were already reserving for a purchase and the number went up, log a notice of the timer being reset.
                 let purchaseChangeLog = `INFO: The augmentation purchase we can afford has increased from ${formatMoney(reservedPurchase)} to ${formatMoney(totalCost)}.`
                 // First, check if we're ready to install TRP - if so, don't delay the install for any additional augmentations.
@@ -991,7 +994,7 @@ export async function main(ns) {
                     installCountdownResets++;
                     const newCountDown = Date.now() + Math.max(10 * 1000, // At a bare minimum, wait 10 more seconds
                         // Heuristic: Linearly reduce the cooldown until we have doubled the aug count needed.
-                        options['install-countdown'] * (1 - (installCountdownResets / augsNeededInclNf)));
+                        installCountdownMs * (1 - (installCountdownResets / augsNeededInclNf)));
                     if (newCountDown > installCountdown) { // If the existing countdown remaining was longer than this, leave it be
                         installCountdown = newCountDown;
                         purchaseChangeLog = purchaseChangeLog + ' Resetting the timer before we install augmentations.'
@@ -1003,7 +1006,7 @@ export async function main(ns) {
         }
         // We must wait until the configured cooldown elapses before we install augs.
         if (installCountdown > Date.now()) {
-            resetStatus += `\n  Waiting for ${formatDuration(options['install-countdown'])} (--install-countdown) ` +
+            resetStatus += `\n  Waiting for ${formatDuration(installCountdownMs)} (--install-countdown) ` +
                 `to elapse before we install, in case we're close to being able to purchase more augmentations...`;
             setStatus(ns, resetStatus);
             ns.toast(`Heads up: Autopilot plans to reset in ${formatDuration(installCountdown - Date.now())}`, 'info');
