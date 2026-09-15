@@ -8,6 +8,7 @@ export async function main(ns) {
         return log(ns, 'Another instance is already running. Shutting down...');
 
     disableLogs(ns, ["scan"]);
+    ns.write('/Temp/contractor-heartbeat.txt', String(Date.now()), 'w'); // HN-4: lets spend-hacknet-hashes.js know that generated contracts will get solved (0 GB)
     ns.print("Getting server list...");
     const servers = await getNsDataThroughFile(ns, 'scanAllServers(ns)');
     ns.print(`Got ${servers.length} servers. Searching for contracts on each...`);

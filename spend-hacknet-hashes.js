@@ -11,7 +11,9 @@ const argsSchema = [
     ['spend-on-server', null], // The server to boost, for spend options that take a server argument: 'Reduce Minimum Security' and 'Increase Maximum Money'
     ['spend-on-company', null], // The company to target, for spend options that take a company argument: 'Company Favor' (v3.0: +5 favor per purchase, persists until you leave the BitNode)
     ['contracts-before-money', true], // When no explicit --spend-on is given, prefer 'Generate Coding Contract' (solved automatically by contractor.js) over 'Sell for Money' while contracts are cheap enough (see --max-contract-cost-ratio). Set `--contracts-before-money false` to only sell for money.
-    ['max-contract-cost-ratio', 40], // Only generate a contract while its hash cost (25 * (contracts generated + 1)) is at most this many times the 'Sell for Money' cost (4 hashes). A contract pays >= $25m * difficulty (v3.0: 75e6 * difficulty * BN mult / 3), so at the default ratio (160 hashes = $40m) it is still a bargain.
+    ['max-contract-cost-ratio', 40], // Only generate a contract while its hash cost (25 * (contracts generated + 1)) is at most this many times the 'Sell for Money' cost (4 hashes). A generated contract's reward is picked uniformly from faction rep, all-faction rep, company rep and money (v3.0 src/CodingContract/ContractGenerator.ts getRandomReward), and the money reward is 75e6 * difficulty * BN mult * scaling (src/PersonObjects/Player/PlayerObjectGeneralMethods.ts), so the expected money is only a quarter of that; at the default ratio (160 hashes = $40m of 'Sell for Money') it is still a bargain, and the reputation rewards are the real value. Only at most 6 contracts per install are this cheap (the level resets on install).
+    ['require-contractor', true], // HN-4: only generate contracts while Tasks/contractor.js has run recently (it writes /Temp/contractor-heartbeat.txt on every run; daemon.js launches it every 27 s). Contracts nobody solves are worth nothing.
+    ['contractor-max-age', 300], // (seconds) How old the contractor heartbeat may be for --require-contractor
     ['no-capacity-upgrades', false], // By default, we will attempt to upgrade the hacknet node capacity if we cannot afford any purchases. Set to true to disable this.
     ['reserve', null], // The amount of player money to leave unpent when considering buying capacity upgrades (defaults to the amount in reserve.txt on home)
     ['ignore-reserve-if-upgrade-cost-less-than-pct', 0.01], // Hack to purchase capacity upgrades regardless of the curent global reserve if they cost less than this fraction of player money
@@ -26,6 +28,15 @@ const companySpendOptions = ['Company Favor']; // Upgrades which take a company 
 const parameterizedSpendOptions = serverSpendOptions.concat(companySpendOptions);
 const purchaseOptions = basicSpendOptions.concat(parameterizedSpendOptions);
 const minTimeBetweenToasts = 5000; // milleconds. If we start buying a lot of things, throttle toast notifications.
+
+export const contractorHeartbeatFile = '/Temp/contractor-heartbeat.txt'; // HN-4: written by Tasks/contractor.js on every run (ms timestamp)
+
+/** HN-4: whether the contract solver ran recently enough for a generated contract to get solved.
+ * @param {string} heartbeatText contents of contractorHeartbeatFile (a Date.now() string, or '' when missing) @param {number} nowMs @param {number} maxAgeMs */
+export function contractorIsActive(heartbeatText, nowMs, maxAgeMs) {
+    const lastRun = Number(heartbeatText);
+    return heartbeatText != '' && Number.isFinite(lastRun) && nowMs - lastRun <= maxAgeMs;
+}
 
 export function autocomplete(data, args) {
     data.flags(argsSchema);
@@ -68,9 +79,11 @@ export async function main(ns) {
     const contractsBeforeMoney = options['contracts-before-money'] && !explicitSpendOn;
     const maxContractCostRatio = options['max-contract-cost-ratio'];
     const primaryPurchases = contractsBeforeMoney ? [generateContract, ...toBuy] : toBuy;
-    // Predicate: an action is worth buying unless it is our (implicit) contract generation and contracts have become too expensive relative to money
+    // Predicate: an action is worth buying unless it is our (implicit) contract generation and contracts have become too expensive relative to money,
+    // or (HN-4) nobody is around to solve them (contractor.js heartbeat too old; ns.read is 0 GB)
     const isWorthBuying = (spendAction) => spendAction != generateContract || !contractsBeforeMoney ||
-        ns.hacknet.hashCost(generateContract) <= maxContractCostRatio * ns.hacknet.hashCost(sellForMoney);
+        (ns.hacknet.hashCost(generateContract) <= maxContractCostRatio * ns.hacknet.hashCost(sellForMoney) &&
+            (!options['require-contractor'] || contractorIsActive(ns.read(contractorHeartbeatFile), Date.now(), options['contractor-max-age'] * 1000)));
 
     disableLogs(ns, ['sleep', 'getServerMoneyAvailable']);
     ns.print(`Starting spend-hacknet-hashes.js... Will check in every ${formatDuration(interval)}`);
@@ -78,7 +91,8 @@ export async function main(ns) {
         `Saving up hashes, only spending hashes when near capacity to avoid wasting them.`);
     if (contractsBeforeMoney)
         ns.print(`Will prefer '${generateContract}' over '${sellForMoney}' while a contract costs at most ${maxContractCostRatio}x the money cost ` +
-            `(--contracts-before-money / --max-contract-cost-ratio).`);
+            `(--contracts-before-money / --max-contract-cost-ratio)` + (options['require-contractor'] ?
+                ` and Tasks/contractor.js has run in the last ${options['contractor-max-age']}s (--require-contractor).` : '.'));
 
     // Set up a helper to log but limit how often we generate a toast notification when making many purchases in a short time
     let lastToast = 0; // Last time we generated a toast notification about a successful purchase
