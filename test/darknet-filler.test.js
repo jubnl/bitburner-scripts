@@ -92,3 +92,11 @@ test("crack.js only heartbleeds for feedback models and agent.js orders cracks w
     assert.match(agent, /crackOrder\(/);
     assert.match(agent, /cmd\.charisma/);
 });
+
+// R12: the agent launches min(cmd.threads.crack, free) threads (6 by default) but reserved only 4 threads' worth
+// from the fillers, so a filler could keep the last two threads' RAM and the crack ran under-sized.
+test("agent.js reserves the full commanded crack thread count for a pending crack", () => {
+    const agent = src("darknet/agent.js");
+    assert.match(agent, /let reserve = pending\.length \? \(cmd\.threads\.crack \|\| 6\) \* WORKER_RAM\.crack : 0;/);
+    assert.doesNotMatch(agent, /Math\.min\(cmd\.threads\.crack \|\| 6, 4\)/);
+});

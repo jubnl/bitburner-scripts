@@ -59,7 +59,7 @@ export async function main(ns) {
             dispatch("server", { host: me, details: mine, neighbours });
         }
         // Cracking always outranks spare-RAM work (promote/phish/share): reserve enough RAM for
-        // up to 4 crack.js threads whenever a live, non-lab, unclaimed neighbour still needs one.
+        // the commanded crack.js thread count whenever a live, non-lab, unclaimed neighbour still needs one.
         // crackOrder drops oracle-model hosts above the charisma bar (heartbleed would refuse them, R4)
         // and puts hosts that would pay the underleveled auth penalty last.
         const pending = crackOrder(neighbours.filter(h => {
@@ -72,7 +72,7 @@ export async function main(ns) {
         // order the spec gives (section 6 -- realloc, migrate, promote, share, phish), realloc
         // is what *creates* the RAM a crack worker needs, and a migration charge is lost work
         // if it stalls. Promote/phish/share are pure filler and always yield to a pending crack.
-        let reserve = pending.length ? Math.min(cmd.threads.crack || 6, 4) * WORKER_RAM.crack : 0;
+        let reserve = pending.length ? (cmd.threads.crack || 6) * WORKER_RAM.crack : 0;
         // A commanded labyrinth walker outranks spare-RAM work too: hold its RAM back from
         // promote/phish/share so it has somewhere to land once buildCmd's threads.phish = 0 /
         // threads.promote = 0 / share = false empty the host out (may take a loop or two).
