@@ -558,6 +558,15 @@ test("chooseMode flips to labyrinth when the frontier sits just above an air gap
     assert.equal(chooseMode(ns, creeping, options, 2000), "loot", "row 7 is still crackable, keep looting");
     const crossed = makeState({ beyond: { depth: 9, difficulty: 7 } });
     assert.equal(chooseMode(ns, crossed, options, 2000), "loot", "past the gap and 10 rows short: loot until the next gap");
-    const secondGap = makeState({ beyond: { depth: 15, difficulty: 12 } });
-    assert.equal(chooseMode(ns, secondGap, options, 2000), "labyrinth", "row 16 also lies below the lab");
+
+    // Gap rule only: slack cannot satisfy this, only the gap check can.
+    const ns2 = makeNs({
+        charisma: 2500, ownedAugs: [LAB_AUGMENTATIONS.TheBrokenWings, LAB_AUGMENTATIONS.TheBoots, LAB_AUGMENTATIONS.TheHammer],
+        details: { ub3r_l4byr1nth: { isOnline: true, depth: -1 } },
+    });
+    assert.equal(currentLab(ns2, makeState({})).host, "ub3r_l4byr1nth");
+    const gapBlocked = makeState({ deep: { depth: 15, difficulty: 12 } });
+    assert.equal(chooseMode(ns2, gapBlocked, options, 2500), "labyrinth", "frontier 15 = row 16 - 1, lab at 23, slack 17 > 15");
+    const gapNotBlocked = makeState({ deep: { depth: 14, difficulty: 12 } });
+    assert.equal(chooseMode(ns2, gapNotBlocked, options, 2500), "loot", "frontier 14 is not row-1 of any gap");
 });
