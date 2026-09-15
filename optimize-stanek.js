@@ -318,11 +318,7 @@ function planBoosters(plan, boosterPlacements, boosterStatAdjacencies, blockedBo
     planBoostersCount++;
     if (availableCount == 0) {
         const { stats, boosters } = plan;
-
-        let score = 0;
-        for (let i = 0; i < boosters.length; i++)
-            score += boosterStatAdjacencies[boosters[i].key];
-        score = stats.length * (1 + 0.1 * score); // piecesPlaced*(1+0.1*numAdjacencies)
+        const score = scoreLayout(stats, boosters); // ST-2: power-weighted, boosters multiply (was piecesPlaced*(1+0.1*numAdjacencies))
 
         if (score > bestResult[0])
             return [score, { stats: [...stats], boosters: [...boosters] }]; // Clone plan
@@ -350,6 +346,21 @@ function planBoosters(plan, boosterPlacements, boosterStatAdjacencies, blockedBo
     }
 
     return bestResult;
+}
+
+/** ST-2: score a layout the way the game values it: each stat fragment's effect is proportional to its own power times the product of the
+ * powers (1.1 each) of the distinct boosters touching it (src/CotMG/StaneksGift.ts effect, src/CotMG/formulas/effect.ts CalculateEffect).
+ * Adding a stat or a booster never lowers the score, so planStats/planBoosters may keep scoring only maximal booster sets.
+ * @param {Placement[]} stats @param {Placement[]} boosters @return {number} */
+export function scoreLayout(stats, boosters) {
+    let score = 0;
+    for (const stat of stats) {
+        let boost = 1;
+        for (const booster of boosters)
+            if (stat.adjacentBoosters.includes(booster.key)) boost *= booster.fragment.power;
+        score += stat.fragment.power * boost;
+    }
+    return score;
 }
 
 /** @param {number} x0
