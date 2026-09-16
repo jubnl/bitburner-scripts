@@ -264,11 +264,9 @@ export function applyMessage(state, msg) {
                 maxRam: msg.maxRam, isStationary: details.isStationary,
             }, ts);
             // Only the agent running ON a host reports that host's neighbours; reports about a
-            // neighbour carry `neighbours: null`, so an untouched [] means "never scanned", not
-            // "island". `neighboursAt` is what tells the two apart.
+            // neighbour carry `neighbours: null`, so an untouched [] means "never scanned".
             if (Array.isArray(msg.neighbours)) {
                 entry.neighbours = msg.neighbours;
-                entry.neighboursAt = ts;
                 // A host the agent's probe still returns is provably alive right now, even
                 // when nothing has cracked it and so no report ever names it as `host`.
                 // Without this stamp, uncracked deep neighbours age past SERVER_TTL and

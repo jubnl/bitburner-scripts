@@ -73,7 +73,7 @@ function makeState(hosts) {
         state.servers[name] = {
             depth: row.depth ?? 1, difficulty: row.difficulty ?? 1, modelId: row.modelId ?? "TopPass",
             maxRam: row.maxRam ?? 32, blockedRam: row.blockedRam ?? 0, chaReq: row.chaReq ?? 0,
-            neighbours: row.neighbours ?? [], neighboursAt: now, online: true, lastSeen: now,
+            neighbours: row.neighbours ?? [], online: true, lastSeen: now,
             stasis: false, isStationary: row.isStationary ?? false,
         };
         if (row.cracked !== false) state.passwords[name] = { password: row.password ?? "pw", modelId: "TopPass", solvedAt: now };
@@ -216,7 +216,6 @@ test("applyMessage: a server report updates details and stamps the neighbours", 
     assert.equal(alpha.chaReq, 50);
     assert.equal(alpha.maxRam, 64);
     assert.deepEqual(alpha.neighbours, ["beta"]);
-    assert.equal(alpha.neighboursAt, ts);
     assert.ok(state.servers.beta, "a probed neighbour is known to exist even before anyone cracks it");
 
     applyMessage(state, { type: "server", from: "alpha", host: "alpha", pid: 7, ts: ts + 1, details: { isOnline: false } });
