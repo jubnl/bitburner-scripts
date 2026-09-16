@@ -1038,6 +1038,13 @@ export async function main(ns) {
                     if (!server.hasRoot() && server.canCrack())
                         await doRoot(ns, server);
 
+                    // HC-1 (final review issue 10): drop round state for anything that is no longer targeting, for any reason (shouldHack() turned
+                    // false, the round drained while continuation was RAM-capped, --xp-only was toggled on). A stale entry would let
+                    // canPlanNextRound return true for a server we no longer intend to chain, and would feed performScheduling a dead cadence.
+                    // isTargeting() is cached per server per loop (resetCaches above), so this costs nothing the branches below don't already pay.
+                    if (server.name in roundState && !(await server.isTargeting()))
+                        delete roundState[server.name];
+
                     // Check whether we can / should attempt any actions on this server
                     if (!server.shouldHack()) { // Ignore servers we own (bought servers / home / no money)
                         noMoney.push(server);
@@ -1058,13 +1065,18 @@ export async function main(ns) {
                         // de-prepped target (batch thread counts only undo their own hardening and assume max money before the theft). Stop
                         // chaining when it drifts too far; once the in-flight round drains, isTargeting() goes false and the pre-existing
                         // prepServer path below re-preps it exactly as it did before chaining existed.
+                        // Issue 9: --hack-only deliberately has no such checkpoint - it never grows or weakens, so a hardened, drained target is
+                        // its steady state, not a regression, and there is no prep path to hand it back to.
                         if (!xpOnly && !hackOnly && round && chainingRegressed(server.getSecurity(), server.getMinSecurity(), server.getMoney(),
                             server.getMaxMoney(), round.hackHardening, round.growHardening, round.percentToSteal)) {
                             log(ns, `WARNING ${server.prepRegressions++}: Server was prepped, but now at security: ${formatNumber(server.getSecurity())} ` +
                                 `(min ${formatNumber(server.getMinSecurity())}) money: ${formatMoney(server.getMoney(), 3)} (max ${formatMoney(server.getMaxMoney(), 3)}). ` +
                                 `Prior cycle: ${server.previousCycle}. ETA now (Hack ${playerHackSkill()}) is ${formatDuration(server.timeToWeaken())}. ` +
                                 `No further rounds will be chained until it has been re-prepped.`, true, 'warning');
-                            server.previouslyPrepped = true; // So that the prepServer path logs this regression too, as it would have pre-chaining
+                            // Issue 8: this checkpoint has now reported the regression (one WARNING, one prepRegressions increment). Clearing the
+                            // flag stops the prepServer path below from logging and counting the very same regression again next loop, once the
+                            // in-flight round drains and the server comes back through it.
+                            server.previouslyPrepped = false;
                             delete roundState[server.name];
                         }
                         // HC-1: chain rounds. Once the last batch of the current round has begun launching, plan the next round so that its first
@@ -1234,7 +1246,10 @@ export async function main(ns) {
                     }
                 } //else log(ns, `Not Sharing. workCapped: ${isWorkCapped()} utilizationPercent: ${utilizationPercent} maxShareUtilization: ${maxShareUtilization} cooldown: ${formatDuration(Date.now() - lastShareTime)} networkRam: ${network.totalMaxRam}`);
 
-                await launchDueTasks(ns, jitLeadTime()); // HC-1: tasks planned this loop whose start is imminent (first W1 is due queueDelay + delayInterval from planning)
+                // HC-1: catches tasks that became due while this loop ran long. A freshly planned round's first task is queueDelay + delayInterval
+                // (1500 ms) out, so with the old fixed 1000 ms lead this call could only ever be a no-op; with the adaptive lead (jitLeadTime) a
+                // loop that overran launches them here rather than leaving them to start late at the head of the next loop.
+                await launchDueTasks(ns, jitLeadTime());
 
                 // Log some status updates
                 let keyUpdates = `Of ${allHostNames.length} total servers:\n > ${noMoney.length} were ignored (owned or no money)`;
@@ -2522,6 +2537,7 @@ export async function main(ns) {
     }
 
     function removeServerByName(ns, deletedHostName) {
+        delete roundState[deletedHostName]; // HC-1 (issue 10): a host that no longer exists must not keep round state that could chain a new round
         // Remove from the list of server names
         let findIndex = allHostNames.indexOf(deletedHostName)
         if (findIndex === -1)
