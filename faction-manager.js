@@ -367,7 +367,7 @@ class FactionData {
     }
     /** @returns {number} The most cost (monetary) of the most expensive augmentation offered by this faction. */
     mostExpensiveAugCost() {
-        return this.augmentations.map(augName => augmentationData[augName]).reduce((max, aug) => Math.max(max, aug.price), 0)
+        return this.augmentations.map(augName => augmentationData[augName]).reduce((max, aug) => Math.max(max, aug?.price ?? 0), 0)
     }
     /** @returns {Map<string, AugmentationData>}  */
     totalUnownedMults() {
@@ -446,9 +446,13 @@ class AugmentationData {
         this.desired = desiredAugs.includes(aug) || // Mark as "desired" augs explicitly requested, or those with stats in the 'stat-desired' command line options
             desiredStatsFilters.includes('*') || desiredStatsFilters.includes('_') || // Wildcards - all stats are desired (_ is for backwards compatibility when all stat names ended with '_mult')
             Object.keys(this.stats).some(stat => isStatDesired(stat));
-        // Get the name of the "most-early-game" faction from which we can buy this augmentation. Estimate this by cost of the most expensive aug the offer
-        this.getFromAny = factionNames.map(f => factionData[f]).sort((a, b) => a.mostExpensiveAugCost() - b.mostExpensiveAugCost())
-            .filter(f => f.augmentations.includes(aug))[0]?.name ?? "(unknown)";
+    }
+    /** The name of the "most-early-game" faction from which we can buy this augmentation, estimated by the cost of the most expensive aug each
+     *  faction offers. Computed lazily (and cached): mostExpensiveAugCost() reads augmentationData, which is still being built while the
+     *  AugmentationData constructors run (updateAugmentationData), so it cannot be evaluated in the constructor. */
+    get getFromAny() {
+        return this._getFromAny ??= factionNames.map(f => factionData[f]).sort((a, b) => a.mostExpensiveAugCost() - b.mostExpensiveAugCost())
+            .filter(f => f.augmentations.includes(this.name))[0]?.name ?? "(unknown)";
     }
     /** @returns {FactionData[]} A list of joined factions that have this augmentation */
     joinedFactionsWithAug() {
