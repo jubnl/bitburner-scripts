@@ -15,6 +15,16 @@ test("partitionDueTasks returns due tasks sorted by start and keeps the rest", (
     assert.equal(queue.length, 4, "input is not mutated");
 });
 
+test("partitionDueTasks with a longer lead pulls in the tasks a long loop would otherwise launch late", () => {
+    // Final review issue 1: the lead is max(loopInterval, last loop's duration). A loop that took 2500 ms must launch everything due before its
+    // next turn, or those tasks are exec'd after their start time and the remote scripts (which clamp a negative sleep to 0) fire immediately.
+    const queue = [{ start: 1500, id: "a" }, { start: 2200, id: "b" }, { start: 5000, id: "c" }];
+    assert.deepEqual(partitionDueTasks(queue, 1000, 1000)[0].map(t => t.id), ["a"], "a 1000 ms lead leaves b for the next loop");
+    const [due, pending] = partitionDueTasks(queue, 1000, 2500);
+    assert.deepEqual(due.map(t => t.id), ["a", "b"], "a 2500 ms lead launches b now instead of 200 ms late");
+    assert.deepEqual(pending.map(t => t.id), ["c"]);
+});
+
 test("partitionDueTasks with an empty queue", () => {
     assert.deepEqual(partitionDueTasks([], 0, 1000), [[], []]);
 });
