@@ -94,6 +94,12 @@ export async function main(ns) {
     const defaultOpponentPreference = ["Daedalus", "????????????", "Illuminati", "The Black Hand", "Netburners", "Slum Snakes", "Tetrads"];
     const allOpponents = ["Netburners", "Slum Snakes", "The Black Hand", "Tetrads", "Daedalus", "Illuminati", "????????????"];
 
+    // GO-3 state (declared before start(): main's inner functions are hoisted, but let/const are not, and start() runs first)
+    const directAnalysisRam = 60;
+    const directAnalysisMinFreeRam = 80; // Only switch with this much free on our host (leaves ~20 GB for other scripts' temp scripts)
+    let directAnalysis = false;
+    const goApi = () => ns.go, goAnalysis = () => ns.go.analysis;
+
     await start();
 
     /** @param {NS} ns */
@@ -149,10 +155,6 @@ export async function main(ns) {
     // our host has plenty of free RAM we grow this script's allocation with ns.ramOverride (0 GB) and call them directly through a string-keyed
     // property lookup: the static RAM calculator only counts Identifier nodes (src/Script/RamCalculations.ts), and the dynamic check
     // (src/Netscript/NetscriptHelpers.tsx updateDynamicRam) charges each function once against the enlarged allocation.
-    const directAnalysisRam = 60;
-    const directAnalysisMinFreeRam = 80; // Only switch with this much free on our host (leaves ~20 GB for other scripts' temp scripts)
-    let directAnalysis = false;
-    const goApi = () => ns.go, goAnalysis = () => ns.go.analysis;
 
     /** Switch to direct Go analysis calls if our host has >= directAnalysisMinFreeRam GB free. Called once per game; cheap no-op once enabled.
      * @param {NS} ns */
