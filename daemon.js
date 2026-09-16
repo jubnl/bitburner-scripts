@@ -1011,10 +1011,14 @@ export async function main(ns) {
                 // If this gets set to true, the loop will continue (e.g. to gather information), but no more work will be scheduled
                 let workCapped = false;
                 // HC-1: continuing an active target's rounds is capped only by RAM (the target-count caps below govern *new* targets)
-                const isContinuationCapped = () => failed.length > 0 || launchFailuresLastLoop > 0 || getTotalNetworkUtilization() >= maxUtilization;
+                // HC-1 (final review issue 2): "last loop" alone lags a whole loop behind - the head-of-loop launchDueTasks (and prepServer's own
+                // calls) record their failures in launchFailuresThisLoop, so a loop that just dropped batches for lack of RAM would otherwise go
+                // on to chain a fresh round for every target in that same loop. Count both, so the back-off damps instead of oscillating.
+                const recentLaunchFailures = () => launchFailuresLastLoop + launchFailuresThisLoop;
+                const isContinuationCapped = () => failed.length > 0 || recentLaunchFailures() > 0 || getTotalNetworkUtilization() >= maxUtilization;
                 // Function to assess whether we've hit some cap that should prevent us from scheduling any more work
                 let isWorkCapped = () => workCapped = workCapped || failed.length > 0 // Scheduling fails when there's insufficient RAM. We've likely encountered a "soft cap" on ram utilization e.g. due to fragmentation
-                    || launchFailuresLastLoop > 0 // HC-1: queued tasks could not be launched last loop - the network is over-committed, plan nothing new
+                    || recentLaunchFailures() > 0 // HC-1: queued tasks could not be launched last loop or this one - the network is over-committed, plan nothing new
                     || getTotalNetworkUtilization() >= maxUtilization // "hard cap" on ram utilization, can be used to reserve ram or reduce the rate of encountering the "soft cap"
                     || targeting.length >= maxTargets // variable cap on the number of simultaneous targets
                     || (targeting.length + prepping.length) >= (maxTargets + maxPreppingAtMaxTargets); // Only allow a couple servers to be prepped in advance when at max-targets
