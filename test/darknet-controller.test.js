@@ -1,10 +1,11 @@
-import { test } from "node:test";
+import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseCmd, emptyState, encodeMsg, WORKER_RAM, LABS, LAB_AUGMENTATIONS, labFromAugmentations, labFromDifficulty } from "../darknet/lib.js";
 import {
     applyMessage, assignStasis, buildCmd, chooseMode, currentLab, drainPort, launchWalkers,
-    loadState, planFillers, planLabyrinth, planLoot, planPromotions, pushFiles, recomputeCompleted, saveState,
+    loadState, planFillers, planLabyrinth, planLoot, planPromotions, pushFiles, recomputeCompleted,
+    resetPushCache, saveState,
 } from "../darknet.js";
 
 /* Node-only tests for darknet.js's planning and state machine.
@@ -17,6 +18,9 @@ import {
 
 const LAB = "th3_l4byr1nth";
 const LAB_CHA = 300;
+
+// R13: pushFiles' "what did this host last get" cache is module-level, so it would otherwise leak between tests.
+beforeEach(() => resetPushCache());
 
 function makeNs(config = {}) {
     const files = new Map(Object.entries(config.files ?? {}));

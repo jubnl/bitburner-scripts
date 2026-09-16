@@ -92,6 +92,7 @@ export async function main(ns) {
                     log(ns, "WARN: darknet detected a prestige; wiping state.", true, "warning");
                     resetTime = latest;
                     state = emptyState(resetTime);
+                    resetPushCache(); // R13 fix: same process, brand new network - nothing we pushed before the reset still holds
                 }
             }
             recomputeCompleted(ns, state);
@@ -154,6 +155,7 @@ export function loadState(ns, resetTime) {
         if (!parsed || typeof parsed !== "object" || parsed.version !== 1) continue;
         if (parsed.resetTime !== resetTime) {
             log(ns, "INFO: darknet state is from a previous reset; starting fresh.");
+            resetPushCache(); // R13 fix: the old state's pushes describe a network that no longer exists
             return emptyState(resetTime);
         }
         return fillState(parsed, resetTime);
@@ -897,6 +899,14 @@ export function bootstrap(ns, state, plan, options) {
 // (darknet/agent.js copies its own files), so the host's own command file has to go out again even when
 // the plan for it did not change.
 const lastPushed = new Map();
+
+/** R13 fix: forget what every host was last given. The cache is module-level, so it outlives the `state`
+ * object it describes: when the controller throws the old state away (a prestige, or a state file from a
+ * previous reset) its entries describe files on hosts that may no longer exist, and a hostname reused
+ * after the reset would skip its first push. Also lets each test start from an empty cache. */
+export function resetPushCache() {
+    lastPushed.clear();
+}
 
 /** Push `passwords.txt` and a per-host `cmd.txt` to every online cracked server whose copy is out of
  * date. The session is opened for every host regardless: it is the liveness probe.
