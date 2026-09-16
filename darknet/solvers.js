@@ -490,6 +490,11 @@ export const SOLVERS = {
     // calibrating heartbleed, an attempt's own duration REJECTS a wrong guess for free (i equals
     // the prefix length, the common case); a longer, ambiguous or uncalibrated reading buys the
     // heartbleed for that attempt (fetchFeedback, no second authenticate) and recalibrates.
+    // C14: that fetch can come back empty -- the runner offered no fetcher, or the heartbleed log
+    // line belonged to another pid (logMatchesAttempt rejects it) -- and only then does the solver
+    // re-authenticate the same guess asking for feedback outright. It is the one path here that
+    // spends two attempts on one guess; it costs at most +1 attempt per race against a budget of
+    // BUDGETS["2G_cellular"] = 500, and R6's crack-claim renewal makes the race itself very rare.
     "2G_cellular": async (d, tryPw, opts = {}) => {
         const L = d.passwordLength, cs = charset(d);
         const step = timingStep(opts.threads);

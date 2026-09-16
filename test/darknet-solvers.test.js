@@ -183,3 +183,35 @@ test("2G_cellular survives timer jitter and a drifting base without a wrong pref
         assert.ok(hb.count < attempts, `seed ${seed}: ${hb.count} heartbleeds for ${attempts} attempts`);
     }
 });
+
+// C14: the heartbleed fetch can come back empty -- the log line the runner found belonged to another pid
+// (logMatchesAttempt rejects it), or there is no fetcher at all. The solver then re-authenticates that one
+// guess asking for feedback outright: the only place 2G_cellular spends two attempts on a single guess.
+test("2G_cellular recovers when one heartbleed fetch comes back empty, at the cost of exactly one extra attempt", async () => {
+    for (const seed of [1, 2, 3]) {
+        const s = makeServer("2G_cellular", 17, makeRng(seed));
+        // Baseline: the same crack with every fetch succeeding.
+        const plain = { count: 0 };
+        let plainAttempts = 0;
+        const quiet = timedAttempt(s, plain, { base: () => 4000 });
+        const plainResult = await solve(detailsOf(s), async (pw, need) => { plainAttempts++; return quiet(pw, need); }, { threads: 6 });
+        assert.equal(plainResult.password, s.password, `seed ${seed} baseline`);
+
+        // Same crack, but the first heartbleed the solver actually fetches returns another pid's line (null).
+        const hb = { count: 0 };
+        let attempts = 0, swallowed = 0;
+        const inner = timedAttempt(s, hb, { base: () => 4000 });
+        const racing = async (pw, need) => {
+            attempts++;
+            const r = await inner(pw, need);
+            if (typeof r.fetchFeedback === "function" && swallowed === 0)
+                return { ...r, fetchFeedback: async () => { swallowed++; hb.count++; return null; } };
+            return r;
+        };
+        const r = await solve(detailsOf(s), racing, { threads: 6 });
+        assert.equal(swallowed, 1, "exactly one fetch was sabotaged");
+        assert.equal(r.password, s.password, `seed ${seed}: the password is still found`);
+        assert.equal(attempts, plainAttempts + 1, "the lost feedback costs one re-authenticate of that guess and nothing more");
+        assert.ok(attempts <= budgetFor(detailsOf(s)) + 1, `seed ${seed} used ${attempts} of ${budgetFor(detailsOf(s))} + 1`);
+    }
+});
