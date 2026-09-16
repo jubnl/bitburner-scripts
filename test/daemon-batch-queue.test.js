@@ -107,3 +107,10 @@ test("dropBatchAfterFailure drops both the grow and the hack when a second weake
     assert.equal(dropped, 2, "a grow with no weaken to follow it would permanently harden the target");
     assert.deepEqual(ids(remaining), ["joesguns Batch 8-weak2"]);
 });
+
+import { launchTiming } from "../daemon.js";
+test("launchTiming: start is the planned landing minus the duration as it is now; late only when that start is already past", () => {
+    assert.deepEqual(launchTiming(10_000, 4_000, 5_000), { start: 6_000, lateMs: 0 });
+    assert.deepEqual(launchTiming(10_000, 4_400, 5_000), { start: 5_600, lateMs: 0 }); // hardening made the tool 10% slower: start earlier, still lands on time
+    assert.deepEqual(launchTiming(10_000, 5_300, 5_000), { start: 4_700, lateMs: 300 }); // too slow to land on time now, by 300 ms
+});

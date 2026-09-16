@@ -109,6 +109,16 @@ export function partitionDueTasks(queue, now, leadMs) {
     return [due, pending];
 }
 
+/** HC-1: when to start a task so that it *lands* when planned. The game fixes hack/grow/weaken time when the remote script calls it (at the
+ * security of that moment, src/Netscript/NetscriptHelpers.tsx), so a task launched while an earlier batch's hardening is still open would land
+ * late if it kept its plan-time start. Re-derive the start from the planned landing time and the duration as it is now.
+ * @param {number} end planned landing time (ms) @param {number} durationNow the tool's duration right now (ms) @param {number} now
+ * @returns {{start: number, lateMs: number}} the start to hand the remote script, and how late it will land if that start is already past */
+export function launchTiming(end, durationNow, now) {
+    const start = end - durationNow;
+    return { start, lateMs: Math.max(0, now - start) };
+}
+
 /** The batch start time of a target's next round: continue the previous round's cadence (one cycle-timing-delay after its last batch) when that
  * is still at least queueDelay away, otherwise start queueDelay from now. Never plans a batch whose first task would already be overdue. */
 export function nextRoundStart(now, queueDelay, prevLastBatchStart, cycleTimingDelay) {
@@ -260,14 +270,13 @@ export async function main(ns) {
     // (reset at the top of every call) - lets a caller like prepServer judge success for its own target without being drained by an unrelated
     // target's RAM failure in the same call.
     let lastLaunchFailuresByTarget = (/**@returns{Map<string, number>}*/() => new Map())();
-    // HC-1 (final review issue 1): how long the previous targeting loop took, end to end. The launcher only gets a turn once per loop, so this is
-    // how far ahead it must look - see jitLeadTime.
-    let lastLoopDurationMs = 0;
-    /** HC-1 (final review issue 1): how far ahead of its planned start a queued task must be exec'd. A task that is not launched before its start
-     * time launches *late*: Remote/*-target.js clamps a negative sleep to 0 and fires immediately, so that task lands out of order relative to the
-     * rest of its batch. The launcher only runs once per targeting loop, so the lead must cover a whole loop period - which is loopInterval only
-     * while the loop keeps up. When the last loop ran longer than that (lag, a big network, a slow periodic pass), use its duration instead. */
-    const jitLeadTime = () => Math.max(loopInterval, lastLoopDurationMs);
+    /** HC-1: how far ahead of its planned start a queued task must be exec'd. A task that is not launched before its start time launches *late*:
+     * Remote/*-target.js clamps a negative sleep to 0 and fires immediately, so that task lands out of order relative to the rest of its batch.
+     * The launcher gets a turn every jitSliceMs while the loop sleeps and between the phases of the loop (launcherTurn), so the lead only has to
+     * cover the longest gap between two turns seen in the last loop (one slow phase), not a whole loop period. */
+    const jitSliceMs = 250; // How often the launcher gets a turn while the targeting loop sleeps (jitSleep)
+    let lastLauncherTurnAt = 0, worstLauncherGapMs = loopInterval, worstLauncherGapThisLoop = 0;
+    const jitLeadTime = () => Math.max(jitSliceMs, worstLauncherGapMs);
     // HC-1 (final review issue 1): a task launched this many ms or less after its planned start is not counted as late. Tasks enqueued for "now"
     // (prepServer's W1) are exec'd in the same call that queued them, so a few ms of bookkeeping between the two is not a scheduling failure.
     const lateLaunchToleranceMs = 50;
@@ -434,7 +443,8 @@ export async function main(ns) {
         resetServerSortCache();
         ownedCracks = [], ownedPrograms = [], ownTorRouter = false;
         psCache = {};
-        batchQueue = [], roundState = {}, launchFailuresThisLoop = launchFailuresLastLoop = 0, lastLoopDurationMs = 0; // HC-1 launcher state
+        batchQueue = [], roundState = {}, launchFailuresThisLoop = launchFailuresLastLoop = 0; // HC-1 launcher state
+        lastLauncherTurnAt = 0, worstLauncherGapMs = loopInterval, worstLauncherGapThisLoop = 0;
         lastLaunchFailuresByTarget = new Map(); // HC-3 fix
         // XpMode Related Caches
         singleServerLimit = 0, lastCycleTotalRam = 0; // Cache of total ram on the server to check whether we should attempt to lift the above restriction.
@@ -861,8 +871,8 @@ export async function main(ns) {
 
     /** HC-1: put a planned task on the launch queue. `args` must be the complete remote-script args (target, start, duration, description, flags...)
      * @param {Server} target */
-    function enqueueTask(target, start, toolShortName, threads, args, threadsByCores = null, allowSplit = null, description = '') {
-        batchQueue.push({ target, start, toolShortName, threads, threadsByCores, args, allowSplit, description });
+    function enqueueTask(target, start, toolShortName, threads, args, threadsByCores = null, allowSplit = null, description = '', end = null) {
+        batchQueue.push({ target, start, end, toolShortName, threads, threadsByCores, args, allowSplit, description }); // end: planned landing (see launchTiming)
     }
 
     /** HC-1: number of queued (not yet launched) tasks against a server, optionally only those whose description starts with a prefix ("Batch", "prep") */
@@ -879,23 +889,34 @@ export async function main(ns) {
      * @param {NS} ns
      * @param {number} leadMs How far ahead of its planned start a task must be exec'd (defaults to the adaptive JIT lead)
      * @returns {Promise<number>} tasks that failed to launch or were dropped with their batch, in this call (queue-wide total) */
-    async function launchDueTasks(ns, leadMs = jitLeadTime()) {
+    async function launchDueTasks(ns, leadMs = jitLeadTime(), refreshRam = true) {
         lastLaunchFailuresByTarget = new Map(); // HC-3 fix: scoped to this call
+        const turnStart = Date.now();
+        if (lastLauncherTurnAt > 0) worstLauncherGapThisLoop = Math.max(worstLauncherGapThisLoop, turnStart - lastLauncherTurnAt);
+        lastLauncherTurnAt = turnStart;
         if (batchQueue.length == 0) return 0;
-        let [due, pending] = partitionDueTasks(batchQueue, Date.now(), leadMs);
+        let [due, pending] = partitionDueTasks(batchQueue, turnStart, leadMs);
         batchQueue = pending;
+        // The HC-6 used-RAM snapshot is taken at the head of the loop. A turn taken later (between phases, or while the loop sleeps) would otherwise
+        // still see the RAM of tasks that have since finished as used, and drop batches for "insufficient RAM" that would have fit.
+        if (due.length > 0 && refreshRam)
+            for (const server of getAllServers()) server.refreshUsedRam();
         let attempted = 0, failures = 0, dropped = 0, late = 0, worstLatenessMs = 0;
         while (due.length > 0) {
             const task = due.shift();
             attempted++;
-            const latenessMs = Date.now() - task.start; // Issue 1: measured just before the exec, i.e. how late this script actually starts
-            if (latenessMs > lateLaunchToleranceMs) {
+            // Re-derive the start from the planned landing time and the tool's duration *right now* (see launchTiming): a task exec'd while an
+            // earlier batch's hardening is still open runs longer than planned, and would otherwise land late - and harden the next one further.
+            const durationNow = liveDuration(task);
+            const { start, lateMs } = launchTiming(task.end ?? task.start + (durationNow ?? 0), durationNow ?? 0, Date.now());
+            if (lateMs > lateLaunchToleranceMs) { // Issue 1: measured just before the exec, i.e. how late this task will land
                 late++;
-                worstLatenessMs = Math.max(worstLatenessMs, latenessMs);
+                worstLatenessMs = Math.max(worstLatenessMs, lateMs);
             }
             // HC-1: our stock position may have reversed since this task was planned. Running scripts can only be killed for that
             // (see terminateScriptsManipulatingStock); a task that has not launched yet we simply re-flag from the current position.
-            const args = withStockManipulationFlag(task.toolShortName, task.args, shouldManipulateStock(task.toolShortName, task.target.name));
+            let args = withStockManipulationFlag(task.toolShortName, task.args, shouldManipulateStock(task.toolShortName, task.target.name));
+            if (durationNow != null && args[1] != start) { args = args.slice(); args[1] = start; } // args[1]: the remote sleeps until this time (additionalMsec)
             const ok = await arbitraryExecution(ns, getTool(task.toolShortName), task.threads, args, undefined, undefined, task.allowSplit, task.threadsByCores);
             if (ok == false) {
                 failures++;
@@ -917,12 +938,36 @@ export async function main(ns) {
         launchFailuresThisLoop += failures + dropped;
         // Issue 1: the one symptom of the JIT launcher falling behind that is not otherwise visible. One line per call, never per task.
         if (late > 0)
-            log(ns, `WARNING: ${late} of ${attempted} due tasks launched late (worst ${Math.round(worstLatenessMs)}ms); batches may be desynchronised. ` +
-                `Consider raising --cycle-timing-delay or lowering --max-targets if this persists (last loop took ${Math.round(lastLoopDurationMs)}ms).`, false, 'warning');
+            log(ns, `WARNING: ${late} of ${attempted} due tasks will land late (worst ${Math.round(worstLatenessMs)}ms); batches may be desynchronised. ` +
+                `Consider raising --cycle-timing-delay or lowering --max-targets if this persists (worst gap between launcher turns last loop: ${Math.round(worstLauncherGapMs)}ms).`, false, 'warning');
         if (verbose && attempted > 0)
             log(ns, `INFO: Launched ${attempted - failures} of ${attempted} due tasks ` +
                 `(${batchQueue.length} still queued, ${failures} failed, ${dropped} dropped with their batch)`);
         return failures + dropped;
+    }
+
+    /** The duration hack/grow/weaken would take against the task's target right now (what the game will use when the remote script starts) */
+    function liveDuration(task) {
+        switch (task.toolShortName) {
+            case "hack": case "manualhack": return task.target.timeToHack();
+            case "grow": return task.target.timeToGrow();
+            case "weak": return task.target.timeToWeaken();
+            default: return null;
+        }
+    }
+
+    /** Sleep between targeting loops, giving the launcher a turn every jitSliceMs so due tasks are not held until the next loop starts. */
+    async function jitSleep(ns, ms) {
+        const until = Date.now() + ms;
+        do {
+            await ns.sleep(Math.max(1, Math.min(jitSliceMs, until - Date.now())));
+            await launchDueTasks(ns);
+        } while (Date.now() < until);
+    }
+
+    /** A launcher turn between two phases of the targeting loop: cheap when nothing is queued, skipped when the last turn was under half a slice ago. */
+    async function launcherTurn(ns) {
+        if (batchQueue.length > 0 && Date.now() - lastLauncherTurnAt >= jitSliceMs / 2) await launchDueTasks(ns);
     }
 
     // Main targeting loop
@@ -933,28 +978,33 @@ export async function main(ns) {
         //let isHelperListLaunched = false; // Uncomment this and related code to keep trying to start helpers
         do {
             loops++;
-            if (loops > 0) await ns.sleep(loopInterval);
+            if (loops > 0) await jitSleep(ns, loopInterval); // HC-1: the launcher keeps getting turns while we sleep
             try {
                 let start = Date.now();
                 psCache = {}; // Clear the cache of the process list we update once per loop
                 launchFailuresLastLoop = launchFailuresThisLoop; launchFailuresThisLoop = 0;
                 for (const server of getAllServers()) server.refreshUsedRam(); // HC-6: one used-RAM snapshot per loop; kept current locally by noteRamUsed
-                await launchDueTasks(ns, jitLeadTime()); // HC-1: exec batch/prep tasks that are due, before any of the slower bookkeeping below
+                await launchDueTasks(ns, jitLeadTime(), false); // HC-1: exec batch/prep tasks that are due, before any of the slower bookkeeping below (snapshot just taken)
                 await buildServerList(ns, true); // Check if any new servers have been purchased by the external host_manager process
+                await launcherTurn(ns); // HC-1
                 if (maxRamRefreshDueAt && Date.now() >= maxRamRefreshDueAt) { // HC-10: ram-manager / host-manager ran a moment ago, sizes may have changed
                     maxRamRefreshDueAt = 0;
                     await updateCachedServerData(ns);
                 }
                 await updatePortCrackers(ns); // Check if any new port crackers have been purchased
                 await getPlayerInfo(ns); // Force an update of _cachedPlayerInfo               
+                await launcherTurn(ns); // HC-1
                 if (!allHelpersRunning && loops % 60 == 0) // If we have not yet launched all helpers see if any are now ready to be run (launch may have been postponed while e.g. awaiting more home ram, or TIX API to be purchased)
                     allHelpersRunning = await runStartupScripts(ns);
                 // Run some auxilliary processes that ease the ram burden of this daemon and add additional functionality (like managing hacknet or buying servers)
                 await runPeriodicScripts(ns);
+                await launcherTurn(ns); // HC-1
                 if (stockMode) await updateStockPositions(ns); // In stock market manipulation mode, get our current position in all stocks, as it affects targetting order
+                await launcherTurn(ns); // HC-1
                 // For early players, change behaviour slightly
                 const homeRam = homeServer.totalRam(true);
                 let targetingOrder = await getAllServersByTargetOrder(homeRam); // Sort the targets in the order we should prioritize spending RAM on them
+                await launcherTurn(ns); // HC-1
 
                 if (!(4 in dictSourceFiles) && homeRam < 64) {
                     // Until the user buys the first home RAM upgrade, prioritize just one target, so that we see fast results.
@@ -971,6 +1021,7 @@ export async function main(ns) {
                     // Pull additional data about servers that infrequently changes
                     await updateCachedServerData(ns); // HC-10: max RAM (was every loop; it only changes via purchases we trigger, see maxRamRefreshDueAt)
                     await refreshDynamicServerData(ns);
+                    await launcherTurn(ns); // HC-1
                     // Occassionally print our current targetting order (todo, make this controllable with a flag or custom UI?)
                     if (verbose || loops % 600 == 0) {
                         const targetsLog = 'Targetting Order: (* = prepped, ✓ = hackable)\n  ' + targetingOrder.filter(s => s.shouldHack()).map(s =>
@@ -1034,6 +1085,7 @@ export async function main(ns) {
 
                     const server = targetingOrder[i];
                     server.resetCaches(); // For each new loop, reset any cached properties
+                    await launcherTurn(ns); // HC-1: a slow scheduling pass must not hold due tasks
                     // Attempt to root any servers that are not yet rooted
                     if (!server.hasRoot() && server.canCrack())
                         await doRoot(ns, server);
@@ -1278,7 +1330,7 @@ export async function main(ns) {
                 }
                 //log(ns, 'Prepping: ' + prepping.map(s => s.name).join(', '))
                 //log(ns, 'targeting: ' + targeting.map(s => s.name).join(', '))
-                lastLoopDurationMs = Date.now() - start; // HC-1 (issue 1): the lead the launcher needs next loop - see jitLeadTime
+                worstLauncherGapMs = Math.max(jitSliceMs, worstLauncherGapThisLoop); worstLauncherGapThisLoop = 0; // The lead the launcher needs next loop - see jitLeadTime
             } catch (err) {
                 // Sometimes a script is shut down by throwing an object containing internal game script info. Detect this and exit silently
                 if (err?.env?.stopFlag) return;
@@ -1813,7 +1865,7 @@ export async function main(ns) {
                 if (options.i && currentTerminalServer?.name == currentTarget.name && schedItem.toolShortName == "hack")
                     schedItem.toolShortName = "manualhack";
                 // HC-1: queue it; launchDueTasks execs it loopInterval before schedItem.start. grow/weaken items carry a cores-aware thread count
-                enqueueTask(currentTarget, schedItem.start.getTime(), schedItem.toolShortName, schedItem.threadsNeeded, args, schedItem.threadsByCores ?? null, null, discriminationArg);
+                enqueueTask(currentTarget, schedItem.start.getTime(), schedItem.toolShortName, schedItem.threadsNeeded, args, schedItem.threadsByCores ?? null, null, discriminationArg, schedItem.end.getTime());
             }
         }
         const lastSched = scheduledTasks[scheduledTasks.length - 1];
@@ -2163,16 +2215,16 @@ export async function main(ns) {
         if (weakenThreadsScheduled > 0)
             enqueueTask(currentTarget, timing.weakenStart, "weak", weakenThreadsScheduled,
                 [currentTarget.name, timing.weakenStart, currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
-                weakenThreadsByCores(weakenThreadsScheduled), null, "prep"); // Fewer threads are needed on hosts with more cores
+                weakenThreadsByCores(weakenThreadsScheduled), null, "prep", timing.weakenStart + currentTarget.timeToWeaken()); // Fewer threads are needed on hosts with more cores
         if (growThreadsScheduled > 0) {
             enqueueTask(currentTarget, timing.growStart, "grow", growThreadsScheduled,
                 [currentTarget.name, timing.growStart, currentTarget.timeToGrow(), "prep", ...getFlagsArgs("grow", currentTarget.name, false, true)],
                 // Fewer threads are needed on hosts with more cores. If we could afford the full grow, hosts with cores can compute the exact count from current money
                 growThreadsByCores(currentTarget, growThreadsScheduled, growThreadsScheduled == growThreadsNeeded ? currentTarget.getMoney() : null),
-                /*allowThreadSplitting*/ true, "prep"); // Special case: for prep we allow grow threads to be split
+                /*allowThreadSplitting*/ true, "prep", timing.growStart + currentTarget.timeToGrow()); // Special case: for prep we allow grow threads to be split
             enqueueTask(currentTarget, timing.weaken2Start, "weak", weaken2ThreadsScheduled,
                 [currentTarget.name, timing.weaken2Start, currentTarget.timeToWeaken(), "prep", ...getFlagsArgs("weak", currentTarget.name, false, true)],
-                weakenThreadsByCores(weaken2ThreadsScheduled), null, "prep");
+                weakenThreadsByCores(weaken2ThreadsScheduled), null, "prep", timing.weaken2Start + currentTarget.timeToWeaken());
         }
         // Launch what is due now (W1, and W2 which starts 2 delays from now). A failure here means we are out of RAM despite the checks above.
         // HC-3 fix: launchDueTasks may also launch other targets' due tasks in this same call; judge success from only this target's own
