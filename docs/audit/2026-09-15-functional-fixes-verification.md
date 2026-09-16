@@ -1,7 +1,7 @@
 # Functional fixes — in-game verification checklist
 
-This is a checklist for the 56 plan tasks that fixed the findings of `docs/audit/2026-09-15-functional-review.md`, on branch `game-optimisation-3.0`, commits `4edb810..52c78d3` (56 plan tasks, then an 8-commit final fix wave b10d64a..52c78d3).
-The Node suite (`node --test` from the scripts repo root) passes all 259 tests, and the darknet headless loot smoke (`tools/harness`, fixture rebuilt from HEAD `9a17233`) passed with an empty `=== errors ===` section — but every step below runs against the live game and none of it has been observed there yet.
+This is a checklist for the 56 plan tasks that fixed the findings of `docs/audit/2026-09-15-functional-review.md`, on branch `game-optimisation-3.0`, commits `4edb810..HEAD` (56 plan tasks, an 8-commit final fix wave b10d64a..52c78d3, then the first-live-run fixes).
+The Node suite (`node --test` from the scripts repo root) passes all 260 tests, and the darknet headless loot smoke (`tools/harness`, fixture rebuilt from HEAD `9a17233`) passed with an empty `=== errors ===` section — but every step below runs against the live game and none of it has been observed there yet.
 Each task lists the exact terminal commands and the exact log lines / observations to look for, and — where the source states it — what the old, buggy behaviour looked like for comparison.
 
 ---
@@ -412,6 +412,11 @@ Adaptive JIT lead time (`max(loopInterval, last loop duration)`), a per-loop lat
 1. `run daemon.js --tail` on the BN1 test save for 10 minutes. Expected: no `WARNING: N of M due tasks launched late` line while the status line's loop time stays under 1 s; if the game is throttled (background tab), the warning appears at most once per loop and disappears again when the loop time recovers.
 2. Trigger a RAM squeeze (`run share.js` with most of home RAM, or buy no servers): after a `dropped batch` warning the same loop must not start a new round for any target (no `Batch ... scheduled` lines until the next loop without failures).
 3. A chaining regression (`WARNING: ... regressed` on a target) must appear once per event, not twice on consecutive loops.
+
+### FW-1b — HC-1 landing-time launch (see `git log -1 -- daemon.js`)
+First live run showed `Server was prepped, but now at security ...` regressions right after prep: a JIT-launched task's duration is fixed by the game at exec time (current security), so tasks exec'd while an earlier batch's hardening was open landed late and desynchronised the round. Tasks are now launched against their planned landing time with the duration as it is at launch, and the launcher gets a turn every 250 ms while the loop sleeps and between loop phases.
+1. `run daemon.js --tail` for 10 minutes on a save with 5+ targets. Expected: no `Server was prepped, but now at security` warnings while RAM is not capped, no `Misfire` toasts, and no `due tasks will land late` warnings unless the game is throttled (background tab).
+2. `run daemon.js --tail -v` briefly: `Launched N of N due tasks` lines appear several times per second while a round is in flight (launcher turns), not once per loop.
 
 ### FW-2 — PR-6 follow-up (ef0edb5)
 Pinned NeuroFlux source factions survive the donation consolidation pass.
