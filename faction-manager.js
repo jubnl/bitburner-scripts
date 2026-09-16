@@ -888,10 +888,17 @@ function computeAugsRepReqDonationByFaction(augmentations) {
         let reqDonation = getReqDonationForAug(aug, faction);
         // See if any other faction we're already planning to donate to offers the same augmentation, so we can avoid donating to multiple factions
         // Use the alternative faction if we're already planning on donating this much to them, or if they're closer to the donation requirement than this faction currently is
-        let fDonationsIndex = Object.keys(repCostByFaction).findIndex(f => f == faction.name);
-        let alternativeFaction = Object.keys(repCostByFaction).find((f, i) => f != faction.name && factionData[f].augmentations.includes(aug.name) && (
-            (repCostByFaction[f] >= reqDonation && (fDonationsIndex == -1 || i < fDonationsIndex)) || // We're donating the same or more to the other faction, and were planning on donating to it before this one
-            ((getReqDonationForAug(aug, f) - repCostByFaction[f]) < (reqDonation - (repCostByFaction[faction.name] || 0))))); // The amount we've committed to donating the other faction is closer to this requirement
+        // PR-6 fix: skip this for augs whose source faction is *pinned* with an own `getFromJoined` (the NeuroFlux clones, one per level - see
+        // managePurchaseableAugs). purchaseFactionDonations is finalised before this consolidation pass and its return value is discarded when
+        // this runs from a display pass, so retargeting a pinned clone here would have us buy that NF level from a faction we never donated to.
+        // A pinned aug still contributes its own faction's donation to repCostByFaction below.
+        let alternativeFaction = null;
+        if (!Object.hasOwn(aug, 'getFromJoined')) {
+            let fDonationsIndex = Object.keys(repCostByFaction).findIndex(f => f == faction.name);
+            alternativeFaction = Object.keys(repCostByFaction).find((f, i) => f != faction.name && factionData[f].augmentations.includes(aug.name) && (
+                (repCostByFaction[f] >= reqDonation && (fDonationsIndex == -1 || i < fDonationsIndex)) || // We're donating the same or more to the other faction, and were planning on donating to it before this one
+                ((getReqDonationForAug(aug, f) - repCostByFaction[f]) < (reqDonation - (repCostByFaction[faction.name] || 0))))); // The amount we've committed to donating the other faction is closer to this requirement
+        }
         if (alternativeFaction) {
             log(_ns, `INFO: Using alternative faction "${alternativeFaction}" for "${aug.name}" rather than earlier faction "${faction.name}"`)
             aug.getFromJoined = () => alternativeFaction; // Overwrite this function to always return the faction we've chosen to provide this augmentation
